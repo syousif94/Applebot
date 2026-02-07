@@ -23,6 +23,17 @@ class GridMapView: UIView {
     let trailColor = UIColor.cyan.withAlphaComponent(0.5)
     let gridLineColor = UIColor(white: 0.3, alpha: 0.5)
     
+    /// Cached CGColors for each classification
+    private lazy var classificationCGColors: [UInt8: CGColor] = {
+        var colors: [UInt8: CGColor] = [:]
+        for raw in 0...7 {
+            let c = MeshClassification(rawValue: UInt8(raw)) ?? .none
+            let rgb = c.color
+            colors[UInt8(raw)] = UIColor(red: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1.0).cgColor
+        }
+        return colors
+    }()
+    
     /// Reference to the occupancy grid
     private weak var occupancyGrid: OccupancyGrid?
     
@@ -165,13 +176,20 @@ class GridMapView: UIView {
         let maxHeight = region.maxHeight
         let heightRange = maxHeight - minHeight
         
-        // Draw cells with rainbow colors based on height
+        // Draw cells with classification-based colors
         let cellPixelSize = max(2, scale * CGFloat(grid.cellSize))
         let cellSize = grid.cellSize
         
         // Collect free rects to batch draw
         var freeRects: [CGRect] = []
         freeRects.reserveCapacity(500)
+        
+        // Collect classification rects for batch drawing by classification type
+        var classifiedRects: [UInt8: [CGRect]] = [:]
+        
+        // Track classified regions for labels: aggregate screen positions per classification
+        // Use a grid-based approach: accumulate cell positions per classification
+        var classificationAccumulator: [UInt8: (sumX: CGFloat, sumY: CGFloat, count: Int)] = [:]
         
         for (xi, column) in region.cells.enumerated() {
             let worldX = region.originX + Float(xi) * cellSize
@@ -189,19 +207,51 @@ class GridMapView: UIView {
                 
                 let cellRect = CGRect(x: screenX, y: screenY, width: cellPixelSize, height: cellPixelSize)
                 
+                let classification = region.classifications[xi][yi]
+                
                 switch state {
                 case .occupied:
-                    // Get height for this cell and convert to rainbow color
-                    let height = region.heights[xi][yi]
-                    let normalizedHeight = heightRange > 0 ? (height - minHeight) / heightRange : 0.5
-                    let color = rainbowColor(for: CGFloat(normalizedHeight))
-                    context.setFillColor(color)
-                    context.fill(cellRect)
+                    let classRaw = classification.rawValue
+                    if classification != .none {
+                        // Use classification color
+                        classifiedRects[classRaw, default: []].append(cellRect)
+                        // Accumulate position for label
+                        var acc = classificationAccumulator[classRaw] ?? (0, 0, 0)
+                        acc.sumX += screenX + cellPixelSize / 2
+                        acc.sumY += screenY + cellPixelSize / 2
+                        acc.count += 1
+                        classificationAccumulator[classRaw] = acc
+                    } else {
+                        // Fallback: height-based rainbow color for unclassified
+                        let height = region.heights[xi][yi]
+                        let normalizedHeight = heightRange > 0 ? (height - minHeight) / heightRange : 0.5
+                        let color = rainbowColor(for: CGFloat(normalizedHeight))
+                        context.setFillColor(color)
+                        context.fill(cellRect)
+                    }
                 case .free:
-                    freeRects.append(cellRect)
+                    if classification != .none && classification != .floor {
+                        let classRaw = classification.rawValue
+                        classifiedRects[classRaw, default: []].append(cellRect)
+                        var acc = classificationAccumulator[classRaw] ?? (0, 0, 0)
+                        acc.sumX += screenX + cellPixelSize / 2
+                        acc.sumY += screenY + cellPixelSize / 2
+                        acc.count += 1
+                        classificationAccumulator[classRaw] = acc
+                    } else {
+                        freeRects.append(cellRect)
+                    }
                 case .unknown:
                     break
                 }
+            }
+        }
+        
+        // Batch draw all classified cells by type
+        for (classRaw, rects) in classifiedRects {
+            if let color = classificationCGColors[classRaw] {
+                context.setFillColor(color)
+                context.fill(rects)
             }
         }
         
@@ -209,6 +259,34 @@ class GridMapView: UIView {
         if !freeRects.isEmpty {
             context.setFillColor(freeCGColor)
             context.fill(freeRects)
+        }
+        
+        // Draw classification labels at the centroid of each classified region
+        let labelFont = UIFont.boldSystemFont(ofSize: 11)
+        let labelShadowAttrs: [NSAttributedString.Key: Any] = [
+            .foregroundColor: UIColor.black,
+            .font: labelFont
+        ]
+        for (classRaw, acc) in classificationAccumulator {
+            guard acc.count > 10 else { continue }  // Only label regions with enough cells
+            guard let classification = MeshClassification(rawValue: classRaw) else { continue }
+            let label = classification.label
+            guard !label.isEmpty else { continue }
+            
+            let cx = acc.sumX / CGFloat(acc.count)
+            let cy = acc.sumY / CGFloat(acc.count)
+            
+            let rgb = classification.color
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: UIColor(red: rgb.r, green: rgb.g, blue: rgb.b, alpha: 1.0),
+                .font: labelFont
+            ]
+            let size = label.size(withAttributes: labelAttrs)
+            let drawPoint = CGPoint(x: cx - size.width / 2, y: cy - size.height / 2)
+            
+            // Draw shadow for readability
+            label.draw(at: CGPoint(x: drawPoint.x + 1, y: drawPoint.y + 1), withAttributes: labelShadowAttrs)
+            label.draw(at: drawPoint, withAttributes: labelAttrs)
         }
         
         // Draw position trail (in rotated coordinate system)

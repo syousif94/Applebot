@@ -15,6 +15,61 @@ enum CellState: UInt8 {
     case occupied = 2
 }
 
+/// Classification of a mesh surface from ARKit scene reconstruction
+enum MeshClassification: UInt8 {
+    case none = 0
+    case wall = 1
+    case floor = 2
+    case ceiling = 3
+    case table = 4
+    case seat = 5
+    case window = 6
+    case door = 7
+    
+    /// Human-readable label for display
+    var label: String {
+        switch self {
+        case .none: return ""
+        case .wall: return "Wall"
+        case .floor: return "Floor"
+        case .ceiling: return "Ceiling"
+        case .table: return "Table"
+        case .seat: return "Seat"
+        case .window: return "Window"
+        case .door: return "Door"
+        }
+    }
+    
+    /// Color for rendering on the 2D grid
+    var color: (r: CGFloat, g: CGFloat, b: CGFloat) {
+        switch self {
+        case .none: return (1.0, 1.0, 1.0)       // white
+        case .wall: return (0.8, 0.4, 0.2)       // orange
+        case .floor: return (0.15, 0.05, 0.25)   // dark purple
+        case .ceiling: return (0.5, 0.5, 0.5)    // gray (shouldn't render)
+        case .table: return (0.2, 0.6, 1.0)      // blue
+        case .seat: return (0.2, 0.8, 0.4)       // green
+        case .window: return (0.4, 0.9, 0.9)     // cyan
+        case .door: return (1.0, 0.8, 0.2)       // yellow
+        }
+    }
+    
+    /// Convert from ARMeshClassification
+    static func from(arClassification: Int) -> MeshClassification {
+        switch arClassification {
+        case 0: return .none
+        case 1: return .wall
+        case 2: return .floor
+        case 3: return .ceiling
+        case 4: return .table
+        case 5: return .seat
+        case 6: return .window
+        case 7: return .door
+        default: return .none
+        }
+    }
+}
+
 /// Device position and orientation in the grid
 struct DevicePosition {
     var x: Float  // meters from origin
@@ -56,6 +111,9 @@ class OccupancyGrid {
     /// Height data per cell - stores max height
     private var maxHeights: [[Float]]
     
+    /// Classification data per cell
+    private var classifications: [[UInt8]]
+    
     /// Global min and max recorded heights
     private(set) var globalMinHeight: Float = .greatestFiniteMagnitude
     private(set) var globalMaxHeight: Float = -.greatestFiniteMagnitude
@@ -92,6 +150,7 @@ class OccupancyGrid {
         self.cells = Array(repeating: Array(repeating: CellState.unknown.rawValue, count: size), count: size)
         self.minHeights = Array(repeating: Array(repeating: Float.greatestFiniteMagnitude, count: size), count: size)
         self.maxHeights = Array(repeating: Array(repeating: -Float.greatestFiniteMagnitude, count: size), count: size)
+        self.classifications = Array(repeating: Array(repeating: MeshClassification.none.rawValue, count: size), count: size)
         
         print("OccupancyGrid initialized: \(size)x\(size) cells, \(sizeInMeters)m x \(sizeInMeters)m, cell size: \(cellSize)m")
     }
@@ -294,7 +353,55 @@ class OccupancyGrid {
         }
     }
     
-    /// Clear all cells to unknown state
+    /// Mark multiple points as occupied with heights and classification (batch operation)
+    func markOccupiedBatchWithClassification(_ points: [(x: Float, y: Float, height: Float, classification: MeshClassification)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for point in points {
+            guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
+            setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+            
+            // Update classification (prefer more specific classifications over .none)
+            if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                classifications[gx][gy] = point.classification.rawValue
+            }
+            
+            // Update height data
+            if point.height < minHeights[gx][gy] {
+                minHeights[gx][gy] = point.height
+            }
+            if point.height > maxHeights[gx][gy] {
+                maxHeights[gx][gy] = point.height
+            }
+            
+            // Update global min/max
+            if point.height < globalMinHeight {
+                globalMinHeight = point.height
+            }
+            if point.height > globalMaxHeight {
+                globalMaxHeight = point.height
+            }
+        }
+    }
+    
+    /// Mark multiple points as free with classification (batch operation)
+    func markFreeBatchWithClassification(_ points: [(x: Float, y: Float, classification: MeshClassification)]) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        for point in points {
+            guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
+            if cells[gx][gy] != CellState.occupied.rawValue {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                if point.classification != .none {
+                    classifications[gx][gy] = point.classification.rawValue
+                }
+            }
+        }
+    }
+    
+    /// Clear all cells to unknown state and reset origin
     func clear() {
         lock.lock()
         defer { lock.unlock() }
@@ -302,10 +409,23 @@ class OccupancyGrid {
         for x in 0..<gridSize {
             for y in 0..<gridSize {
                 cells[x][y] = CellState.unknown.rawValue
+                minHeights[x][y] = Float.greatestFiniteMagnitude
+                maxHeights[x][y] = -Float.greatestFiniteMagnitude
+                classifications[x][y] = MeshClassification.none.rawValue
             }
         }
         occupiedCount = 0
         freeCount = 0
+        
+        // Reset origin offset so new AR session coordinates map correctly
+        originOffset = .zero
+        
+        // Reset global height tracking
+        globalMinHeight = .greatestFiniteMagnitude
+        globalMaxHeight = -.greatestFiniteMagnitude
+        
+        // Reset device position
+        devicePosition = .zero
     }
     
     // MARK: - Region Queries
@@ -342,8 +462,8 @@ class OccupancyGrid {
     }
     
     /// Get a subsection of the grid for rendering
-    /// Returns cell states in a 2D array for the specified region
-    func getRegion(centerX: Float, centerY: Float, radiusMeters: Float) -> (cells: [[CellState]], heights: [[Float]], originX: Float, originY: Float, cellSize: Float, minHeight: Float, maxHeight: Float) {
+    /// Returns cell states, heights, and classifications in 2D arrays for the specified region
+    func getRegion(centerX: Float, centerY: Float, radiusMeters: Float) -> (cells: [[CellState]], heights: [[Float]], classifications: [[MeshClassification]], originX: Float, originY: Float, cellSize: Float, minHeight: Float, maxHeight: Float) {
         lock.lock()
         defer { lock.unlock() }
         
@@ -352,10 +472,11 @@ class OccupancyGrid {
         
         var region = Array(repeating: Array(repeating: CellState.unknown, count: regionSize), count: regionSize)
         var heights = Array(repeating: Array(repeating: Float(0), count: regionSize), count: regionSize)
+        var classifs = Array(repeating: Array(repeating: MeshClassification.none, count: regionSize), count: regionSize)
         
         guard let center = worldToGrid(centerX, centerY) else {
             let origin = gridToWorld(gridRadius - cellRadius, gridRadius - cellRadius)
-            return (region, heights, origin.x, origin.y, cellSize, globalMinHeight, globalMaxHeight)
+            return (region, heights, classifs, origin.x, origin.y, cellSize, globalMinHeight, globalMaxHeight)
         }
         
         for dx in -cellRadius...cellRadius {
@@ -367,6 +488,7 @@ class OccupancyGrid {
                 
                 if gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize {
                     region[rx][ry] = CellState(rawValue: cells[gx][gy]) ?? .unknown
+                    classifs[rx][ry] = MeshClassification(rawValue: classifications[gx][gy]) ?? .none
                     // Use max height for this cell
                     if maxHeights[gx][gy] > -Float.greatestFiniteMagnitude {
                         heights[rx][ry] = maxHeights[gx][gy]
@@ -376,7 +498,7 @@ class OccupancyGrid {
         }
         
         let origin = gridToWorld(center.x - cellRadius, center.y - cellRadius)
-        return (region, heights, origin.x, origin.y, cellSize, globalMinHeight, globalMaxHeight)
+        return (region, heights, classifs, origin.x, origin.y, cellSize, globalMinHeight, globalMaxHeight)
     }
     
     // MARK: - Update Device Position

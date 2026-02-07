@@ -11,7 +11,9 @@ import simd
 /// Extracted mesh data that can be processed without retaining ARMeshAnchor
 struct ExtractedMeshData {
     let vertices: [simd_float3]
+    let classifications: [MeshClassification]
     let transform: simd_float4x4
+    let generation: Int  // Generation counter to detect stale data after reset
 }
 
 /// Processes ARMeshAnchor data and updates the occupancy grid
@@ -21,10 +23,16 @@ class MeshProcessor {
     
     /// Height threshold for obstacles (meters above floor)
     var minObstacleHeight: Float = 0.1  // 10cm minimum
-    var maxObstacleHeight: Float = 2.0  // 2m maximum (ignore ceiling)
+    var maxObstacleHeight: Float = 1.8  // 1.8m maximum (ignore ceiling - typical door height)
+    
+    /// Absolute ceiling height threshold (fallback if floor estimate is wrong)
+    var absoluteMaxHeight: Float = 2.5  // Ignore anything above 2.5m absolute
     
     /// Estimated floor height (updated dynamically)
     var floorHeight: Float = 0.0
+    
+    /// Whether floor height has been initialized from device position
+    private var floorInitialized: Bool = false
     
     /// Sampling rate for mesh vertices (skip every N vertices for performance)
     var vertexSamplingRate: Int = 4  // Process every 4th vertex for better performance
@@ -36,13 +44,33 @@ class MeshProcessor {
     /// Track floor height estimates
     private var floorHeightSamples: [Float] = []
     
-    /// Lock for thread-safe access to floor samples
+    /// Generation counter to discard stale mesh data after reset
+    private var generation: Int = 0
+    
+    /// Lock for thread-safe access to floor samples and generation
     private let lock = NSLock()
     
     // MARK: - Initialization
     
     init(occupancyGrid: OccupancyGrid) {
         self.occupancyGrid = occupancyGrid
+    }
+    
+    /// Increment generation to invalidate any in-flight mesh processing and reset floor estimation
+    func reset() {
+        lock.lock()
+        generation += 1
+        floorHeightSamples.removeAll()
+        floorHeight = 0.0
+        floorInitialized = false
+        lock.unlock()
+    }
+    
+    /// Get current generation (call on main thread before async processing)
+    func currentGeneration() -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return generation
     }
     
     // MARK: - Data Extraction (call on main thread to avoid retaining ARFrame)
@@ -52,10 +80,50 @@ class MeshProcessor {
         let geometry = anchor.geometry
         let vertexSource = geometry.vertices
         let vertexCount = vertexSource.count
+        let faceCount = geometry.faces.count
         
-        // Extract sampled vertices
+        // Build per-vertex classification from face classifications
+        var vertexClassifications = Array(repeating: MeshClassification.none, count: vertexCount)
+        
+        if let classificationSource = geometry.classification {
+            let classBuffer = classificationSource.buffer.contents()
+            let classStride = classificationSource.stride
+            let classOffset = classificationSource.offset
+            let facesElement = geometry.faces
+            let facesBuffer = facesElement.buffer.contents()
+            let bytesPerIndex = facesElement.bytesPerIndex
+            let indicesPerPrimitive = facesElement.indexCountPerPrimitive
+            
+            for faceIndex in 0..<faceCount {
+                // Read classification for this face
+                let classPtr = classBuffer.advanced(by: classOffset + classStride * faceIndex)
+                let classValue = classPtr.assumingMemoryBound(to: UInt8.self).pointee
+                let classification = MeshClassification.from(arClassification: Int(classValue))
+                
+                // Assign classification to each vertex of this face
+                for j in 0..<indicesPerPrimitive {
+                    let indexPtr = facesBuffer.advanced(by: (faceIndex * indicesPerPrimitive + j) * bytesPerIndex)
+                    let vertexIndex: Int
+                    if bytesPerIndex == 4 {
+                        vertexIndex = Int(indexPtr.assumingMemoryBound(to: Int32.self).pointee)
+                    } else {
+                        vertexIndex = Int(indexPtr.assumingMemoryBound(to: Int16.self).pointee)
+                    }
+                    if vertexIndex < vertexCount {
+                        // Prefer more specific classification
+                        if classification != .none {
+                            vertexClassifications[vertexIndex] = classification
+                        }
+                    }
+                }
+            }
+        }
+        
+        // Extract sampled vertices and their classifications
         var vertices: [simd_float3] = []
+        var classifications: [MeshClassification] = []
         vertices.reserveCapacity(vertexCount / vertexSamplingRate)
+        classifications.reserveCapacity(vertexCount / vertexSamplingRate)
         
         let buffer = vertexSource.buffer.contents()
         let vertexStride = vertexSource.stride
@@ -65,27 +133,40 @@ class MeshProcessor {
             let ptr = buffer.advanced(by: vertexOffset + vertexStride * i)
             let vertex = ptr.assumingMemoryBound(to: simd_float3.self).pointee
             vertices.append(vertex)
+            classifications.append(vertexClassifications[i])
         }
         
-        return ExtractedMeshData(vertices: vertices, transform: anchor.transform)
+        return ExtractedMeshData(vertices: vertices, classifications: classifications, transform: anchor.transform, generation: currentGeneration())
     }
     
     // MARK: - Processing (can be called on background thread)
     
     /// Process extracted mesh data and update the occupancy grid
     func processExtractedMesh(_ meshData: ExtractedMeshData) {
+        // Check if this mesh data is stale (from before a reset)
+        if meshData.generation != currentGeneration() {
+            return  // Discard stale mesh data
+        }
+        
         guard let grid = occupancyGrid else { return }
         
         let transform = meshData.transform
         
-        // Collect points to mark as obstacles (with height)
-        var obstaclePoints: [(x: Float, y: Float, height: Float)] = []
-        var floorPoints: [(x: Float, y: Float)] = []
+        // Collect points to mark as obstacles (with height and classification)
+        var obstaclePoints: [(x: Float, y: Float, height: Float, classification: MeshClassification)] = []
+        var floorPoints: [(x: Float, y: Float, classification: MeshClassification)] = []
         obstaclePoints.reserveCapacity(meshData.vertices.count)
         floorPoints.reserveCapacity(meshData.vertices.count)
         
         // Process vertices
-        for vertex in meshData.vertices {
+        for (index, vertex) in meshData.vertices.enumerated() {
+            let classification = meshData.classifications[index]
+            
+            // Skip ceiling-classified vertices entirely
+            if classification == .ceiling {
+                continue
+            }
+            
             // Transform vertex to world coordinates
             let localPos = simd_float4(vertex.x, vertex.y, vertex.z, 1.0)
             let worldPos = transform * localPos
@@ -97,25 +178,30 @@ class MeshProcessor {
             // Update floor height estimate (look for lowest points)
             updateFloorEstimate(height: worldY)
             
+            // Skip points that are absolutely too high (ceiling)
+            if worldY > absoluteMaxHeight {
+                continue
+            }
+            
             // Check if this is an obstacle (above floor, below ceiling)
             let heightAboveFloor = worldY - floorHeight
             
             if heightAboveFloor > minObstacleHeight && heightAboveFloor < maxObstacleHeight {
-                // This is an obstacle - add to grid with height info
+                // This is an obstacle - add to grid with height and classification info
                 // Use X and Z as the 2D coordinates (Y is up in ARKit)
-                obstaclePoints.append((worldX, worldZ, heightAboveFloor))
+                obstaclePoints.append((worldX, worldZ, heightAboveFloor, classification))
             } else if heightAboveFloor >= -0.05 && heightAboveFloor <= minObstacleHeight {
                 // This is floor level - mark as free/floor
-                floorPoints.append((worldX, worldZ))
+                floorPoints.append((worldX, worldZ, classification == .none ? .floor : classification))
             }
         }
         
         // Batch update the grid - floor first, then obstacles on top
         if !floorPoints.isEmpty {
-            grid.markFreeBatch(floorPoints)
+            grid.markFreeBatchWithClassification(floorPoints)
         }
         if !obstaclePoints.isEmpty {
-            grid.markOccupiedBatchWithHeights(obstaclePoints)
+            grid.markOccupiedBatchWithClassification(obstaclePoints)
         }
     }
     
@@ -141,8 +227,15 @@ class MeshProcessor {
             floorHeightSamples[index] = height
         }
         
-        // Update floor estimate periodically
-        if floorHeightSamples.count >= 100 && floorHeightSamples.count % 100 == 0 {
+        // Initialize floor estimate early with just 20 samples
+        if !floorInitialized && floorHeightSamples.count >= 20 {
+            let sorted = floorHeightSamples.sorted()
+            let percentileIndex = max(0, sorted.count / 20)  // 5%
+            floorHeight = sorted[percentileIndex]
+            floorInitialized = true
+        }
+        // Update floor estimate periodically after initialization
+        else if floorInitialized && floorHeightSamples.count % 100 == 0 {
             // Use 5th percentile as floor estimate
             let sorted = floorHeightSamples.sorted()
             let percentileIndex = sorted.count / 20  // 5%

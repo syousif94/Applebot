@@ -36,6 +36,9 @@ class LiDARViewController: UIViewController {
     /// Frame counter for throttling
     private var frameCount = 0
     
+    /// Flag to pause mesh processing during reset
+    private var isResetting = false
+    
     // MARK: - Lifecycle
     
     override func viewDidLoad() {
@@ -189,14 +192,18 @@ class LiDARViewController: UIViewController {
     }
     
     private func performReset() {
-        // Clear the occupancy grid
+        // Pause mesh processing during reset
+        isResetting = true
+        
+        // Invalidate any in-flight mesh processing BEFORE clearing
+        // This increments generation so stale mesh data will be discarded
+        meshProcessor.reset()
+        
+        // Clear the occupancy grid (resets originOffset and all data)
         occupancyGrid.clear()
         
         // Reset mesh tracking
         processedMeshVersions.removeAll()
-        
-        // Reset floor height estimation
-        meshProcessor = MeshProcessor(occupancyGrid: occupancyGrid)
         
         // Reset the grid view's initial heading
         gridMapView.resetInitialHeading()
@@ -218,14 +225,14 @@ class LiDARViewController: UIViewController {
     // MARK: - AR Session
     
     private func startARSession() {
-        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) else {
+        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
             statusLabel.text = "⚠️ LiDAR not available"
             statusLabel.textColor = .red
             return
         }
         
         let config = ARWorldTrackingConfiguration()
-        config.sceneReconstruction = .mesh
+        config.sceneReconstruction = .meshWithClassification
         config.environmentTexturing = .automatic
         config.planeDetection = [.horizontal, .vertical]
         
@@ -243,13 +250,20 @@ class LiDARViewController: UIViewController {
     // MARK: - UI Updates
     
     @objc private func updateFrame() {
-        guard let frame = arView.session.currentFrame else { return }
-        
         frameCount += 1
         
-        // Extract what we need immediately, don't hold frame reference
-        let cameraTransform = frame.camera.transform
-        let meshCount = frame.anchors.compactMap { $0 as? ARMeshAnchor }.count
+        // Extract only what we need from the frame in a minimal scope
+        // to avoid holding AR frame references longer than necessary
+        let cameraTransform: simd_float4x4
+        let meshCount: Int
+        
+        if let frame = arView.session.currentFrame {
+            cameraTransform = frame.camera.transform
+            meshCount = frame.anchors.lazy.compactMap { $0 as? ARMeshAnchor }.count
+            // frame goes out of scope here, releasing the reference
+        } else {
+            return
+        }
         
         // Update device position every frame
         occupancyGrid.updateDevicePosition(transform: cameraTransform)
@@ -284,6 +298,9 @@ extension LiDARViewController: ARSessionDelegate {
     }
     
     private func processAnchors(_ anchors: [ARAnchor]) {
+        // Skip processing if we're in the middle of a reset
+        guard !isResetting else { return }
+        
         for anchor in anchors {
             guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
             
@@ -330,6 +347,7 @@ extension LiDARViewController: ARSessionDelegate {
                 self?.statusLabel.text = "⚠️ Limited: \(reasonText)"
                 self?.statusLabel.textColor = .yellow
             case .normal:
+                self?.isResetting = false  // Safe to process meshes now
                 self?.statusLabel.text = "✅ Tracking normal"
                 self?.statusLabel.textColor = .green
             }
