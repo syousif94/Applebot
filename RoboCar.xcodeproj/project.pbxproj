@@ -149,6 +149,7 @@
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Bluetooth is used to connect to robots.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
@@ -183,6 +184,7 @@
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Bluetooth is used to connect to robots.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;

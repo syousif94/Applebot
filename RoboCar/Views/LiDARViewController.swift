@@ -18,6 +18,7 @@ class LiDARViewController: UIViewController {
     private var statusLabel: UILabel!
     private var positionLabel: UILabel!
     private var resetButton: UIButton!
+    private var settingsButton: UIButton!
     
     // MARK: - State
     
@@ -50,6 +51,7 @@ class LiDARViewController: UIViewController {
         setupGridMapView()
         setupStatusLabels()
         setupResetButton()
+        setupSettingsButton()
         setupMeshProcessor()
         
         // Use CADisplayLink for smooth updates
@@ -174,6 +176,39 @@ class LiDARViewController: UIViewController {
             resetButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             resetButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
         ])
+    }
+    
+    private func setupSettingsButton() {
+        settingsButton = UIButton(type: .system)
+        settingsButton.translatesAutoresizingMaskIntoConstraints = false
+        
+        let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)
+        settingsButton.setImage(UIImage(systemName: "gear", withConfiguration: config), for: .normal)
+        settingsButton.tintColor = .white
+        settingsButton.backgroundColor = UIColor(white: 0.2, alpha: 0.9)
+        settingsButton.layer.cornerRadius = 22
+        settingsButton.addTarget(self, action: #selector(settingsButtonTapped), for: .touchUpInside)
+        
+        view.addSubview(settingsButton)
+        
+        NSLayoutConstraint.activate([
+            settingsButton.widthAnchor.constraint(equalToConstant: 44),
+            settingsButton.heightAnchor.constraint(equalToConstant: 44),
+            settingsButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
+            settingsButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
+        ])
+    }
+    
+    @objc private func settingsButtonTapped() {
+        let controlPanel = ControlPanelViewController()
+        if let sheet = controlPanel.sheetPresentationController {
+            sheet.detents = [.medium(), .large()]
+            if #available(iOS 16.0, *) {
+                sheet.prefersGrabberVisible = false
+            }
+            sheet.preferredCornerRadius = 20
+        }
+        present(controlPanel, animated: true)
     }
     
     @objc private func resetButtonTapped() {
@@ -361,3 +396,4 @@ extension LiDARViewController: ARSessionDelegate {
         }
     }
 }
+
