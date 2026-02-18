@@ -145,7 +145,7 @@ class JoystickView: UIView {
         
         // Normalize to -1…1
         let normX = Float(dx / maxDist)
-        let normY = Float(-dy / maxDist)  // Invert Y so up = positive
+        let normY = Float(dy / maxDist)  // Up = negative (backward), Down = positive (forward)
         
         // Apply dead zone
         let mag = sqrt(normX * normX + normY * normY)

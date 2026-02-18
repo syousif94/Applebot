@@ -76,6 +76,15 @@ class ESP32BLEManager: NSObject {
     private var isMotorWriteInFlight = false
     private var pendingMotorData: Data?
     
+    /// Heartbeat timer that re-sends the last motor command to satisfy the ESP32 watchdog
+    private var heartbeatTimer: Timer?
+    
+    /// Last motor data sent (kept for heartbeat re-sends)
+    private var lastMotorData: Data?
+    
+    /// Heartbeat interval — must be well under the ESP32's 500ms watchdog timeout
+    private let heartbeatInterval: TimeInterval = 0.2
+    
     /// Callback when WiFi credentials have been written
     var onWifiWriteResult: ((Bool) -> Void)?
     
@@ -178,6 +187,15 @@ class ESP32BLEManager: NSObject {
             UInt8(bitPattern: max(-100, min(100, d)))
         ])
         
+        lastMotorData = data
+        
+        let allZero = a == 0 && b == 0 && c == 0 && d == 0
+        if allZero {
+            stopHeartbeat()
+        } else {
+            startHeartbeat()
+        }
+        
         if isMotorWriteInFlight {
             // Replace any pending value with the latest
             pendingMotorData = data
@@ -204,16 +222,50 @@ class ESP32BLEManager: NSObject {
     
     /// Convenience: differential drive using joystick x,y (-1…1)
     /// x = turn (positive = right), y = throttle (positive = forward)
-    func drive(x: Float, y: Float) {
-        // Tank-style mixing: left = y + x, right = y - x
-        let left  = max(-1, min(1, y + x))
-        let right = max(-1, min(1, y - x))
+    ///
+    /// Uses polar mixing with a power-curved turn component so that
+    /// 45° drives forward in an arc (inner wheel stays positive) while
+    /// 90° still spins in place.
+    @discardableResult
+    func drive(x: Float, y: Float) -> (left: Float, right: Float) {
+        let magnitude = min(sqrtf(x * x + y * y), 1.0)
+        guard magnitude > 0.01 else {
+            stopAll()
+            return (0, 0)
+        }
         
-        let leftPower  = Int8(left * 100)
-        let rightPower = Int8(right * 100)
+        // Angle from forward: 0 = forward, ±π/2 = pure turn, ±π = backward
+        let angle = atan2f(x, y)
+        
+        let rawDrive = cosf(angle)  // forward/back component
+        let rawTurn  = sinf(angle)  // left/right component
+        
+        // Power-curve the turn so diagonals keep inner wheel moving.
+        // Exponent 2: at 45° turn goes from 0.707 → 0.5, preserving
+        // the inner wheel at ~17% instead of 0%. At 90° it stays 1.0.
+        let turnExponent: Float = 2.0
+        let turn = copysignf(powf(fabsf(rawTurn), turnExponent), rawTurn)
+        
+        // Mix into left / right
+        var left  = rawDrive + turn
+        var right = rawDrive - turn
+        
+        // Normalize so the larger side is ±1 (preserves ratio, avoids clipping)
+        let maxAbs = max(fabsf(left), fabsf(right), 1.0)
+        left  /= maxAbs
+        right /= maxAbs
+        
+        // Scale by joystick magnitude (how far the stick is pushed)
+        left  *= magnitude
+        right *= magnitude
+        
+        let leftPower  = Int8(max(-100, min(100, Int(left * 100))))
+        let rightPower = Int8(max(-100, min(100, Int(right * 100))))
         
         // A & C = left side, B & D = right side
         setAllMotors(a: leftPower, b: rightPower, c: leftPower, d: rightPower)
+        
+        return (left, right)
     }
     
     /// Stop all motors
@@ -244,12 +296,41 @@ class ESP32BLEManager: NSObject {
     
     // MARK: - Helpers
     
+    // MARK: - Heartbeat
+    
+    /// Start the heartbeat timer (no-op if already running)
+    private func startHeartbeat() {
+        guard heartbeatTimer == nil else { return }
+        heartbeatTimer = Timer.scheduledTimer(withTimeInterval: heartbeatInterval, repeats: true) { [weak self] _ in
+            self?.sendHeartbeat()
+        }
+    }
+    
+    /// Stop the heartbeat timer
+    private func stopHeartbeat() {
+        heartbeatTimer?.invalidate()
+        heartbeatTimer = nil
+    }
+    
+    /// Re-send the last motor data to keep the ESP32 watchdog happy
+    private func sendHeartbeat() {
+        guard let data = lastMotorData, peripheral != nil, motorsChar != nil else { return }
+        if isMotorWriteInFlight {
+            // A write is already queued — just make sure the pending value is current
+            pendingMotorData = data
+        } else {
+            sendMotorData(data)
+        }
+    }
+    
     private func clearCharacteristics() {
         servoChar = nil
         motorsChar = nil
         wifiConfigChar = nil
         isMotorWriteInFlight = false
         pendingMotorData = nil
+        lastMotorData = nil
+        stopHeartbeat()
     }
 }
 
