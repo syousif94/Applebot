@@ -162,7 +162,7 @@ class ControlPanelViewController: UIViewController {
         
         // Joystick callbacks
         joystickView.onMove = { [weak self] x, y in
-            let powers = self?.ble.drive(x: x, y: y) ?? (left: Float(0), right: Float(0))
+            let powers = self?.ble.drive(x: x, y: y, bypassObstacleFilter: true) ?? (left: Float(0), right: Float(0))
             self?.motorLabel.text = String(format: "L: %d%%  R: %d%%",
                                            Int(powers.left * 100), Int(powers.right * 100))
         }

@@ -32,7 +32,7 @@ class MeshProcessor {
     var floorHeight: Float = 0.0
     
     /// Whether floor height has been initialized from device position
-    private var floorInitialized: Bool = false
+    private(set) var floorInitialized: Bool = false
     
     /// Sampling rate for mesh vertices (skip every N vertices for performance)
     var vertexSamplingRate: Int = 4  // Process every 4th vertex for better performance

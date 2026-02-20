@@ -37,6 +37,9 @@ class GridMapView: UIView {
     /// Reference to the occupancy grid
     private weak var occupancyGrid: OccupancyGrid?
     
+    /// Reference to the obstacle detector for highlighting nearby obstacles
+    weak var obstacleDetector: ObstacleDetector?
+    
     /// Scale: pixels per meter
     private var scale: CGFloat = 50.0
     
@@ -303,6 +306,54 @@ class GridMapView: UIView {
         
         // Draw compass (shows which way is north relative to device heading)
         drawCompass(context: context, rect: rect, heading: relativeHeading)
+        
+        // Draw obstacle highlights LAST so they are always on top
+        context.saveGState()
+        context.translateBy(x: centerX, y: centerY)
+        context.rotate(by: relativeHeading)
+        context.translateBy(x: -centerX, y: -centerY)
+        drawObstacleHighlights(context: context, centerX: centerX, centerY: centerY, devicePos: devicePos, cellPixelSize: cellPixelSize)
+        context.restoreGState()
+    }
+    
+    private func drawObstacleHighlights(context: CGContext, centerX: CGFloat, centerY: CGFloat, devicePos: DevicePosition, cellPixelSize: CGFloat) {
+        guard let detector = obstacleDetector, detector.obstacleDetected else { return }
+        
+        let positions = detector.obstacleWorldPositions
+        guard !positions.isEmpty else { return }
+        
+        // Use a dot size at least 6pt so highlights are visible even when zoomed out
+        let dotSize = max(cellPixelSize * 3, 6)
+        
+        // Bright red for obstacle cells
+        context.setFillColor(UIColor(red: 1.0, green: 0.0, blue: 0.0, alpha: 0.9).cgColor)
+        
+        var rects: [CGRect] = []
+        rects.reserveCapacity(positions.count)
+        
+        for pos in positions {
+            let relX = CGFloat(pos.x - devicePos.x) * scale
+            let relY = CGFloat(pos.y - devicePos.y) * scale
+            let screenX = centerX - relX - dotSize / 2
+            let screenY = centerY - relY - dotSize / 2
+            rects.append(CGRect(x: screenX, y: screenY, width: dotSize, height: dotSize))
+        }
+        
+        context.fill(rects)
+        
+        // Draw the stop-radius circle as a dashed ring
+        let radiusPixels = CGFloat(detector.stopRadius) * scale
+        context.setStrokeColor(UIColor(red: 1.0, green: 0.2, blue: 0.1, alpha: 0.8).cgColor)
+        context.setLineWidth(2)
+        context.setLineDash(phase: 0, lengths: [4, 4])
+        context.addEllipse(in: CGRect(
+            x: centerX - radiusPixels,
+            y: centerY - radiusPixels,
+            width: radiusPixels * 2,
+            height: radiusPixels * 2
+        ))
+        context.strokePath()
+        context.setLineDash(phase: 0, lengths: [])  // Reset dash
     }
     
     private func drawGridLines(context: CGContext, rect: CGRect, devicePos: DevicePosition) {

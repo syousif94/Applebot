@@ -4,6 +4,10 @@
 <dict>
 	<key>NSBluetoothAlwaysUsageDescription</key>
 	<string>RoboCar uses Bluetooth to connect to the ESP32 motor controller.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>RoboCar uses the microphone for voice commands to control the car.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>RoboCar uses speech recognition to understand voice commands for driving the car.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

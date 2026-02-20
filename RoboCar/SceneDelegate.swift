@@ -37,8 +37,10 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneWillEnterForeground(_ scene: UIScene) {
-        // Called as the scene transitions from the background to the foreground.
-        // Use this method to undo the changes made on entering the background.
+        // Auto-connect BLE if not already connected
+        ESP32BLEManager.shared.autoConnect()
+        // Resume voice listening if permissions were previously granted
+        VoiceAssistantManager.shared.startIfPermitted()
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {

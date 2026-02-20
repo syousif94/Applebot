@@ -82,6 +82,9 @@ class ESP32BLEManager: NSObject {
     /// Last motor data sent (kept for heartbeat re-sends)
     private var lastMotorData: Data?
     
+    /// Public read-only access to last motor data (for obstacle detection)
+    var lastMotorDataPublic: Data? { lastMotorData }
+    
     /// Heartbeat interval — must be well under the ESP32's 500ms watchdog timeout
     private let heartbeatInterval: TimeInterval = 0.2
     
@@ -154,6 +157,12 @@ class ESP32BLEManager: NSObject {
         connectionState = .disconnected
     }
     
+    /// Auto-connect: start scanning if disconnected (no-op if already connected/scanning)
+    func autoConnect() {
+        guard connectionState == .disconnected else { return }
+        startScanning()
+    }
+    
     /// Toggle connection: scan if disconnected, disconnect if connected
     func toggleConnection() {
         switch connectionState {
@@ -178,7 +187,11 @@ class ESP32BLEManager: NSObject {
     /// Set all four motor powers at once (single 4-byte write)
     /// Uses latest-value-wins: if a write is in flight, the new value
     /// replaces any pending value and is sent once the current write completes.
-    func setAllMotors(a: Int8, b: Int8, c: Int8, d: Int8) {
+    func setAllMotors(a: Int8, b: Int8, c: Int8, d: Int8, bypassObstacleFilter: Bool = false) {
+        // Apply obstacle filtering — blocks forward-only commands (skip for joystick)
+        let f = bypassObstacleFilter ? (a: a, b: b, c: c, d: d) : ObstacleDetector.shared.filterMotors(a: a, b: b, c: c, d: d)
+        // Negate: motor wiring is reversed (positive software = backward physical)
+        let a = -f.a, b = -f.b, c = -f.c, d = -f.d
         guard peripheral != nil, motorsChar != nil else { return }
         let data = Data([
             UInt8(bitPattern: max(-100, min(100, a))),
@@ -227,15 +240,20 @@ class ESP32BLEManager: NSObject {
     /// 45° drives forward in an arc (inner wheel stays positive) while
     /// 90° still spins in place.
     @discardableResult
-    func drive(x: Float, y: Float) -> (left: Float, right: Float) {
-        let magnitude = min(sqrtf(x * x + y * y), 1.0)
+    func drive(x: Float, y: Float, bypassObstacleFilter: Bool = false) -> (left: Float, right: Float) {
+        // Apply obstacle avoidance — blocks forward component only (skip for joystick)
+        let filtered = bypassObstacleFilter ? (x: x, y: y) : ObstacleDetector.shared.filterDrive(x: x, y: y)
+        let fx = filtered.x
+        let fy = filtered.y
+        
+        let magnitude = min(sqrtf(fx * fx + fy * fy), 1.0)
         guard magnitude > 0.01 else {
             stopAll()
             return (0, 0)
         }
         
         // Angle from forward: 0 = forward, ±π/2 = pure turn, ±π = backward
-        let angle = atan2f(x, y)
+        let angle = atan2f(fx, fy)
         
         let rawDrive = cosf(angle)  // forward/back component
         let rawTurn  = sinf(angle)  // left/right component
@@ -263,7 +281,7 @@ class ESP32BLEManager: NSObject {
         let rightPower = Int8(max(-100, min(100, Int(right * 100))))
         
         // A & C = left side, B & D = right side
-        setAllMotors(a: leftPower, b: rightPower, c: leftPower, d: rightPower)
+        setAllMotors(a: leftPower, b: rightPower, c: leftPower, d: rightPower, bypassObstacleFilter: bypassObstacleFilter)
         
         return (left, right)
     }

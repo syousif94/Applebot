@@ -461,6 +461,214 @@ class OccupancyGrid {
         return result
     }
     
+    /// Get all occupied cells within a radius, including classification, distance, and height
+    func getOccupiedCellsDetailed(aroundX: Float, aroundY: Float, radius: Float) -> [(worldX: Float, worldY: Float, distance: Float, classification: MeshClassification, height: Float)] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        var result: [(worldX: Float, worldY: Float, distance: Float, classification: MeshClassification, height: Float)] = []
+        
+        guard let center = worldToGrid(aroundX, aroundY) else { return result }
+        
+        let cellRadius = Int(radius / cellSize) + 1
+        
+        for dx in -cellRadius...cellRadius {
+            for dy in -cellRadius...cellRadius {
+                let gx = center.x + dx
+                let gy = center.y + dy
+                
+                guard gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize else { continue }
+                
+                if cells[gx][gy] == CellState.occupied.rawValue {
+                    let world = gridToWorld(gx, gy)
+                    let dist = sqrt(pow(world.x - aroundX, 2) + pow(world.y - aroundY, 2))
+                    if dist <= radius {
+                        let classif = MeshClassification(rawValue: classifications[gx][gy]) ?? .none
+                        let h = maxHeights[gx][gy] > -Float.greatestFiniteMagnitude ? maxHeights[gx][gy] : 0
+                        result.append((world.x, world.y, dist, classif, h))
+                    }
+                }
+            }
+        }
+        
+        return result
+    }
+    
+    // MARK: - Frontier Detection
+    
+    /// A frontier cell is an unknown cell adjacent to at least one free cell.
+    /// Returns frontier cells clustered into groups, sorted by distance from the device.
+    /// Each returned point is the centroid of a frontier cluster in world coordinates.
+    func findFrontierClusters(maxClusters: Int = 20, minClusterSize: Int = 3) -> [(x: Float, y: Float, size: Int)] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        // Find the bounding box of known cells to limit search
+        var minGX = gridSize, maxGX = 0, minGY = gridSize, maxGY = 0
+        var hasKnown = false
+        
+        // Scan a reasonable area around the device position
+        let pos = devicePosition
+        guard let deviceGrid = worldToGrid(pos.x, pos.y) else { return [] }
+        
+        // Search within 10m of device (200 cells at 5cm)
+        let searchRadius = min(200, gridRadius)
+        let startX = max(0, deviceGrid.x - searchRadius)
+        let endX = min(gridSize - 1, deviceGrid.x + searchRadius)
+        let startY = max(0, deviceGrid.y - searchRadius)
+        let endY = min(gridSize - 1, deviceGrid.y + searchRadius)
+        
+        // Find all frontier cells
+        var frontierCells: [(gx: Int, gy: Int)] = []
+        
+        let neighbors = [(-1, 0), (1, 0), (0, -1), (0, 1)]
+        
+        for gx in startX...endX {
+            for gy in startY...endY {
+                guard cells[gx][gy] == CellState.unknown.rawValue else { continue }
+                
+                // Check if adjacent to a free cell
+                var adjacentToFree = false
+                for (dx, dy) in neighbors {
+                    let nx = gx + dx
+                    let ny = gy + dy
+                    if nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize {
+                        if cells[nx][ny] == CellState.free.rawValue {
+                            adjacentToFree = true
+                            break
+                        }
+                    }
+                }
+                
+                if adjacentToFree {
+                    frontierCells.append((gx, gy))
+                }
+            }
+        }
+        
+        guard !frontierCells.isEmpty else { return [] }
+        
+        // Cluster frontier cells using simple flood-fill grouping
+        var visited = Set<Int>()  // gx * gridSize + gy
+        var clusters: [[(gx: Int, gy: Int)]] = []
+        
+        for cell in frontierCells {
+            let key = cell.gx * gridSize + cell.gy
+            if visited.contains(key) { continue }
+            
+            // BFS to find connected frontier cells
+            var cluster: [(gx: Int, gy: Int)] = []
+            var queue: [(gx: Int, gy: Int)] = [cell]
+            visited.insert(key)
+            
+            while !queue.isEmpty {
+                let current = queue.removeFirst()
+                cluster.append(current)
+                
+                for (dx, dy) in neighbors {
+                    let nx = current.gx + dx
+                    let ny = current.gy + dy
+                    let nkey = nx * gridSize + ny
+                    
+                    if visited.contains(nkey) { continue }
+                    if nx < startX || nx > endX || ny < startY || ny > endY { continue }
+                    if cells[nx][ny] != CellState.unknown.rawValue { continue }
+                    
+                    // Check if this neighbor is also a frontier
+                    var isFrontier = false
+                    for (ddx, ddy) in neighbors {
+                        let nnx = nx + ddx
+                        let nny = ny + ddy
+                        if nnx >= 0 && nnx < gridSize && nny >= 0 && nny < gridSize {
+                            if cells[nnx][nny] == CellState.free.rawValue {
+                                isFrontier = true
+                                break
+                            }
+                        }
+                    }
+                    
+                    if isFrontier {
+                        visited.insert(nkey)
+                        queue.append((nx, ny))
+                    }
+                }
+            }
+            
+            if cluster.count >= minClusterSize {
+                clusters.append(cluster)
+            }
+        }
+        
+        // Convert clusters to world-coordinate centroids
+        var result: [(x: Float, y: Float, size: Int)] = clusters.map { cluster in
+            var sumX: Float = 0
+            var sumY: Float = 0
+            for cell in cluster {
+                let world = gridToWorld(cell.gx, cell.gy)
+                sumX += world.x
+                sumY += world.y
+            }
+            let cx = sumX / Float(cluster.count)
+            let cy = sumY / Float(cluster.count)
+            return (cx, cy, cluster.count)
+        }
+        
+        // Sort by distance from device
+        result.sort { a, b in
+            let distA = (a.x - pos.x) * (a.x - pos.x) + (a.y - pos.y) * (a.y - pos.y)
+            let distB = (b.x - pos.x) * (b.x - pos.x) + (b.y - pos.y) * (b.y - pos.y)
+            return distA < distB
+        }
+        
+        return Array(result.prefix(maxClusters))
+    }
+    
+    /// Check whether the mapped area is fully enclosed (no frontier cells reachable).
+    /// Returns true if all free space is bounded by occupied cells with no unknown neighbors.
+    func isFullyMapped() -> Bool {
+        let frontiers = findFrontierClusters(maxClusters: 1, minClusterSize: 2)
+        return frontiers.isEmpty
+    }
+    
+    /// Check if a straight-line path between two world points is free of occupied cells
+    func isPathClear(fromX: Float, fromY: Float, toX: Float, toY: Float) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let start = worldToGrid(fromX, fromY),
+              let end = worldToGrid(toX, toY) else { return false }
+        
+        var x = start.x
+        var y = start.y
+        let dx = abs(end.x - start.x)
+        let dy = abs(end.y - start.y)
+        let sx = start.x < end.x ? 1 : -1
+        let sy = start.y < end.y ? 1 : -1
+        var err = dx - dy
+        
+        while true {
+            if x == end.x && y == end.y { break }
+            
+            if x >= 0 && x < gridSize && y >= 0 && y < gridSize {
+                if cells[x][y] == CellState.occupied.rawValue {
+                    return false
+                }
+            }
+            
+            let e2 = 2 * err
+            if e2 > -dy {
+                err -= dy
+                x += sx
+            }
+            if e2 < dx {
+                err += dx
+                y += sy
+            }
+        }
+        
+        return true
+    }
+    
     /// Get a subsection of the grid for rendering
     /// Returns cell states, heights, and classifications in 2D arrays for the specified region
     func getRegion(centerX: Float, centerY: Float, radiusMeters: Float) -> (cells: [[CellState]], heights: [[Float]], classifications: [[MeshClassification]], originX: Float, originY: Float, cellSize: Float, minHeight: Float, maxHeight: Float) {
