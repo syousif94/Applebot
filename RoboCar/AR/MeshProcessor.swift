@@ -14,6 +14,7 @@ struct ExtractedMeshData {
     let classifications: [MeshClassification]
     let transform: simd_float4x4
     let generation: Int  // Generation counter to detect stale data after reset
+    let updateId: UInt64 // ID to ensure newer meshes overwrite older ones
 }
 
 /// Processes ARMeshAnchor data and updates the occupancy grid
@@ -76,7 +77,7 @@ class MeshProcessor {
     // MARK: - Data Extraction (call on main thread to avoid retaining ARFrame)
     
     /// Extract vertex data from mesh anchor synchronously (call before async processing)
-    func extractMeshData(from anchor: ARMeshAnchor) -> ExtractedMeshData {
+    func extractMeshData(from anchor: ARMeshAnchor, updateId: UInt64) -> ExtractedMeshData {
         let geometry = anchor.geometry
         let vertexSource = geometry.vertices
         let vertexCount = vertexSource.count
@@ -136,7 +137,7 @@ class MeshProcessor {
             classifications.append(vertexClassifications[i])
         }
         
-        return ExtractedMeshData(vertices: vertices, classifications: classifications, transform: anchor.transform, generation: currentGeneration())
+        return ExtractedMeshData(vertices: vertices, classifications: classifications, transform: anchor.transform, generation: currentGeneration(), updateId: updateId)
     }
     
     // MARK: - Processing (can be called on background thread)
@@ -198,17 +199,17 @@ class MeshProcessor {
         
         // Batch update the grid - floor first, then obstacles on top
         if !floorPoints.isEmpty {
-            grid.markFreeBatchWithClassification(floorPoints)
+            grid.markFreeBatchWithClassification(floorPoints, updateId: meshData.updateId)
         }
         if !obstaclePoints.isEmpty {
-            grid.markOccupiedBatchWithClassification(obstaclePoints)
+            grid.markOccupiedBatchWithClassification(obstaclePoints, updateId: meshData.updateId)
         }
     }
     
     /// Process a mesh anchor and update the occupancy grid (legacy - retains anchor)
     @available(*, deprecated, message: "Use extractMeshData + processExtractedMesh instead")
     func processMeshAnchor(_ anchor: ARMeshAnchor) {
-        let meshData = extractMeshData(from: anchor)
+        let meshData = extractMeshData(from: anchor, updateId: 0)
         processExtractedMesh(meshData)
     }
     

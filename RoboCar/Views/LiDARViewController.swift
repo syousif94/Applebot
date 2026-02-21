@@ -21,8 +21,7 @@ class LiDARViewController: UIViewController {
     private var settingsButton: UIButton!
     private var micButton: UIButton!
     private var voiceStatusLabel: UILabel!
-    private var obstacleBannerView: UIView!
-    private var obstacleBannerContent: ObstacleBannerContentView!
+    private var obstaclePointOverlay: ObstaclePointOverlayView!
     
     // MARK: - Voice Assistant
     
@@ -48,8 +47,20 @@ class LiDARViewController: UIViewController {
     /// Frame counter for throttling
     private var frameCount = 0
     
+    /// Counter for mesh updates to ensure newer meshes overwrite older ones
+    private var meshUpdateCounter: UInt64 = 0
+    
     /// Flag to pause mesh processing during reset
     private var isResetting = false
+    
+    /// Planned path waypoints in world coordinates (grid X/Y)
+    private var plannedPath: [(x: Float, y: Float)] = []
+    
+    /// Planned path waypoints as 3D points for AR overlay (ARKit world space)
+    private var pathPoints3D: [simd_float3] = []
+    
+    /// Anchor entity for the 3D path mesh in the AR scene
+    private var pathAnchor: AnchorEntity?
     
     // MARK: - Lifecycle
     
@@ -65,7 +76,7 @@ class LiDARViewController: UIViewController {
         setupSettingsButton()
         setupMicButton()
         setupVoiceAssistant()
-        setupObstacleBanner()
+        setupObstacleOverlay()
         setupMeshProcessor()
         setupObstacleDetector()
         
@@ -130,6 +141,11 @@ class LiDARViewController: UIViewController {
         gridMapView = GridMapView(occupancyGrid: occupancyGrid)
         gridMapView.translatesAutoresizingMaskIntoConstraints = false
         gridMapView.backgroundColor = UIColor(white: 0.1, alpha: 1.0)
+        
+        // Handle tap for pathfinding
+        gridMapView.onTapWorldPosition = { [weak self] worldX, worldY in
+            self?.planPath(toX: worldX, toY: worldY)
+        }
         
         view.addSubview(gridMapView)
         
@@ -386,6 +402,12 @@ class LiDARViewController: UIViewController {
         // Reset mesh tracking
         processedMeshVersions.removeAll()
         
+        // Clear planned path
+        plannedPath.removeAll()
+        pathPoints3D.removeAll()
+        pathAnchor?.removeFromParent()
+        pathAnchor = nil
+        
         // Reset the grid view's initial heading
         gridMapView.resetInitialHeading()
         
@@ -393,38 +415,18 @@ class LiDARViewController: UIViewController {
         gridMapView.setNeedsDisplay()
     }
     
-    private func setupObstacleBanner() {
-        // Container
-        obstacleBannerView = UIView()
-        obstacleBannerView.translatesAutoresizingMaskIntoConstraints = false
-        obstacleBannerView.backgroundColor = UIColor(red: 0.9, green: 0.15, blue: 0.1, alpha: 0.92)
-        obstacleBannerView.layer.cornerRadius = 16
-        obstacleBannerView.layer.shadowColor = UIColor.black.cgColor
-        obstacleBannerView.layer.shadowOffset = CGSize(width: 0, height: 2)
-        obstacleBannerView.layer.shadowRadius = 6
-        obstacleBannerView.layer.shadowOpacity = 0.4
-        obstacleBannerView.alpha = 0
-        obstacleBannerView.isUserInteractionEnabled = false
+    private func setupObstacleOverlay() {
+        obstaclePointOverlay = ObstaclePointOverlayView()
+        obstaclePointOverlay.translatesAutoresizingMaskIntoConstraints = false
         
-        view.addSubview(obstacleBannerView)
-        
-        // Custom-drawn content with chevrons
-        obstacleBannerContent = ObstacleBannerContentView()
-        obstacleBannerContent.translatesAutoresizingMaskIntoConstraints = false
-        obstacleBannerContent.backgroundColor = .clear
-        obstacleBannerView.addSubview(obstacleBannerContent)
+        // Add as subview of arView so project() coordinates map directly
+        arView.addSubview(obstaclePointOverlay)
         
         NSLayoutConstraint.activate([
-            obstacleBannerView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            obstacleBannerView.topAnchor.constraint(equalTo: arView.bottomAnchor, constant: 6),
-            obstacleBannerView.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 8),
-            obstacleBannerView.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -8),
-            obstacleBannerView.heightAnchor.constraint(equalToConstant: 32),
-            
-            obstacleBannerContent.leadingAnchor.constraint(equalTo: obstacleBannerView.leadingAnchor),
-            obstacleBannerContent.trailingAnchor.constraint(equalTo: obstacleBannerView.trailingAnchor),
-            obstacleBannerContent.topAnchor.constraint(equalTo: obstacleBannerView.topAnchor),
-            obstacleBannerContent.bottomAnchor.constraint(equalTo: obstacleBannerView.bottomAnchor),
+            obstaclePointOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
+            obstaclePointOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
+            obstaclePointOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
+            obstaclePointOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
         ])
     }
     
@@ -463,6 +465,196 @@ class LiDARViewController: UIViewController {
         statusLabel.textColor = .yellow
     }
     
+    // MARK: - Pathfinding
+    
+    /// Plan a path from the current device position to the tapped world position.
+    /// Runs A* on a background thread, then updates the grid and AR overlays on main.
+    private func planPath(toX: Float, toY: Float) {
+        let devicePos = occupancyGrid.devicePosition
+        let startX = devicePos.x
+        let startY = devicePos.y
+        
+        // Set target point immediately for visual feedback
+        gridMapView.pathTargetPoint = (x: toX, y: toY)
+        gridMapView.plannedPath = []
+        gridMapView.setNeedsDisplay()
+        
+        // Run pathfinding off the main thread
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            let path = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            
+            // Densify the path: interpolate points along each segment
+            var densePath: [(x: Float, y: Float)] = []
+            let spacing: Float = 0.05  // 5cm between points
+            
+            for i in 0..<path.count {
+                let pt = path[i]
+                densePath.append(pt)
+                
+                if i < path.count - 1 {
+                    let next = path[i + 1]
+                    let dx = next.x - pt.x
+                    let dy = next.y - pt.y
+                    let dist = sqrt(dx * dx + dy * dy)
+                    let steps = Int(dist / spacing)
+                    
+                    for s in 1..<steps {
+                        let t = Float(s) / Float(steps)
+                        densePath.append((x: pt.x + dx * t, y: pt.y + dy * t))
+                    }
+                }
+            }
+            
+            // Convert to 3D points for AR overlay
+            // Grid worldX = ARKit X, grid worldY = ARKit Z, height = floor plane Y
+            let floorY = self.meshProcessor.floorHeight
+            let points3D = densePath.map { pt in
+                simd_float3(pt.x, floorY + 0.02, pt.y)  // Slightly above floor
+            }
+            
+            // Generate 3D ribbon mesh on background thread
+            let pathMesh = self.createPathMesh(from: points3D, width: 0.05)
+            
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.plannedPath = path
+                self.pathPoints3D = points3D
+                self.gridMapView.plannedPath = path
+                self.gridMapView.pathTargetPoint = (x: toX, y: toY)
+                self.gridMapView.setNeedsDisplay()
+                
+                // Update 3D path mesh in AR scene
+                self.pathAnchor?.removeFromParent()
+                self.pathAnchor = nil
+                
+                if let mesh = pathMesh {
+                    var material = UnlitMaterial()
+                    material.color = .init(tint: UIColor(red: 0.0, green: 0.9, blue: 0.3, alpha: 0.9))
+                    let entity = ModelEntity(mesh: mesh, materials: [material])
+                    let anchor = AnchorEntity(world: .zero)
+                    anchor.addChild(entity)
+                    self.arView.scene.addAnchor(anchor)
+                    self.pathAnchor = anchor
+                }
+                
+                if path.isEmpty {
+                    print("[Path] ❌ No path found to (\(String(format: "%.2f", toX)), \(String(format: "%.2f", toY)))")
+                } else {
+                    print("[Path] ✅ Path found: \(path.count) waypoints, \(densePath.count) mesh points")
+                }
+            }
+        }
+    }
+    
+    // MARK: - 3D Path Mesh
+    
+    /// Smooth points using Catmull-Rom spline interpolation
+    private func catmullRomSmooth(_ points: [simd_float3], subdivisions: Int = 4) -> [simd_float3] {
+        guard points.count >= 2 else { return points }
+        var result: [simd_float3] = []
+        result.reserveCapacity(points.count * subdivisions)
+        
+        for i in 0..<points.count - 1 {
+            let p0 = i > 0 ? points[i - 1] : points[i]
+            let p1 = points[i]
+            let p2 = points[i + 1]
+            let p3 = i < points.count - 2 ? points[i + 2] : points[i + 1]
+            
+            for s in 0..<subdivisions {
+                let t = Float(s) / Float(subdivisions)
+                let tt = t * t
+                let ttt = tt * t
+
+                let twoP1 = p1 * 2.0
+                let term1 = twoP1
+                let term2 = (p2 - p0) * t
+                let term3 = ((p0 * 2.0) - (p1 * 5.0) + (p2 * 4.0) - p3) * tt
+                let term4 = (-p0 + (p1 * 3.0) - (p2 * 3.0) + p3) * ttt
+                let sum = term1 + term2 + term3 + term4
+                let v = sum * 0.5
+                result.append(v)
+            }
+        }
+        result.append(points.last!)
+        return result
+    }
+    
+    /// Create a ribbon mesh from 3D path points for AR overlay
+    private func createPathMesh(from points: [simd_float3], width: Float = 0.05) -> MeshResource? {
+        guard points.count >= 2 else { return nil }
+        
+        // Smooth the path with Catmull-Rom spline
+        let smoothPoints = catmullRomSmooth(points, subdivisions: 4)
+        guard smoothPoints.count >= 2 else { return nil }
+        
+        var vertices: [simd_float3] = []
+        var normals: [simd_float3] = []
+        var indices: [UInt32] = []
+        
+        let halfWidth = width / 2
+        let up = simd_float3(0, 1, 0)
+        
+        vertices.reserveCapacity(smoothPoints.count * 2)
+        normals.reserveCapacity(smoothPoints.count * 2)
+        indices.reserveCapacity((smoothPoints.count - 1) * 12)
+        
+        var pairCount: Int = 0  // Number of vertex pairs added so far
+        
+        for (i, point) in smoothPoints.enumerated() {
+            // Compute forward direction
+            let rawForward: simd_float3
+            if i == 0 {
+                rawForward = smoothPoints[1] - smoothPoints[0]
+            } else if i == smoothPoints.count - 1 {
+                rawForward = smoothPoints[i] - smoothPoints[i - 1]
+            } else {
+                rawForward = smoothPoints[i + 1] - smoothPoints[i - 1]
+            }
+            
+            let forwardLen = simd_length(rawForward)
+            guard forwardLen > 0.0001 else { continue }  // Skip degenerate points
+            let forward = rawForward / forwardLen
+            
+            // Right vector perpendicular to forward and up
+            var right = simd_cross(forward, up)
+            let rightLen = simd_length(right)
+            if rightLen > 0.001 {
+                right = right / rightLen
+            } else {
+                right = simd_float3(1, 0, 0)  // Fallback for vertical segments
+            }
+            
+            // Left and right edge vertices
+            vertices.append(point - right * halfWidth)
+            vertices.append(point + right * halfWidth)
+            normals.append(up)
+            normals.append(up)
+            
+            // Add triangles connecting to previous pair
+            if pairCount > 0 {
+                let base = UInt32((pairCount - 1) * 2)
+                // Front face (visible from above)
+                indices.append(contentsOf: [base, base + 2, base + 1])
+                indices.append(contentsOf: [base + 1, base + 2, base + 3])
+                // Back face (visible from below)
+                indices.append(contentsOf: [base, base + 1, base + 2])
+                indices.append(contentsOf: [base + 1, base + 3, base + 2])
+            }
+            pairCount += 1
+        }
+        
+        guard pairCount >= 2 else { return nil }
+        
+        var descriptor = MeshDescriptor(name: "pathLine")
+        descriptor.positions = MeshBuffer(vertices)
+        descriptor.normals = MeshBuffer(normals)
+        descriptor.primitives = .triangles(indices)
+        
+        return try? MeshResource.generate(from: [descriptor])
+    }
+    
     // MARK: - UI Updates
     
     @objc private func updateFrame() {
@@ -472,6 +664,7 @@ class LiDARViewController: UIViewController {
         // to avoid holding AR frame references longer than necessary
         let cameraTransform: simd_float4x4
         let meshCount: Int
+        var obstaclePoints3D: [simd_float3] = []
         
         if let frame = arView.session.currentFrame {
             cameraTransform = frame.camera.transform
@@ -481,6 +674,10 @@ class LiDARViewController: UIViewController {
             obstacleDetector.floorHeightEstimated = meshProcessor.floorInitialized
             // Update depth-based proximity detection (catches dynamic objects like hands)
             obstacleDetector.updateDepth(frame: frame)
+            // Collect 3D obstacle points for white dot overlay every 2 frames
+            if frameCount % 2 == 0 {
+                obstaclePoints3D = obstacleDetector.collectObstaclePoints3D(frame: frame)
+            }
             // frame goes out of scope here, releasing the reference
         } else {
             return
@@ -493,9 +690,21 @@ class LiDARViewController: UIViewController {
         // Check for obstacles every frame (~20-30Hz)
         obstacleDetector.update()
         
-        // Update obstacle banner every 3 frames
-        if frameCount % 3 == 0 {
-            updateObstacleBanner()
+        // Update obstacle point overlay every 2 frames
+        if frameCount % 2 == 0 {
+            let camPos = simd_float3(cameraTransform.columns.3.x,
+                                     cameraTransform.columns.3.y,
+                                     cameraTransform.columns.3.z)
+            var projected: [ProjectedObstaclePoint] = []
+            projected.reserveCapacity(obstaclePoints3D.count)
+            for pt in obstaclePoints3D {
+                if let sp = arView.project(pt) {
+                    let dist = simd_distance(pt, camPos)
+                    projected.append(ProjectedObstaclePoint(position: sp, distance: dist))
+                }
+            }
+            obstaclePointOverlay.projectedPoints = projected
+            obstaclePointOverlay.setNeedsDisplay()
         }
         
         // Update labels every 3 frames (~10Hz at 30fps)
@@ -514,40 +723,7 @@ class LiDARViewController: UIViewController {
         }
     }
     
-    // MARK: - Obstacle Banner
-    
-    private var bannerIsVisible = false
-    
-    private func updateObstacleBanner() {
-        let detector = obstacleDetector
-        
-        if detector.obstacleDetected, let distance = detector.nearestObstacleDistance {
-            // Feed obstacles to the custom content view
-            obstacleBannerContent.obstacles = Array(detector.nearbyObstacles.prefix(3))
-            obstacleBannerContent.setNeedsDisplay()
-            
-            // Tint: interpolate from yellow (far) to red (very close)
-            let urgency = max(0, min(1, 1.0 - CGFloat(distance) / CGFloat(detector.stopRadius)))
-            let r: CGFloat = 0.9
-            let g: CGFloat = 0.6 * (1.0 - urgency)  // yellow → red
-            let b: CGFloat = 0.05
-            obstacleBannerView.backgroundColor = UIColor(red: r, green: g, blue: b, alpha: 0.92)
-            
-            if !bannerIsVisible {
-                bannerIsVisible = true
-                UIView.animate(withDuration: 0.2) {
-                    self.obstacleBannerView.alpha = 1
-                }
-            }
-        } else {
-            if bannerIsVisible {
-                bannerIsVisible = false
-                UIView.animate(withDuration: 0.3) {
-                    self.obstacleBannerView.alpha = 0
-                }
-            }
-        }
-    }
+
 }
 
 // MARK: - ARSessionDelegate
@@ -578,8 +754,11 @@ extension LiDARViewController: ARSessionDelegate {
             }
             processedMeshVersions[anchor.identifier] = version
             
+            meshUpdateCounter += 1
+            let currentUpdateId = meshUpdateCounter
+            
             // IMPORTANT: Extract data synchronously on main thread to avoid retaining ARFrame
-            let meshData = meshProcessor.extractMeshData(from: meshAnchor)
+            let meshData = meshProcessor.extractMeshData(from: meshAnchor, updateId: currentUpdateId)
             
             // Process extracted data asynchronously (no ARFrame reference retained)
             DispatchQueue.global(qos: .utility).async { [weak self] in

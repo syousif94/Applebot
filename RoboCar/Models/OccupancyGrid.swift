@@ -114,6 +114,9 @@ class OccupancyGrid {
     /// Classification data per cell
     private var classifications: [[UInt8]]
     
+    /// Update ID per cell to track which mesh generated it
+    private var cellUpdates: [[UInt64]]
+    
     /// Global min and max recorded heights
     private(set) var globalMinHeight: Float = .greatestFiniteMagnitude
     private(set) var globalMaxHeight: Float = -.greatestFiniteMagnitude
@@ -151,6 +154,7 @@ class OccupancyGrid {
         self.minHeights = Array(repeating: Array(repeating: Float.greatestFiniteMagnitude, count: size), count: size)
         self.maxHeights = Array(repeating: Array(repeating: -Float.greatestFiniteMagnitude, count: size), count: size)
         self.classifications = Array(repeating: Array(repeating: MeshClassification.none.rawValue, count: size), count: size)
+        self.cellUpdates = Array(repeating: Array(repeating: 0, count: size), count: size)
         
         print("OccupancyGrid initialized: \(size)x\(size) cells, \(sizeInMeters)m x \(sizeInMeters)m, cell size: \(cellSize)m")
     }
@@ -201,6 +205,16 @@ class OccupancyGrid {
             return .unknown
         }
         return CellState(rawValue: cells[gridX][gridY]) ?? .unknown
+    }
+    
+    /// Get the max height of a cell at world coordinates, or nil if no height data
+    func getMaxHeight(worldX: Float, worldY: Float) -> Float? {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let (gx, gy) = worldToGrid(worldX, worldY) else { return nil }
+        let h = maxHeights[gx][gy]
+        return h > -Float.greatestFiniteMagnitude ? h : nil
     }
     
     /// Set the state of a cell at world coordinates
@@ -277,15 +291,25 @@ class OccupancyGrid {
     }
     
     /// Mark multiple points as free/floor (batch operation) - only if not already occupied
-    func markFreeBatch(_ points: [(x: Float, y: Float)]) {
+    func markFreeBatch(_ points: [(x: Float, y: Float)], updateId: UInt64? = nil) {
         lock.lock()
         defer { lock.unlock() }
         
         for point in points {
             guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
-            // Only mark as free if not already occupied (obstacles take priority)
-            if cells[gx][gy] != CellState.occupied.rawValue {
-                setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+            
+            if let uid = updateId {
+                if uid > cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                    cellUpdates[gx][gy] = uid
+                } else if uid == cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                }
+            } else {
+                // Only mark as free if not already occupied (obstacles take priority)
+                if cells[gx][gy] != CellState.occupied.rawValue {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                }
             }
         }
     }
@@ -316,86 +340,127 @@ class OccupancyGrid {
     }
     
     /// Mark multiple points as occupied (batch operation)
-    func markOccupiedBatch(_ points: [(x: Float, y: Float)]) {
+    func markOccupiedBatch(_ points: [(x: Float, y: Float)], updateId: UInt64? = nil) {
         lock.lock()
         defer { lock.unlock() }
         
         for point in points {
             guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
-            setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+            
+            if let uid = updateId {
+                if uid > cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                    cellUpdates[gx][gy] = uid
+                } else if uid == cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                }
+            } else {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+            }
         }
     }
     
     /// Mark multiple points as occupied with heights (batch operation)
-    func markOccupiedBatchWithHeights(_ points: [(x: Float, y: Float, height: Float)]) {
+    func markOccupiedBatchWithHeights(_ points: [(x: Float, y: Float, height: Float)], updateId: UInt64? = nil) {
         lock.lock()
         defer { lock.unlock() }
         
         for point in points {
             guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
-            setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
             
-            // Update height data
-            if point.height < minHeights[gx][gy] {
-                minHeights[gx][gy] = point.height
-            }
-            if point.height > maxHeights[gx][gy] {
-                maxHeights[gx][gy] = point.height
-            }
-            
-            // Update global min/max
-            if point.height < globalMinHeight {
-                globalMinHeight = point.height
-            }
-            if point.height > globalMaxHeight {
-                globalMaxHeight = point.height
+            if let uid = updateId {
+                if uid > cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                    minHeights[gx][gy] = point.height
+                    maxHeights[gx][gy] = point.height
+                    if point.height < globalMinHeight { globalMinHeight = point.height }
+                    if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                    cellUpdates[gx][gy] = uid
+                } else if uid == cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                    if point.height < minHeights[gx][gy] { minHeights[gx][gy] = point.height }
+                    if point.height > maxHeights[gx][gy] { maxHeights[gx][gy] = point.height }
+                    if point.height < globalMinHeight { globalMinHeight = point.height }
+                    if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                }
+            } else {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                if point.height < minHeights[gx][gy] { minHeights[gx][gy] = point.height }
+                if point.height > maxHeights[gx][gy] { maxHeights[gx][gy] = point.height }
+                if point.height < globalMinHeight { globalMinHeight = point.height }
+                if point.height > globalMaxHeight { globalMaxHeight = point.height }
             }
         }
     }
     
     /// Mark multiple points as occupied with heights and classification (batch operation)
-    func markOccupiedBatchWithClassification(_ points: [(x: Float, y: Float, height: Float, classification: MeshClassification)]) {
+    func markOccupiedBatchWithClassification(_ points: [(x: Float, y: Float, height: Float, classification: MeshClassification)], updateId: UInt64? = nil) {
         lock.lock()
         defer { lock.unlock() }
         
         for point in points {
             guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
-            setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
             
-            // Update classification (prefer more specific classifications over .none)
-            if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
-                classifications[gx][gy] = point.classification.rawValue
-            }
-            
-            // Update height data
-            if point.height < minHeights[gx][gy] {
-                minHeights[gx][gy] = point.height
-            }
-            if point.height > maxHeights[gx][gy] {
-                maxHeights[gx][gy] = point.height
-            }
-            
-            // Update global min/max
-            if point.height < globalMinHeight {
-                globalMinHeight = point.height
-            }
-            if point.height > globalMaxHeight {
-                globalMaxHeight = point.height
+            if let uid = updateId {
+                if uid > cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                    classifications[gx][gy] = point.classification.rawValue
+                    minHeights[gx][gy] = point.height
+                    maxHeights[gx][gy] = point.height
+                    if point.height < globalMinHeight { globalMinHeight = point.height }
+                    if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                    cellUpdates[gx][gy] = uid
+                } else if uid == cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                    if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                        classifications[gx][gy] = point.classification.rawValue
+                    }
+                    if point.height < minHeights[gx][gy] { minHeights[gx][gy] = point.height }
+                    if point.height > maxHeights[gx][gy] { maxHeights[gx][gy] = point.height }
+                    if point.height < globalMinHeight { globalMinHeight = point.height }
+                    if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                }
+            } else {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                    classifications[gx][gy] = point.classification.rawValue
+                }
+                if point.height < minHeights[gx][gy] { minHeights[gx][gy] = point.height }
+                if point.height > maxHeights[gx][gy] { maxHeights[gx][gy] = point.height }
+                if point.height < globalMinHeight { globalMinHeight = point.height }
+                if point.height > globalMaxHeight { globalMaxHeight = point.height }
             }
         }
     }
     
     /// Mark multiple points as free with classification (batch operation)
-    func markFreeBatchWithClassification(_ points: [(x: Float, y: Float, classification: MeshClassification)]) {
+    func markFreeBatchWithClassification(_ points: [(x: Float, y: Float, classification: MeshClassification)], updateId: UInt64? = nil) {
         lock.lock()
         defer { lock.unlock() }
         
         for point in points {
             guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
-            if cells[gx][gy] != CellState.occupied.rawValue {
-                setStateUnsafe(gridX: gx, gridY: gy, state: .free)
-                if point.classification != .none {
+            
+            if let uid = updateId {
+                if uid > cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
                     classifications[gx][gy] = point.classification.rawValue
+                    // Reset heights for free space
+                    minHeights[gx][gy] = Float.greatestFiniteMagnitude
+                    maxHeights[gx][gy] = -Float.greatestFiniteMagnitude
+                    cellUpdates[gx][gy] = uid
+                } else if uid == cellUpdates[gx][gy] {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                    if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                        classifications[gx][gy] = point.classification.rawValue
+                    }
+                }
+            } else {
+                if cells[gx][gy] != CellState.occupied.rawValue {
+                    setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                    if point.classification != .none {
+                        classifications[gx][gy] = point.classification.rawValue
+                    }
                 }
             }
         }
@@ -412,6 +477,7 @@ class OccupancyGrid {
                 minHeights[x][y] = Float.greatestFiniteMagnitude
                 maxHeights[x][y] = -Float.greatestFiniteMagnitude
                 classifications[x][y] = MeshClassification.none.rawValue
+                cellUpdates[x][y] = 0
             }
         }
         occupiedCount = 0
@@ -707,6 +773,246 @@ class OccupancyGrid {
         
         let origin = gridToWorld(center.x - cellRadius, center.y - cellRadius)
         return (region, heights, classifs, origin.x, origin.y, cellSize, globalMinHeight, globalMaxHeight)
+    }
+    
+    // MARK: - Pathfinding (A*)
+    
+    /// Find the nearest free cell to a grid position using BFS.
+    /// Must be called while lock is held.
+    private func findNearestFreeCell(gridX: Int, gridY: Int, maxRadius: Int = 50) -> (x: Int, y: Int)? {
+        for r in 1...maxRadius {
+            for dx in -r...r {
+                for dy in -r...r {
+                    guard abs(dx) == r || abs(dy) == r else { continue } // perimeter only
+                    let nx = gridX + dx
+                    let ny = gridY + dy
+                    guard nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize else { continue }
+                    if cells[nx][ny] == CellState.free.rawValue {
+                        return (nx, ny)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+    
+    /// Check line-of-sight between two grid cells (no occupied cells in the way).
+    /// Must be called while lock is held.
+    private func lineOfSight(fromX: Int, fromY: Int, toX: Int, toY: Int) -> Bool {
+        var x = fromX
+        var y = fromY
+        let dx = abs(toX - fromX)
+        let dy = abs(toY - fromY)
+        let sx = fromX < toX ? 1 : -1
+        let sy = fromY < toY ? 1 : -1
+        var err = dx - dy
+        
+        while true {
+            if x == toX && y == toY { return true }
+            
+            if x >= 0 && x < gridSize && y >= 0 && y < gridSize {
+                if cells[x][y] == CellState.occupied.rawValue {
+                    return false
+                }
+            } else {
+                return false
+            }
+            
+            let e2 = 2 * err
+            if e2 > -dy { err -= dy; x += sx }
+            if e2 < dx { err += dx; y += sy }
+        }
+    }
+    
+    /// Find a path from start to goal using A* on the occupancy grid.
+    /// Only traverses free cells, avoiding occupied and unknown cells.
+    /// Returns an array of world-coordinate waypoints (smoothed), or empty if no path found.
+    func findPath(fromX: Float, fromY: Float, toX: Float, toY: Float) -> [(x: Float, y: Float)] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard var start = worldToGrid(fromX, fromY),
+              var goal = worldToGrid(toX, toY) else { return [] }
+        
+        // If start isn't free, find nearest free cell
+        if cells[start.x][start.y] != CellState.free.rawValue {
+            if let nearest = findNearestFreeCell(gridX: start.x, gridY: start.y) {
+                start = nearest
+            } else { return [] }
+        }
+        
+        // If goal isn't free, find nearest free cell
+        if cells[goal.x][goal.y] != CellState.free.rawValue {
+            if let nearest = findNearestFreeCell(gridX: goal.x, gridY: goal.y) {
+                goal = nearest
+            } else { return [] }
+        }
+        
+        if start.x == goal.x && start.y == goal.y { return [] }
+        
+        // Clearance: 15cm = 3 cells at 5cm. We add a heavy cost penalty for cells
+        // near obstacles so A* naturally avoids them when possible.
+        let clearanceCells = 3
+        
+        /// Returns a proximity penalty for (x,y): high if near an obstacle, 0 if far away.
+        /// Must be called while lock is held.
+        func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
+            // Check a small neighborhood for occupied cells
+            for r in 1...clearanceCells {
+                for ddx in -r...r {
+                    for ddy in -r...r {
+                        guard abs(ddx) == r || abs(ddy) == r else { continue } // perimeter only
+                        let cx = x + ddx, cy = y + ddy
+                        if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
+                            if cells[cx][cy] == CellState.occupied.rawValue {
+                                // Closer obstacles get a bigger penalty
+                                return 8.0 * Float(clearanceCells + 1 - r) / Float(clearanceCells)
+                            }
+                        }
+                    }
+                }
+            }
+            return 0
+        }
+        
+        // A* with 8-directional movement
+        let sqrt2: Float = 1.41421356
+        let directions: [(dx: Int, dy: Int, cost: Float)] = [
+            (-1, 0, 1), (1, 0, 1), (0, -1, 1), (0, 1, 1),
+            (-1, -1, sqrt2), (-1, 1, sqrt2), (1, -1, sqrt2), (1, 1, sqrt2)
+        ]
+        
+        // Octile distance heuristic
+        func heuristic(_ x: Int, _ y: Int) -> Float {
+            let dx = Float(abs(x - goal.x))
+            let dy = Float(abs(y - goal.y))
+            return max(dx, dy) + (sqrt2 - 1) * min(dx, dy)
+        }
+        
+        func key(_ x: Int, _ y: Int) -> Int { x * gridSize + y }
+        
+        // Open set as a simple sorted array (adequate for typical indoor paths)
+        struct AStarNode: Comparable {
+            let x: Int
+            let y: Int
+            let f: Float
+            let g: Float
+            static func < (lhs: AStarNode, rhs: AStarNode) -> Bool { lhs.f < rhs.f }
+        }
+        
+        var openList: [AStarNode] = []
+        var gScore: [Int: Float] = [:]
+        var cameFrom: [Int: Int] = [:]
+        var closedSet = Set<Int>()
+        
+        let startKey = key(start.x, start.y)
+        let goalKey = key(goal.x, goal.y)
+        let startH = heuristic(start.x, start.y)
+        gScore[startKey] = 0
+        openList.append(AStarNode(x: start.x, y: start.y, f: startH, g: 0))
+        
+        let maxIterations = 100_000
+        var iterations = 0
+        
+        while !openList.isEmpty && iterations < maxIterations {
+            iterations += 1
+            
+            // Pop node with lowest f
+            var minIdx = 0
+            for i in 1..<openList.count {
+                if openList[i].f < openList[minIdx].f { minIdx = i }
+            }
+            let current = openList.remove(at: minIdx)
+            let currentKey = key(current.x, current.y)
+            
+            if currentKey == goalKey {
+                // Reconstruct path
+                var gridPath: [(x: Int, y: Int)] = [(goal.x, goal.y)]
+                var ck = goalKey
+                while let parentKey = cameFrom[ck] {
+                    let px = parentKey / gridSize
+                    let py = parentKey % gridSize
+                    gridPath.append((px, py))
+                    ck = parentKey
+                }
+                gridPath.reverse()
+                
+                // Smooth path using line-of-sight optimization
+                let smoothed = smoothPath(gridPath)
+                
+                // Convert to world coordinates
+                return smoothed.map { cell in
+                    let world = gridToWorld(cell.x, cell.y)
+                    return (x: world.x, y: world.y)
+                }
+            }
+            
+            if closedSet.contains(currentKey) { continue }
+            closedSet.insert(currentKey)
+            
+            for dir in directions {
+                let nx = current.x + dir.dx
+                let ny = current.y + dir.dy
+                
+                guard nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize else { continue }
+                
+                let nKey = key(nx, ny)
+                if closedSet.contains(nKey) { continue }
+                
+                // Only traverse free cells (or the goal itself)
+                if cells[nx][ny] != CellState.free.rawValue && nKey != goalKey { continue }
+                
+                // For diagonal moves, check that both adjacent cardinal cells are free
+                if dir.dx != 0 && dir.dy != 0 {
+                    let cx1 = current.x + dir.dx
+                    let cy1 = current.y
+                    let cx2 = current.x
+                    let cy2 = current.y + dir.dy
+                    if cx1 >= 0 && cx1 < gridSize && cy1 >= 0 && cy1 < gridSize &&
+                       cx2 >= 0 && cx2 < gridSize && cy2 >= 0 && cy2 < gridSize {
+                        if cells[cx1][cy1] == CellState.occupied.rawValue ||
+                           cells[cx2][cy2] == CellState.occupied.rawValue {
+                            continue  // Can't cut corners around obstacles
+                        }
+                    }
+                }
+                
+                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny)
+                if tentativeG < (gScore[nKey] ?? .greatestFiniteMagnitude) {
+                    gScore[nKey] = tentativeG
+                    cameFrom[nKey] = currentKey
+                    let f = tentativeG + heuristic(nx, ny)
+                    openList.append(AStarNode(x: nx, y: ny, f: f, g: tentativeG))
+                }
+            }
+        }
+        
+        return []  // No path found
+    }
+    
+    /// Smooth a grid path by removing intermediate waypoints when line-of-sight exists.
+    /// Must be called while lock is held.
+    private func smoothPath(_ path: [(x: Int, y: Int)]) -> [(x: Int, y: Int)] {
+        guard path.count > 2 else { return path }
+        
+        var smoothed = [path[0]]
+        var current = 0
+        
+        while current < path.count - 1 {
+            var farthest = current + 1
+            // Try to skip as far ahead as possible with clear line of sight
+            for i in stride(from: path.count - 1, to: current + 1, by: -1) {
+                if lineOfSight(fromX: path[current].x, fromY: path[current].y,
+                              toX: path[i].x, toY: path[i].y) {
+                    farthest = i
+                    break
+                }
+            }
+            smoothed.append(path[farthest])
+            current = farthest
+        }
+        
+        return smoothed
     }
     
     // MARK: - Update Device Position
