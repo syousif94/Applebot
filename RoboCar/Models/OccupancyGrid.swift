@@ -990,6 +990,157 @@ class OccupancyGrid {
         return []  // No path found
     }
     
+    /// Find a path allowing traversal through unknown cells (greedy fallback).
+    /// Uses A* with unknown cells treated as high-cost passable terrain.
+    /// This lets the robot navigate toward unexplored areas.
+    func findPathGreedy(fromX: Float, fromY: Float, toX: Float, toY: Float) -> [(x: Float, y: Float)] {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard var start = worldToGrid(fromX, fromY),
+              var goal = worldToGrid(toX, toY) else { return [] }
+        
+        // If start isn't free, find nearest free cell
+        if cells[start.x][start.y] == CellState.occupied.rawValue {
+            if let nearest = findNearestFreeCell(gridX: start.x, gridY: start.y) {
+                start = nearest
+            } else { return [] }
+        }
+        
+        // Goal can be in unknown territory — find nearest non-occupied cell
+        if cells[goal.x][goal.y] == CellState.occupied.rawValue {
+            if let nearest = findNearestFreeCell(gridX: goal.x, gridY: goal.y) {
+                goal = nearest
+            } else { return [] }
+        }
+        
+        if start.x == goal.x && start.y == goal.y { return [] }
+        
+        let clearanceCells = 2  // Slightly less clearance for greedy
+        
+        func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
+            for r in 1...clearanceCells {
+                for ddx in -r...r {
+                    for ddy in -r...r {
+                        guard abs(ddx) == r || abs(ddy) == r else { continue }
+                        let cx = x + ddx, cy = y + ddy
+                        if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
+                            if cells[cx][cy] == CellState.occupied.rawValue {
+                                return 8.0 * Float(clearanceCells + 1 - r) / Float(clearanceCells)
+                            }
+                        }
+                    }
+                }
+            }
+            return 0
+        }
+        
+        let sqrt2: Float = 1.41421356
+        let directions: [(dx: Int, dy: Int, cost: Float)] = [
+            (-1, 0, 1), (1, 0, 1), (0, -1, 1), (0, 1, 1),
+            (-1, -1, sqrt2), (-1, 1, sqrt2), (1, -1, sqrt2), (1, 1, sqrt2)
+        ]
+        
+        // Cost penalty for traversing unknown cells
+        let unknownPenalty: Float = 3.0
+        
+        func heuristic(_ x: Int, _ y: Int) -> Float {
+            let dx = Float(abs(x - goal.x))
+            let dy = Float(abs(y - goal.y))
+            return max(dx, dy) + (sqrt2 - 1) * min(dx, dy)
+        }
+        
+        func key(_ x: Int, _ y: Int) -> Int { x * gridSize + y }
+        
+        struct AStarNode: Comparable {
+            let x: Int, y: Int, f: Float, g: Float
+            static func < (lhs: AStarNode, rhs: AStarNode) -> Bool { lhs.f < rhs.f }
+        }
+        
+        var openList: [AStarNode] = []
+        var gScore: [Int: Float] = [:]
+        var cameFrom: [Int: Int] = [:]
+        var closedSet = Set<Int>()
+        
+        let startKey = key(start.x, start.y)
+        let goalKey = key(goal.x, goal.y)
+        gScore[startKey] = 0
+        openList.append(AStarNode(x: start.x, y: start.y, f: heuristic(start.x, start.y), g: 0))
+        
+        let maxIterations = 150_000
+        var iterations = 0
+        
+        while !openList.isEmpty && iterations < maxIterations {
+            iterations += 1
+            
+            var minIdx = 0
+            for i in 1..<openList.count {
+                if openList[i].f < openList[minIdx].f { minIdx = i }
+            }
+            let current = openList.remove(at: minIdx)
+            let currentKey = key(current.x, current.y)
+            
+            if currentKey == goalKey {
+                var gridPath: [(x: Int, y: Int)] = [(goal.x, goal.y)]
+                var ck = goalKey
+                while let parentKey = cameFrom[ck] {
+                    let px = parentKey / gridSize
+                    let py = parentKey % gridSize
+                    gridPath.append((px, py))
+                    ck = parentKey
+                }
+                gridPath.reverse()
+                let smoothed = smoothPath(gridPath)
+                return smoothed.map { cell in
+                    let world = gridToWorld(cell.x, cell.y)
+                    return (x: world.x, y: world.y)
+                }
+            }
+            
+            if closedSet.contains(currentKey) { continue }
+            closedSet.insert(currentKey)
+            
+            for dir in directions {
+                let nx = current.x + dir.dx
+                let ny = current.y + dir.dy
+                guard nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize else { continue }
+                let nKey = key(nx, ny)
+                if closedSet.contains(nKey) { continue }
+                
+                let cellState = CellState(rawValue: cells[nx][ny]) ?? .unknown
+                
+                // Block occupied cells (never traverse walls)
+                if cellState == .occupied { continue }
+                
+                // For diagonal moves, check corners
+                if dir.dx != 0 && dir.dy != 0 {
+                    let cx1 = current.x + dir.dx, cy1 = current.y
+                    let cx2 = current.x, cy2 = current.y + dir.dy
+                    if cx1 >= 0 && cx1 < gridSize && cy1 >= 0 && cy1 < gridSize &&
+                       cx2 >= 0 && cx2 < gridSize && cy2 >= 0 && cy2 < gridSize {
+                        if cells[cx1][cy1] == CellState.occupied.rawValue ||
+                           cells[cx2][cy2] == CellState.occupied.rawValue {
+                            continue
+                        }
+                    }
+                }
+                
+                // Unknown cells get a penalty but are traversable
+                let extraCost: Float = (cellState == .unknown) ? unknownPenalty : 0
+                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny) + extraCost
+                
+                if tentativeG < (gScore[nKey] ?? .greatestFiniteMagnitude) {
+                    gScore[nKey] = tentativeG
+                    cameFrom[nKey] = currentKey
+                    let f = tentativeG + heuristic(nx, ny)
+                    openList.append(AStarNode(x: nx, y: ny, f: f, g: tentativeG))
+                }
+            }
+        }
+        
+        return []
+    }
+    
     /// Smooth a grid path by removing intermediate waypoints when line-of-sight exists.
     /// Must be called while lock is held.
     private func smoothPath(_ path: [(x: Int, y: Int)]) -> [(x: Int, y: Int)] {

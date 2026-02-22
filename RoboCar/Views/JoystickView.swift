@@ -144,8 +144,8 @@ class JoystickView: UIView {
         setNeedsDisplay()
         
         // Normalize to -1…1
-        let normX = Float(dx / maxDist)
-        let normY = Float(dy / maxDist)  // Up = negative (backward), Down = positive (forward)
+        let normX = Float(-dx / maxDist)  // Negate: left/right is inverted (phone faces backward)
+        let normY = Float(-dy / maxDist)  // Negate: screen Y is inverted, up = forward (positive)
         
         // Apply dead zone
         let mag = sqrt(normX * normX + normY * normY)

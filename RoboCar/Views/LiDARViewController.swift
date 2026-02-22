@@ -22,6 +22,7 @@ class LiDARViewController: UIViewController {
     private var micButton: UIButton!
     private var voiceStatusLabel: UILabel!
     private var obstaclePointOverlay: ObstaclePointOverlayView!
+    private var navigateButton: UIButton!
     
     // MARK: - Voice Assistant
     
@@ -62,6 +63,9 @@ class LiDARViewController: UIViewController {
     /// Anchor entity for the 3D path mesh in the AR scene
     private var pathAnchor: AnchorEntity?
     
+    /// Navigation controller for autonomous driving
+    private let pathNavigator = PathNavigator.shared
+    
     // MARK: - Lifecycle
     
     override func viewDidLoad() {
@@ -77,8 +81,10 @@ class LiDARViewController: UIViewController {
         setupMicButton()
         setupVoiceAssistant()
         setupObstacleOverlay()
+        setupNavigateButton()
         setupMeshProcessor()
         setupObstacleDetector()
+        setupNavigationController()
         
         // Use CADisplayLink for smooth updates
         displayLink = CADisplayLink(target: self, selector: #selector(updateFrame))
@@ -392,6 +398,9 @@ class LiDARViewController: UIViewController {
     /// Clears the grid, mesh tracking, and view state without restarting the AR session.
     /// Used both by the manual reset button and automatic relocalization reset.
     private func resetGridState() {
+        // Stop navigation if active
+        pathNavigator.stopNavigation()
+        
         // Invalidate any in-flight mesh processing BEFORE clearing
         // This increments generation so stale mesh data will be discarded
         meshProcessor.reset()
@@ -428,6 +437,99 @@ class LiDARViewController: UIViewController {
             obstaclePointOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
             obstaclePointOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
         ])
+    }
+    
+    private func setupNavigateButton() {
+        navigateButton = UIButton(type: .system)
+        navigateButton.translatesAutoresizingMaskIntoConstraints = false
+        navigateButton.setTitle("Navigate", for: .normal)
+        navigateButton.setTitleColor(.white, for: .normal)
+        navigateButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+        navigateButton.layer.cornerRadius = 18
+        navigateButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 24, bottom: 8, right: 24)
+        navigateButton.addTarget(self, action: #selector(navigateButtonTapped), for: .touchUpInside)
+        navigateButton.isHidden = true
+        
+        view.addSubview(navigateButton)
+        
+        NSLayoutConstraint.activate([
+            navigateButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            navigateButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
+            navigateButton.heightAnchor.constraint(equalToConstant: 36),
+        ])
+    }
+    
+    private func setupNavigationController() {
+        pathNavigator.occupancyGrid = occupancyGrid
+        
+        pathNavigator.onStateChanged = { [weak self] state in
+            DispatchQueue.main.async {
+                self?.updateNavigateButtonForState(state)
+            }
+        }
+        
+        pathNavigator.onPathUpdated = { [weak self] path in
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.plannedPath = path
+                self.gridMapView.plannedPath = path
+                self.gridMapView.setNeedsDisplay()
+                self.rebuildPathMesh(from: path)
+            }
+        }
+    }
+    
+    @objc private func navigateButtonTapped() {
+        if pathNavigator.state == .navigating || pathNavigator.state == .paused {
+            // Stop navigation
+            pathNavigator.stopNavigation()
+            gridMapView.pathTargetPoint = nil
+            plannedPath.removeAll()
+            gridMapView.plannedPath = []
+            pathAnchor?.removeFromParent()
+            pathAnchor = nil
+            gridMapView.setNeedsDisplay()
+        } else if !plannedPath.isEmpty, let target = gridMapView.pathTargetPoint {
+            // Start navigating along the current planned path
+            pathNavigator.startNavigation(to: target, path: plannedPath)
+        }
+    }
+    
+    private func updateNavigateButtonForState(_ state: NavigationState) {
+        switch state {
+        case .idle:
+            if gridMapView.pathTargetPoint != nil && !plannedPath.isEmpty {
+                navigateButton.setTitle("Navigate", for: .normal)
+                navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+                navigateButton.isHidden = false
+            } else {
+                navigateButton.isHidden = true
+            }
+        case .navigating:
+            navigateButton.setTitle("Stop", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
+            navigateButton.isHidden = false
+        case .paused:
+            navigateButton.setTitle("Stop", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.6, blue: 0.1, alpha: 0.9)
+            navigateButton.isHidden = false
+        case .arrived:
+            navigateButton.setTitle("Arrived ✓", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.8, blue: 0.3, alpha: 0.9)
+            navigateButton.isHidden = false
+            // Auto-hide after a delay
+            DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+                guard self?.pathNavigator.state == .arrived else { return }
+                self?.navigateButton.isHidden = true
+                self?.gridMapView.pathTargetPoint = nil
+                self?.plannedPath.removeAll()
+                self?.gridMapView.plannedPath = []
+                self?.pathAnchor?.removeFromParent()
+                self?.pathAnchor = nil
+                self?.gridMapView.setNeedsDisplay()
+            }
+        }
     }
     
     private func setupMeshProcessor() {
@@ -469,7 +571,13 @@ class LiDARViewController: UIViewController {
     
     /// Plan a path from the current device position to the tapped world position.
     /// Runs A* on a background thread, then updates the grid and AR overlays on main.
+    /// Falls back to greedy search (through unknown cells) if A* finds nothing.
     private func planPath(toX: Float, toY: Float) {
+        // If navigation is active, stop it before re-planning
+        if pathNavigator.state == .navigating || pathNavigator.state == .paused {
+            pathNavigator.stopNavigation()
+        }
+        
         let devicePos = occupancyGrid.devicePosition
         let startX = devicePos.x
         let startY = devicePos.y
@@ -483,7 +591,11 @@ class LiDARViewController: UIViewController {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
-            let path = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            // Try strict A* first (free cells only), then greedy fallback (allows unknown)
+            var path = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            if path.isEmpty {
+                path = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            }
             
             // Densify the path: interpolate points along each segment
             var densePath: [(x: Float, y: Float)] = []
@@ -541,10 +653,55 @@ class LiDARViewController: UIViewController {
                 
                 if path.isEmpty {
                     print("[Path] ❌ No path found to (\(String(format: "%.2f", toX)), \(String(format: "%.2f", toY)))")
+                    self.navigateButton.isHidden = true
                 } else {
                     print("[Path] ✅ Path found: \(path.count) waypoints, \(densePath.count) mesh points")
+                    // Show navigate button
+                    self.navigateButton.setTitle("Navigate", for: .normal)
+                    self.navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+                    self.navigateButton.isHidden = false
                 }
             }
+        }
+    }
+    
+    /// Rebuild the 3D AR path mesh from a set of world-coordinate waypoints.
+    private func rebuildPathMesh(from path: [(x: Float, y: Float)]) {
+        // Densify
+        var densePath: [(x: Float, y: Float)] = []
+        let spacing: Float = 0.05
+        for i in 0..<path.count {
+            let pt = path[i]
+            densePath.append(pt)
+            if i < path.count - 1 {
+                let next = path[i + 1]
+                let dx = next.x - pt.x
+                let dy = next.y - pt.y
+                let dist = sqrt(dx * dx + dy * dy)
+                let steps = Int(dist / spacing)
+                for s in 1..<steps {
+                    let t = Float(s) / Float(steps)
+                    densePath.append((x: pt.x + dx * t, y: pt.y + dy * t))
+                }
+            }
+        }
+        let floorY = self.meshProcessor.floorHeight
+        let points3D = densePath.map { pt in
+            simd_float3(pt.x, floorY + 0.02, pt.y)
+        }
+        self.pathPoints3D = points3D
+        
+        pathAnchor?.removeFromParent()
+        pathAnchor = nil
+        
+        if let mesh = createPathMesh(from: points3D, width: 0.05) {
+            var material = UnlitMaterial()
+            material.color = .init(tint: UIColor(red: 0.0, green: 0.9, blue: 0.3, alpha: 0.9))
+            let entity = ModelEntity(mesh: mesh, materials: [material])
+            let anchor = AnchorEntity(world: .zero)
+            anchor.addChild(entity)
+            arView.scene.addAnchor(anchor)
+            pathAnchor = anchor
         }
     }
     
@@ -720,6 +877,27 @@ class LiDARViewController: UIViewController {
         // Redraw grid every 6 frames (~5Hz at 30fps)
         if frameCount % 6 == 0 {
             gridMapView.setNeedsDisplay()
+        }
+        
+        // Navigation re-planning: if navigation is active and a re-plan is due,
+        // re-run pathfinding from current position to the original target.
+        if pathNavigator.needsReplan, let target = pathNavigator.targetPoint {
+            let pos = occupancyGrid.devicePosition
+            DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                guard let self = self else { return }
+                var path = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                if path.isEmpty {
+                    path = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                }
+                guard !path.isEmpty else { return }
+                DispatchQueue.main.async {
+                    self.plannedPath = path
+                    self.gridMapView.plannedPath = path
+                    self.gridMapView.setNeedsDisplay()
+                    self.rebuildPathMesh(from: path)
+                    self.pathNavigator.updatePath(path)
+                }
+            }
         }
     }
     
