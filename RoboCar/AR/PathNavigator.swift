@@ -72,7 +72,7 @@ class PathNavigator {
     private(set) var currentPath: [(x: Float, y: Float)] = []
     
     /// Index of the next waypoint we're pursuing
-    private var currentWaypointIndex: Int = 0
+    private(set) var currentWaypointIndex: Int = 0
     
     /// Timer driving the control loop
     private var navTimer: Timer?
@@ -376,7 +376,7 @@ class PathNavigator {
         
         // Phase 0: reverse at 60% power
         let reversePower: Int8 = -60
-        ESP32BLEManager.shared.setAllMotors(a: reversePower, b: reversePower, c: reversePower, d: reversePower, bypassObstacleFilter: true)
+        ESP32BLEManager.shared.setAllMotors(a: reversePower, b: reversePower, c: reversePower, d: reversePower)
         log("↩️ Reversing...")
     }
     
@@ -409,9 +409,9 @@ class PathNavigator {
                 
                 let turnPower: Int8 = 60
                 if turnRight {
-                    ESP32BLEManager.shared.setAllMotors(a: turnPower, b: -turnPower, c: turnPower, d: -turnPower, bypassObstacleFilter: true)
+                    ESP32BLEManager.shared.setAllMotors(a: turnPower, b: -turnPower, c: turnPower, d: -turnPower)
                 } else {
-                    ESP32BLEManager.shared.setAllMotors(a: -turnPower, b: turnPower, c: -turnPower, d: turnPower, bypassObstacleFilter: true)
+                    ESP32BLEManager.shared.setAllMotors(a: -turnPower, b: turnPower, c: -turnPower, d: turnPower)
                 }
                 log("↩️ Turning \(turnRight ? "right" : "left") to avoid obstacle")
             }

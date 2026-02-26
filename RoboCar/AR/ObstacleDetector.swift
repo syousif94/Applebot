@@ -45,8 +45,13 @@ class ObstacleDetector {
     
     // MARK: - Configuration
     
-    /// Protective radius in meters — any obstacle within this distance triggers avoidance
-    var stopRadius: Float = 0.18  // 180mm
+    /// Protective radius in meters — any obstacle within this distance triggers avoidance.
+    /// Must exceed the car’s half-width (17.5cm for a 35cm car) to stop before contact.
+    var stopRadius: Float = 0.20  // 20cm
+    
+    /// Detection radius for the LiDAR depth map (meters) — wider than stopRadius
+    /// to catch dynamic obstacles early and allow evasive steering
+    var depthDetectionRadius: Float = 0.30  // 30cm
     
     /// Whether obstacle avoidance is enabled
     var isEnabled: Bool = true
@@ -156,8 +161,8 @@ class ObstacleDetector {
         for py in stride(from: 0, to: height, by: sampleStepY) {
             for px in stride(from: 0, to: width, by: sampleStepX) {
                 let depth = floatBuffer[py * floatsPerRow + px]
-                // Ignore invalid readings and very far objects
-                guard depth > 0.01 && depth < stopRadius else { continue }
+                // Ignore invalid readings and objects beyond depth detection range
+                guard depth > 0.01 && depth < depthDetectionRadius else { continue }
                 
                 // Project depth pixel to world space to check its height.
                 // Intrinsics use (x-right, y-down, z-forward); camera.transform
@@ -187,7 +192,7 @@ class ObstacleDetector {
             }
         }
         
-        guard minDepth < stopRadius else {
+        guard minDepth < depthDetectionRadius else {
             if depthObstacleDistance != nil {
                 depthObstacleDistance = nil
                 depthObstacleWorldPosition = nil
@@ -420,7 +425,7 @@ class ObstacleDetector {
         
         // Also check depth-based detection for dynamic obstacles
         let hasGridObstacles = !realObstacles.isEmpty
-        let hasDepthObstacle = depthObstacleDistance != nil
+        let hasDepthObstacle = depthObstacleDistance != nil && depthObstacleDistance! < stopRadius
         
         guard hasGridObstacles || hasDepthObstacle else {
             if obstacleDetected {
@@ -500,8 +505,8 @@ class ObstacleDetector {
         }
         nearbyObstacles = uniqueObstacles
         
-        // Merge depth-based obstacle if present — compute angle from grid world position
-        if let depthDist = depthObstacleDistance, let depthWorldPos = depthObstacleWorldPosition {
+        // Merge depth-based obstacle if present (only within stop radius for blocked-direction calc)
+        if let depthDist = depthObstacleDistance, depthDist <= stopRadius, let depthWorldPos = depthObstacleWorldPosition {
             if depthDist < nearest {
                 nearest = depthDist
                 nearestClassif = .none
@@ -560,10 +565,18 @@ class ObstacleDetector {
         }
         
         if !wasBlocked {
-            print("[Obstacle] 🛑 Obstacle within \(Int(stopRadius * 1000))mm — nearest at \(String(format: "%.0f", nearest * 1000))mm")
+            // Describe obstacle direction relative to device
+            var dirLabel = "unknown direction"
+            if let local = blockedLocalDirection {
+                let angle = atan2f(local.x, local.y) * 180 / .pi  // 0° = ahead, +90° = right
+                if angle > 60        { dirLabel = "right" }
+                else if angle > 20   { dirLabel = "front-right" }
+                else if angle > -20  { dirLabel = "ahead" }
+                else if angle > -60  { dirLabel = "front-left" }
+                else                 { dirLabel = "left" }
+            }
+            print("[Obstacle] 🛑 Obstacle \(dirLabel) within \(Int(stopRadius * 1000))mm — nearest at \(String(format: "%.0f", nearest * 1000))mm")
             onObstacleStateChanged?(true, nearest)
-            // Stop motors if they're driving toward the obstacle
-            stopMotionIfNeeded()
         }
     }
     
@@ -578,96 +591,95 @@ class ObstacleDetector {
         onObstacleStateChanged?(false, nil)
     }
     
+    // MARK: - Path-Width Obstacle Detection
+    
+    /// Half-width of the car in meters. Obstacles within this lateral distance
+    /// of the travel line are considered "in the path".
+    var carHalfWidth: Float = 0.15  // 15cm each side → 30cm total
+    
+    /// Checks if any detected obstacle lies within a rectangular corridor
+    /// defined by a world-space heading from the device position.
+    /// The corridor is `stopRadius` long and `2 × carHalfWidth` wide.
+    /// Only obstacles AHEAD (positive projection) are considered.
+    func hasObstacleInPath(heading: Float) -> Bool {
+        guard let grid = occupancyGrid else { return false }
+        let pos = grid.devicePosition
+        
+        // Unit vector along the travel heading
+        let fwdX = sinf(heading)
+        let fwdY = cosf(heading)
+        // Perpendicular (right-pointing)
+        let rightX = cosf(heading)
+        let rightY = -sinf(heading)
+        
+        // Check mesh/grid-based obstacle positions
+        for cell in obstacleWorldPositions {
+            let dx = cell.x - pos.x
+            let dy = cell.y - pos.y
+            // Project onto forward axis
+            let fwd = dx * fwdX + dy * fwdY
+            if fwd < 0 { continue }  // behind us
+            if fwd > stopRadius { continue }  // beyond stop radius
+            // Project onto lateral axis
+            let lat = dx * rightX + dy * rightY
+            if fabsf(lat) < carHalfWidth {
+                return true
+            }
+        }
+        
+        // Check LiDAR depth obstacle
+        if let depthDist = depthObstacleDistance, depthDist <= stopRadius,
+           let depthPos = depthObstacleWorldPosition {
+            let dx = depthPos.x - pos.x
+            let dy = depthPos.y - pos.y
+            let fwd = dx * fwdX + dy * fwdY
+            if fwd > 0 && fwd <= stopRadius {
+                let lat = dx * rightX + dy * rightY
+                if fabsf(lat) < carHalfWidth {
+                    return true
+                }
+            }
+        }
+        
+        return false
+    }
+    
+    /// Finds the world-space heading closest to `preferred` that has a clear
+    /// path corridor (no obstacles within car width). Alternates scanning
+    /// right and left from the preferred heading.
+    /// Returns nil if all directions are blocked.
+    func findClearHeading(preferred: Float, searchStep: Float = 15.0 * .pi / 180.0) -> Float? {
+        // First check if the preferred heading itself is clear
+        if !hasObstacleInPath(heading: preferred) {
+            return preferred
+        }
+        
+        // Search alternating right and left in increasing offsets
+        let maxSteps = Int(.pi / searchStep)
+        for step in 1...maxSteps {
+            let offset = Float(step) * searchStep
+            
+            // Try right (+offset)
+            var rightHeading = preferred + offset
+            if rightHeading >  .pi { rightHeading -= 2 * .pi }
+            if rightHeading < -.pi { rightHeading += 2 * .pi }
+            if !hasObstacleInPath(heading: rightHeading) {
+                return rightHeading
+            }
+            
+            // Try left (-offset)
+            var leftHeading = preferred - offset
+            if leftHeading >  .pi { leftHeading -= 2 * .pi }
+            if leftHeading < -.pi { leftHeading += 2 * .pi }
+            if !hasObstacleInPath(heading: leftHeading) {
+                return leftHeading
+            }
+        }
+        
+        return nil  // completely surrounded
+    }
+    
     // MARK: - Motor Filtering
     
-    /// Filter a joystick drive command.
-    /// x = turn (+ right), y = throttle (+ forward relative to device heading).
-    /// Blocks the component of motion that points toward obstacles; allows escape.
-    func filterDrive(x: Float, y: Float) -> (x: Float, y: Float) {
-        guard isEnabled, obstacleDetected, let blocked = blockedLocalDirection else {
-            return (x, y)
-        }
-        
-        // Project joystick vector onto blocked direction
-        let dot = x * blocked.x + y * blocked.y
-        
-        // If the joystick is pointing away from the obstacle (dot < 0), allow it fully
-        if dot <= 0 {
-            return (x, y)
-        }
-        
-        // Remove the component pointing toward the obstacle
-        let filteredX = x - dot * blocked.x
-        let filteredY = y - dot * blocked.y
-        
-        return (filteredX, filteredY)
-    }
-    
-    /// Filter raw motor powers.
-    /// Determines the net movement direction from motor values and blocks
-    /// motion toward obstacles.
-    func filterMotors(a: Int8, b: Int8, c: Int8, d: Int8) -> (a: Int8, b: Int8, c: Int8, d: Int8) {
-        guard isEnabled, obstacleDetected, let blocked = blockedLocalDirection else {
-            return (a, b, c, d)
-        }
-        
-        // All zero — always pass through
-        if a == 0 && b == 0 && c == 0 && d == 0 {
-            return (0, 0, 0, 0)
-        }
-        
-        // Derive approximate local movement direction from motor powers:
-        // Left side = (a + c) / 2, Right side = (b + d) / 2
-        let leftPower  = Float(Int(a) + Int(c)) / 2.0
-        let rightPower = Float(Int(b) + Int(d)) / 2.0
-        
-        // Forward component: average of both sides
-        let forward = (leftPower + rightPower) / 2.0
-        // Turn component: difference (positive = turning right in place)
-        let turn = (leftPower - rightPower) / 2.0
-        
-        // Movement direction in device-local space: (turn, forward)
-        // turn > 0 with no forward = spinning right, which sweeps the front right
-        // For simplicity, map: localX ~ turn, localY ~ forward
-        let moveX = turn / 100.0   // normalize to -1…1 range
-        let moveY = forward / 100.0
-        
-        // Dot product with blocked direction
-        let dot = moveX * blocked.x + moveY * blocked.y
-        
-        // Moving away from obstacle — allow
-        if dot <= 0 {
-            return (a, b, c, d)
-        }
-        
-        // Moving toward obstacle — block all motion
-        // (We can't easily decompose motor powers into components,
-        //  so we fully block rather than partially)
-        return (0, 0, 0, 0)
-    }
-    
-    /// If motors are currently moving toward the obstacle, stop immediately
-    private func stopMotionIfNeeded() {
-        let ble = ESP32BLEManager.shared
-        guard let lastData = ble.lastMotorDataPublic, lastData.count == 4 else { return }
-        guard let blocked = blockedLocalDirection else { return }
-        
-        let a = Int8(bitPattern: lastData[0])
-        let b = Int8(bitPattern: lastData[1])
-        let c = Int8(bitPattern: lastData[2])
-        let d = Int8(bitPattern: lastData[3])
-        
-        if a == 0 && b == 0 && c == 0 && d == 0 { return }
-        
-        let leftPower  = Float(Int(a) + Int(c)) / 2.0
-        let rightPower = Float(Int(b) + Int(d)) / 2.0
-        let forward = (leftPower + rightPower) / 200.0
-        let turn    = (leftPower - rightPower) / 200.0
-        
-        let dot = turn * blocked.x + forward * blocked.y
-        if dot > 0 {
-            ble.stopAll()
-        }
-    }
 }
 

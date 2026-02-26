@@ -149,8 +149,11 @@
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Bluetooth is used to connect to robots.";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses local network access for telemetry";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoboCar uses the microphone for voice commands to control the car.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "RoboCar uses speech recognition to understand voice commands for driving the car.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;
@@ -184,8 +187,11 @@
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
-				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "Bluetooth is used to connect to robots.";
+				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses local network access for telemetry";
+				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoboCar uses the microphone for voice commands to control the car.";
+				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "RoboCar uses speech recognition to understand voice commands for driving the car.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchStoryboardName = LaunchScreen;
 				INFOPLIST_KEY_UIMainStoryboardFile = Main;

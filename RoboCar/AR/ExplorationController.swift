@@ -383,5 +383,27 @@ class ExplorationController {
     private func log(_ message: String) {
         print("[Explore] \(message)")
         onStatusUpdate?(message)
+        
+        // Telemetry: emit exploration event
+        let grid = ObstacleDetector.shared.occupancyGrid
+        let cameraTransform = TelemetryService.shared.lastCameraTransform
+        let status: String
+        if message.contains("Starting") { status = "started" }
+        else if message.contains("scan") || message.contains("Scan") { status = "scanning" }
+        else if message.contains("frontier") || message.contains("Frontier") { status = "target_selected" }
+        else if message.contains("Turning") { status = "turning" }
+        else if message.contains("Driving") { status = "driving" }
+        else if message.contains("Stuck") || message.contains("stuck") { status = "stuck" }
+        else if message.contains("complete") || message.contains("fully mapped") { status = "completed" }
+        else if message.contains("stopped") || message.contains("Stopped") { status = "stopped" }
+        else if message.contains("Time limit") { status = "time_limit" }
+        else { status = "info" }
+        
+        TelemetryService.shared.logExplorationEvent(
+            status: status,
+            message: message,
+            occupancyGrid: grid,
+            cameraTransform: cameraTransform
+        )
     }
 }

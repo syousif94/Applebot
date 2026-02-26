@@ -27,7 +27,7 @@ struct DriveForwardTool: Tool {
     func call(arguments: Arguments) async throws -> String {
         let power = Int8(min(100, max(1, arguments.speed)))
         await MainActor.run {
-            ESP32BLEManager.shared.setAllMotors(a: power, b: power, c: power, d: power, bypassObstacleFilter: true)
+            ESP32BLEManager.shared.setAllMotors(a: power, b: power, c: power, d: power)
         }
         
         try await Task.sleep(for: .seconds(arguments.duration))
@@ -57,7 +57,7 @@ struct DriveBackwardTool: Tool {
     func call(arguments: Arguments) async throws -> String {
         let power = -Int8(min(100, max(1, arguments.speed)))
         await MainActor.run {
-            ESP32BLEManager.shared.setAllMotors(a: power, b: power, c: power, d: power, bypassObstacleFilter: true)
+            ESP32BLEManager.shared.setAllMotors(a: power, b: power, c: power, d: power)
         }
         
         try await Task.sleep(for: .seconds(arguments.duration))
@@ -88,7 +88,7 @@ struct TurnLeftTool: Tool {
         let power = Int8(min(100, max(1, arguments.speed)))
         // Left wheels backward, right wheels forward = turn left
         await MainActor.run {
-            ESP32BLEManager.shared.setAllMotors(a: -power, b: power, c: -power, d: power, bypassObstacleFilter: true)
+            ESP32BLEManager.shared.setAllMotors(a: -power, b: power, c: -power, d: power)
         }
         
         try await Task.sleep(for: .seconds(arguments.duration))
@@ -119,7 +119,7 @@ struct TurnRightTool: Tool {
         let power = Int8(min(100, max(1, arguments.speed)))
         // Left wheels forward, right wheels backward = turn right
         await MainActor.run {
-            ESP32BLEManager.shared.setAllMotors(a: power, b: -power, c: power, d: -power, bypassObstacleFilter: true)
+            ESP32BLEManager.shared.setAllMotors(a: power, b: -power, c: power, d: -power)
         }
         
         try await Task.sleep(for: .seconds(arguments.duration))

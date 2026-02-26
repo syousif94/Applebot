@@ -54,6 +54,9 @@ class LiDARViewController: UIViewController {
     /// Flag to pause mesh processing during reset
     private var isResetting = false
     
+    /// Guard against concurrent replan dispatches that retain ARFrames
+    private var isReplanning = false
+    
     /// Planned path waypoints in world coordinates (grid X/Y)
     private var plannedPath: [(x: Float, y: Float)] = []
     
@@ -463,10 +466,35 @@ class LiDARViewController: UIViewController {
     private func setupNavigationController() {
         pathNavigator.occupancyGrid = occupancyGrid
         
+        // Start telemetry service
+        TelemetryService.shared.start()
+        
+        let previousOnStateChanged = pathNavigator.onStateChanged
         pathNavigator.onStateChanged = { [weak self] state in
+            // Telemetry: log nav state change
+            if let oldState = self?.pathNavigator.state {
+                // The didSet fires before the value is committed to callers,
+                // but we get the new value from the callback. Use a simple reason.
+                var reason = "unknown"
+                switch state {
+                case .idle: reason = "cancelled"
+                case .navigating: reason = "started"
+                case .paused: reason = "obstacle_blocking"
+                case .arrived: reason = "arrived"
+                }
+                // Use cached transform to avoid retaining an ARFrame
+                let cachedTransform = TelemetryService.shared.lastCameraTransform
+                TelemetryService.shared.logNavStateChange(
+                    from: oldState, to: state, reason: reason,
+                    occupancyGrid: self?.occupancyGrid,
+                    cameraTransform: cachedTransform
+                )
+            }
+
             DispatchQueue.main.async {
                 self?.updateNavigateButtonForState(state)
             }
+            previousOnStateChanged?(state)
         }
         
         pathNavigator.onPathUpdated = { [weak self] path in
@@ -540,6 +568,24 @@ class LiDARViewController: UIViewController {
         obstacleDetector.occupancyGrid = occupancyGrid
         MotorCalibrator.shared.occupancyGrid = occupancyGrid
         gridMapView.obstacleDetector = obstacleDetector
+        
+        // Telemetry: log obstacle state changes
+        obstacleDetector.onObstacleStateChanged = { [weak self] detected, distance in
+            guard let self = self else { return }
+            let action = detected ? "detected" : "cleared"
+            let motor = MotorSnapshot(fromBLEData: ESP32BLEManager.shared.lastMotorDataPublic)
+            // Use cached transform to avoid retaining an ARFrame
+            let cachedTransform = TelemetryService.shared.lastCameraTransform
+            TelemetryService.shared.logObstacleEvent(
+                action: action,
+                obstacles: self.obstacleDetector.nearbyObstacles,
+                motorBefore: motor,
+                motorAfter: detected ? .zero : motor,
+                triggerSource: "mesh_grid",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: cachedTransform
+            )
+        }
     }
     
     // MARK: - AR Session
@@ -573,6 +619,12 @@ class LiDARViewController: UIViewController {
     /// Runs A* on a background thread, then updates the grid and AR overlays on main.
     /// Falls back to greedy search (through unknown cells) if A* finds nothing.
     private func planPath(toX: Float, toY: Float) {
+        // Don't attempt pathfinding when the grid has no scanned data
+        guard occupancyGrid.freeCount > 0 else {
+            print("[Path] ⚠️ No mesh data in grid — ignoring tap")
+            return
+        }
+        
         // If navigation is active, stop it before re-planning
         if pathNavigator.state == .navigating || pathNavigator.state == .paused {
             pathNavigator.stopNavigation()
@@ -591,10 +643,30 @@ class LiDARViewController: UIViewController {
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self = self else { return }
             
+            let planStart = CFAbsoluteTimeGetCurrent()
+            
             // Try strict A* first (free cells only), then greedy fallback (allows unknown)
             var path = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            var algorithm = "astar"
             if path.isEmpty {
                 path = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: toX, toY: toY)
+                algorithm = "greedy"
+            }
+            
+            let planDurationMs = Float((CFAbsoluteTimeGetCurrent() - planStart) * 1000)
+            
+            // Log route to telemetry (use cached transform to avoid retaining ARFrame)
+            if !path.isEmpty {
+                TelemetryService.shared.logRoutePlanned(
+                    target: (x: toX, y: toY),
+                    origin: (x: startX, y: startY),
+                    waypoints: path,
+                    algorithm: algorithm,
+                    reason: "user_tap",
+                    planDurationMs: planDurationMs,
+                    occupancyGrid: self.occupancyGrid,
+                    cameraTransform: TelemetryService.shared.lastCameraTransform
+                )
             }
             
             // Densify the path: interpolate points along each segment
@@ -611,6 +683,7 @@ class LiDARViewController: UIViewController {
                     let dy = next.y - pt.y
                     let dist = sqrt(dx * dx + dy * dy)
                     let steps = Int(dist / spacing)
+                    guard steps > 1 else { continue }
                     
                     for s in 1..<steps {
                         let t = Float(s) / Float(steps)
@@ -679,6 +752,7 @@ class LiDARViewController: UIViewController {
                 let dy = next.y - pt.y
                 let dist = sqrt(dx * dx + dy * dy)
                 let steps = Int(dist / spacing)
+                guard steps > 1 else { continue }
                 for s in 1..<steps {
                     let t = Float(s) / Float(steps)
                     densePath.append((x: pt.x + dx * t, y: pt.y + dy * t))
@@ -818,14 +892,19 @@ class LiDARViewController: UIViewController {
         frameCount += 1
         
         // Extract only what we need from the frame in a minimal scope
-        // to avoid holding AR frame references longer than necessary
-        let cameraTransform: simd_float4x4
-        let meshCount: Int
+        // to avoid holding AR frame references longer than necessary.
+        // autoreleasepool ensures the ARFrame and its buffers are released
+        // promptly, preventing the "retaining N ARFrames" warning.
+        var cameraTransform: simd_float4x4 = matrix_identity_float4x4
+        var meshCount: Int = 0
         var obstaclePoints3D: [simd_float3] = []
-        
-        if let frame = arView.session.currentFrame {
+        var meshAnchorSnapshots: [MeshAnchorSnapshot]?
+
+        let frameAvailable: Bool = autoreleasepool {
+            guard let frame = arView.session.currentFrame else { return false }
             cameraTransform = frame.camera.transform
-            meshCount = frame.anchors.lazy.compactMap { $0 as? ARMeshAnchor }.count
+            let meshAnchors = frame.anchors.compactMap { $0 as? ARMeshAnchor }
+            meshCount = meshAnchors.count
             // Feed floor height from mesh processor so depth detection can filter floor/ceiling
             obstacleDetector.floorHeight = meshProcessor.floorHeight
             obstacleDetector.floorHeightEstimated = meshProcessor.floorInitialized
@@ -835,10 +914,15 @@ class LiDARViewController: UIViewController {
             if frameCount % 2 == 0 {
                 obstaclePoints3D = obstacleDetector.collectObstaclePoints3D(frame: frame)
             }
-            // frame goes out of scope here, releasing the reference
-        } else {
-            return
+            // Extract mesh anchor geometry for telemetry at ~1 Hz
+            if frameCount % 30 == 0 {
+                let gen = meshProcessor.currentGeneration()
+                meshAnchorSnapshots = meshAnchors.map { MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen) }
+            }
+            // frame is released here when autoreleasepool drains
+            return true
         }
+        guard frameAvailable else { return }
         
         // Update device position every frame
         occupancyGrid.updateDevicePosition(transform: cameraTransform)
@@ -872,6 +956,15 @@ class LiDARViewController: UIViewController {
             
             statusLabel.text = "📡 Meshes: \(meshCount)\n🔲 Occupied: \(occupancyGrid.occupiedCount)\n⬜ Free: \(occupancyGrid.freeCount)"
             statusLabel.textColor = .green
+            
+            // Telemetry: emit nav frame at ~10 Hz
+            TelemetryService.shared.lastCameraTransform = cameraTransform
+            TelemetryService.shared.tick(occupancyGrid: occupancyGrid, cameraTransform: cameraTransform)
+        }
+        
+        // Telemetry: emit mesh anchor geometry at ~1 Hz
+        if let snapshots = meshAnchorSnapshots {
+            TelemetryService.shared.emitMeshAnchors(snapshots, occupancyGrid: occupancyGrid, cameraTransform: cameraTransform)
         }
         
         // Redraw grid every 6 frames (~5Hz at 30fps)
@@ -881,16 +974,40 @@ class LiDARViewController: UIViewController {
         
         // Navigation re-planning: if navigation is active and a re-plan is due,
         // re-run pathfinding from current position to the original target.
-        if pathNavigator.needsReplan, let target = pathNavigator.targetPoint {
+        // Guard against concurrent dispatches to avoid retaining multiple ARFrames.
+        if !isReplanning, pathNavigator.needsReplan, let target = pathNavigator.targetPoint {
+            isReplanning = true
             let pos = occupancyGrid.devicePosition
+            // Capture camera transform now — do NOT access currentFrame from background thread
+            let capturedTransform = cameraTransform
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
+                let replanStart = CFAbsoluteTimeGetCurrent()
                 var path = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                var algorithm = "astar"
                 if path.isEmpty {
                     path = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                    algorithm = "greedy"
                 }
-                guard !path.isEmpty else { return }
+                let replanDurationMs = Float((CFAbsoluteTimeGetCurrent() - replanStart) * 1000)
+                
+                if !path.isEmpty {
+                    // Log replan to telemetry
+                    TelemetryService.shared.logRoutePlanned(
+                        target: (x: target.x, y: target.y),
+                        origin: (x: pos.x, y: pos.y),
+                        waypoints: path,
+                        algorithm: algorithm,
+                        reason: "replan_periodic",
+                        planDurationMs: replanDurationMs,
+                        occupancyGrid: self.occupancyGrid,
+                        cameraTransform: capturedTransform
+                    )
+                }
+                
                 DispatchQueue.main.async {
+                    self.isReplanning = false
+                    guard !path.isEmpty else { return }
                     self.plannedPath = path
                     self.gridMapView.plannedPath = path
                     self.gridMapView.setNeedsDisplay()

@@ -244,6 +244,84 @@ class MeshProcessor {
         }
     }
     
+    // MARK: - Telemetry Snapshot Extraction
+
+    /// Extract a telemetry-ready snapshot from an ARMeshAnchor.
+    /// Call on the main thread while the anchor is still valid.
+    static func extractAnchorSnapshot(from anchor: ARMeshAnchor, generation: Int) -> MeshAnchorSnapshot {
+        let geometry = anchor.geometry
+        let vertexSource = geometry.vertices
+        let vertexCount = vertexSource.count
+        let faceCount = geometry.faces.count
+
+        // Vertices: flatten [x,y,z, x,y,z, ...] as Float array
+        var floats: [Float] = []
+        floats.reserveCapacity(vertexCount * 3)
+        let vBuf = vertexSource.buffer.contents()
+        let vStride = vertexSource.stride
+        let vOffset = vertexSource.offset
+        for i in 0..<vertexCount {
+            let ptr = vBuf.advanced(by: vOffset + vStride * i)
+            let v = ptr.assumingMemoryBound(to: simd_float3.self).pointee
+            floats.append(v.x)
+            floats.append(v.y)
+            floats.append(v.z)
+        }
+        let verticesB64 = floatArrayToBase64(floats)
+
+        // Indices: UInt32 triangle indices
+        let facesElement = geometry.faces
+        let indicesPerPrimitive = facesElement.indexCountPerPrimitive
+        let bytesPerIndex = facesElement.bytesPerIndex
+        let fBuf = facesElement.buffer.contents()
+        var indices: [UInt32] = []
+        indices.reserveCapacity(faceCount * indicesPerPrimitive)
+        for i in 0..<(faceCount * indicesPerPrimitive) {
+            let ptr = fBuf.advanced(by: i * bytesPerIndex)
+            if bytesPerIndex == 4 {
+                indices.append(UInt32(bitPattern: ptr.assumingMemoryBound(to: Int32.self).pointee))
+            } else {
+                indices.append(UInt32(ptr.assumingMemoryBound(to: UInt16.self).pointee))
+            }
+        }
+        let indicesB64 = uint32ArrayToBase64(indices)
+
+        // Per-face classifications
+        var classValues: [UInt8] = []
+        classValues.reserveCapacity(faceCount)
+        if let classSource = geometry.classification {
+            let cBuf = classSource.buffer.contents()
+            let cStride = classSource.stride
+            let cOffset = classSource.offset
+            for i in 0..<faceCount {
+                classValues.append(cBuf.advanced(by: cOffset + cStride * i).assumingMemoryBound(to: UInt8.self).pointee)
+            }
+        } else {
+            classValues = Array(repeating: 0, count: faceCount)
+        }
+        let classificationsB64 = uint8ArrayToBase64(classValues)
+
+        // Transform: column-major 16 floats
+        let m = anchor.transform
+        let transform: [Float] = [
+            m.columns.0.x, m.columns.0.y, m.columns.0.z, m.columns.0.w,
+            m.columns.1.x, m.columns.1.y, m.columns.1.z, m.columns.1.w,
+            m.columns.2.x, m.columns.2.y, m.columns.2.z, m.columns.2.w,
+            m.columns.3.x, m.columns.3.y, m.columns.3.z, m.columns.3.w,
+        ]
+
+        return MeshAnchorSnapshot(
+            anchorId: anchor.identifier.uuidString,
+            transform: transform,
+            verticesB64: verticesB64,
+            vertexCount: vertexCount,
+            indicesB64: indicesB64,
+            triangleCount: faceCount,
+            classificationsB64: classificationsB64,
+            generation: generation
+        )
+    }
+
     // MARK: - Face Processing (for more accurate obstacles)
     
     /// Process mesh faces to get surface normals and better obstacle detection

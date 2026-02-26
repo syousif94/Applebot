@@ -12,6 +12,8 @@ class ControlPanelViewController: UIViewController {
     
     // MARK: - Views
     
+    private let scrollView = UIScrollView()
+    private let contentView = UIView()
     private let grabber = UIView()
     private let titleLabel = UILabel()
     private let statusDot = UIView()
@@ -28,6 +30,13 @@ class ControlPanelViewController: UIViewController {
     private let sendWifiButton = UIButton(type: .custom)
     private let wifiStatusLabel = UILabel()
     
+    // Telemetry views
+    private let telemetryLabel = UILabel()
+    private let serverURLField = UITextField()
+    private let telemetryButton = UIButton(type: .custom)
+    private let telemetryStatusDot = UIView()
+    private let telemetryStatusLabel = UILabel()
+    
     private let ble = ESP32BLEManager.shared
     
     // MARK: - Lifecycle
@@ -37,22 +46,29 @@ class ControlPanelViewController: UIViewController {
         
         view.backgroundColor = UIColor(white: 0.12, alpha: 1)
         
+        setupScrollView()
         setupGrabber()
         setupHeader()
         setupConnectionRow()
         setupJoystick()
         setupWiFiConfig()
+        setupTelemetryConfig()
         
         // Dismiss keyboard on tap outside text fields
         let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
         tap.cancelsTouchesInView = false
-        view.addGestureRecognizer(tap)
+        tap.delegate = self
+        scrollView.addGestureRecognizer(tap)
         
         // Listen for BLE state changes
         ble.onStateChanged = { [weak self] state in
             DispatchQueue.main.async { self?.updateConnectionUI(state) }
         }
         updateConnectionUI(ble.connectionState)
+        
+        // Adjust scroll view insets when keyboard appears/disappears
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillShow(_:)), name: UIResponder.keyboardWillShowNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
     }
     
     override func viewDidLayoutSubviews() {
@@ -62,15 +78,41 @@ class ControlPanelViewController: UIViewController {
     
     // MARK: - Setup
     
+    private func setupScrollView() {
+        scrollView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.showsVerticalScrollIndicator = true
+        scrollView.alwaysBounceVertical = true
+        scrollView.keyboardDismissMode = .interactive
+        scrollView.delaysContentTouches = false
+        scrollView.canCancelContentTouches = false
+        view.addSubview(scrollView)
+        
+        contentView.translatesAutoresizingMaskIntoConstraints = false
+        scrollView.addSubview(contentView)
+        
+        NSLayoutConstraint.activate([
+            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
+            
+            contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
+            contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
+            contentView.trailingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.trailingAnchor),
+            contentView.bottomAnchor.constraint(equalTo: scrollView.contentLayoutGuide.bottomAnchor),
+            contentView.widthAnchor.constraint(equalTo: scrollView.frameLayoutGuide.widthAnchor)
+        ])
+    }
+    
     private func setupGrabber() {
         grabber.translatesAutoresizingMaskIntoConstraints = false
         grabber.backgroundColor = UIColor.white.withAlphaComponent(0.3)
         grabber.layer.cornerRadius = 2.5
-        view.addSubview(grabber)
+        contentView.addSubview(grabber)
         
         NSLayoutConstraint.activate([
-            grabber.topAnchor.constraint(equalTo: view.topAnchor, constant: 8),
-            grabber.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            grabber.topAnchor.constraint(equalTo: contentView.topAnchor, constant: 8),
+            grabber.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             grabber.widthAnchor.constraint(equalToConstant: 36),
             grabber.heightAnchor.constraint(equalToConstant: 5)
         ])
@@ -81,11 +123,11 @@ class ControlPanelViewController: UIViewController {
         titleLabel.text = "ESP32 Controller"
         titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
         titleLabel.textColor = .white
-        view.addSubview(titleLabel)
+        contentView.addSubview(titleLabel)
         
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: grabber.bottomAnchor, constant: 16),
-            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20)
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20)
         ])
     }
     
@@ -93,14 +135,14 @@ class ControlPanelViewController: UIViewController {
         // Status dot
         statusDot.translatesAutoresizingMaskIntoConstraints = false
         statusDot.backgroundColor = .red
-        view.addSubview(statusDot)
+        contentView.addSubview(statusDot)
         
         // Status label
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.font = .systemFont(ofSize: 14, weight: .medium)
         statusLabel.textColor = .white
         statusLabel.text = "Disconnected"
-        view.addSubview(statusLabel)
+        contentView.addSubview(statusLabel)
         
         // Connect button
         connectButton.translatesAutoresizingMaskIntoConstraints = false
@@ -111,10 +153,10 @@ class ControlPanelViewController: UIViewController {
         connectButton.layer.cornerRadius = 8
         connectButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 20, bottom: 8, right: 20)
         connectButton.addTarget(self, action: #selector(connectTapped), for: .touchUpInside)
-        view.addSubview(connectButton)
+        contentView.addSubview(connectButton)
         
         NSLayoutConstraint.activate([
-            statusDot.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            statusDot.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             statusDot.centerYAnchor.constraint(equalTo: connectButton.centerYAnchor),
             statusDot.widthAnchor.constraint(equalToConstant: 10),
             statusDot.heightAnchor.constraint(equalToConstant: 10),
@@ -123,7 +165,7 @@ class ControlPanelViewController: UIViewController {
             statusLabel.centerYAnchor.constraint(equalTo: connectButton.centerYAnchor),
             
             connectButton.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 16),
-            connectButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20)
+            connectButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20)
         ])
     }
     
@@ -133,7 +175,7 @@ class ControlPanelViewController: UIViewController {
         joystickLabel.text = "Manual Drive"
         joystickLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         joystickLabel.textColor = UIColor.white.withAlphaComponent(0.6)
-        view.addSubview(joystickLabel)
+        contentView.addSubview(joystickLabel)
         
         // Motor power readout
         motorLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -141,28 +183,28 @@ class ControlPanelViewController: UIViewController {
         motorLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
         motorLabel.textColor = UIColor.cyan.withAlphaComponent(0.8)
         motorLabel.textAlignment = .right
-        view.addSubview(motorLabel)
+        contentView.addSubview(motorLabel)
         
         // Joystick
         joystickView.translatesAutoresizingMaskIntoConstraints = false
-        view.addSubview(joystickView)
+        contentView.addSubview(joystickView)
         
         NSLayoutConstraint.activate([
             joystickLabel.topAnchor.constraint(equalTo: connectButton.bottomAnchor, constant: 24),
-            joystickLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            joystickLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             
             motorLabel.centerYAnchor.constraint(equalTo: joystickLabel.centerYAnchor),
-            motorLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            motorLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
             
             joystickView.topAnchor.constraint(equalTo: joystickLabel.bottomAnchor, constant: 12),
-            joystickView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            joystickView.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             joystickView.widthAnchor.constraint(equalToConstant: 180),
             joystickView.heightAnchor.constraint(equalToConstant: 180),
         ])
         
         // Joystick callbacks
         joystickView.onMove = { [weak self] x, y in
-            let powers = self?.ble.drive(x: x, y: y, bypassObstacleFilter: true) ?? (left: Float(0), right: Float(0))
+            let powers = self?.ble.drive(x: x, y: y) ?? (left: Float(0), right: Float(0))
             self?.motorLabel.text = String(format: "L: %d%%  R: %d%%",
                                            Int(powers.left * 100), Int(powers.right * 100))
         }
@@ -185,7 +227,7 @@ class ControlPanelViewController: UIViewController {
         wifiLabel.text = "WiFi Configuration"
         wifiLabel.font = .systemFont(ofSize: 14, weight: .semibold)
         wifiLabel.textColor = UIColor.white.withAlphaComponent(0.6)
-        view.addSubview(wifiLabel)
+        contentView.addSubview(wifiLabel)
         
         // SSID field
         ssidField.translatesAutoresizingMaskIntoConstraints = false
@@ -204,7 +246,7 @@ class ControlPanelViewController: UIViewController {
             attributes: [.foregroundColor: UIColor(white: 0.5, alpha: 1)]
         )
         ssidField.delegate = self
-        view.addSubview(ssidField)
+        contentView.addSubview(ssidField)
         
         // Password field
         passwordField.translatesAutoresizingMaskIntoConstraints = false
@@ -224,7 +266,7 @@ class ControlPanelViewController: UIViewController {
             attributes: [.foregroundColor: UIColor(white: 0.5, alpha: 1)]
         )
         passwordField.delegate = self
-        view.addSubview(passwordField)
+        contentView.addSubview(passwordField)
         
         // Send button
         sendWifiButton.translatesAutoresizingMaskIntoConstraints = false
@@ -235,7 +277,7 @@ class ControlPanelViewController: UIViewController {
         sendWifiButton.layer.cornerRadius = 8
         sendWifiButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 20, bottom: 10, right: 20)
         sendWifiButton.addTarget(self, action: #selector(sendWifiTapped), for: .touchUpInside)
-        view.addSubview(sendWifiButton)
+        contentView.addSubview(sendWifiButton)
         
         // Status label
         wifiStatusLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -243,28 +285,27 @@ class ControlPanelViewController: UIViewController {
         wifiStatusLabel.textColor = UIColor.white.withAlphaComponent(0.5)
         wifiStatusLabel.text = ""
         wifiStatusLabel.textAlignment = .center
-        view.addSubview(wifiStatusLabel)
+        contentView.addSubview(wifiStatusLabel)
         
         NSLayoutConstraint.activate([
             wifiLabel.topAnchor.constraint(equalTo: joystickView.bottomAnchor, constant: 24),
-            wifiLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
+            wifiLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             
             ssidField.topAnchor.constraint(equalTo: wifiLabel.bottomAnchor, constant: 10),
-            ssidField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            ssidField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            ssidField.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            ssidField.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
             ssidField.heightAnchor.constraint(equalToConstant: 44),
             
             passwordField.topAnchor.constraint(equalTo: ssidField.bottomAnchor, constant: 10),
-            passwordField.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 20),
-            passwordField.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -20),
+            passwordField.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            passwordField.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
             passwordField.heightAnchor.constraint(equalToConstant: 44),
             
             sendWifiButton.topAnchor.constraint(equalTo: passwordField.bottomAnchor, constant: 14),
-            sendWifiButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            sendWifiButton.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
             
             wifiStatusLabel.topAnchor.constraint(equalTo: sendWifiButton.bottomAnchor, constant: 8),
-            wifiStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            wifiStatusLabel.bottomAnchor.constraint(lessThanOrEqualTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
+            wifiStatusLabel.centerXAnchor.constraint(equalTo: contentView.centerXAnchor)
         ])
         
         // WiFi write result callback
@@ -281,6 +322,138 @@ class ControlPanelViewController: UIViewController {
                 self?.sendWifiButton.isEnabled = true
                 self?.sendWifiButton.alpha = 1.0
             }
+        }
+    }
+    
+    // MARK: - Telemetry Config
+    
+    private func setupTelemetryConfig() {
+        // Section label
+        telemetryLabel.translatesAutoresizingMaskIntoConstraints = false
+        telemetryLabel.text = "Telemetry Server"
+        telemetryLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        telemetryLabel.textColor = UIColor.white.withAlphaComponent(0.6)
+        contentView.addSubview(telemetryLabel)
+        
+        // Server URL field
+        serverURLField.translatesAutoresizingMaskIntoConstraints = false
+        serverURLField.font = .systemFont(ofSize: 15)
+        serverURLField.textColor = .white
+        serverURLField.backgroundColor = UIColor(white: 0.2, alpha: 1)
+        serverURLField.layer.cornerRadius = 8
+        serverURLField.autocorrectionType = .no
+        serverURLField.autocapitalizationType = .none
+        serverURLField.keyboardType = .URL
+        serverURLField.returnKeyType = .done
+        serverURLField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 12, height: 0))
+        serverURLField.leftViewMode = .always
+        serverURLField.text = TelemetryService.shared.serverURL
+        serverURLField.attributedPlaceholder = NSAttributedString(
+            string: "ws://192.168.1.100:8765",
+            attributes: [.foregroundColor: UIColor(white: 0.5, alpha: 1)]
+        )
+        serverURLField.delegate = self
+        contentView.addSubview(serverURLField)
+        
+        // Connect button
+        telemetryButton.translatesAutoresizingMaskIntoConstraints = false
+        telemetryButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
+        telemetryButton.setTitleColor(.white, for: .normal)
+        telemetryButton.layer.cornerRadius = 8
+        telemetryButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 20, bottom: 10, right: 20)
+        telemetryButton.addTarget(self, action: #selector(telemetryButtonTapped), for: .touchUpInside)
+        contentView.addSubview(telemetryButton)
+        
+        // Status dot
+        telemetryStatusDot.translatesAutoresizingMaskIntoConstraints = false
+        telemetryStatusDot.layer.cornerRadius = 5
+        contentView.addSubview(telemetryStatusDot)
+        
+        // Status label
+        telemetryStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        telemetryStatusLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        telemetryStatusLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+        contentView.addSubview(telemetryStatusLabel)
+        
+        NSLayoutConstraint.activate([
+            telemetryLabel.topAnchor.constraint(equalTo: wifiStatusLabel.bottomAnchor, constant: 24),
+            telemetryLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            
+            serverURLField.topAnchor.constraint(equalTo: telemetryLabel.bottomAnchor, constant: 10),
+            serverURLField.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            serverURLField.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            serverURLField.heightAnchor.constraint(equalToConstant: 44),
+            
+            telemetryButton.topAnchor.constraint(equalTo: serverURLField.bottomAnchor, constant: 14),
+            telemetryButton.centerXAnchor.constraint(equalTo: contentView.centerXAnchor),
+            
+            telemetryStatusDot.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            telemetryStatusDot.topAnchor.constraint(equalTo: telemetryButton.bottomAnchor, constant: 12),
+            telemetryStatusDot.widthAnchor.constraint(equalToConstant: 10),
+            telemetryStatusDot.heightAnchor.constraint(equalToConstant: 10),
+            
+            telemetryStatusLabel.leadingAnchor.constraint(equalTo: telemetryStatusDot.trailingAnchor, constant: 8),
+            telemetryStatusLabel.centerYAnchor.constraint(equalTo: telemetryStatusDot.centerYAnchor),
+            telemetryStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -20),
+            telemetryStatusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20)
+        ])
+        
+        // Listen for connection status
+        TelemetryService.shared.onConnectionStatusChanged = { [weak self] connected, url in
+            self?.updateTelemetryUI(connected: connected, url: url)
+        }
+        
+        updateTelemetryUI(connected: false, url: TelemetryService.shared.serverURL)
+    }
+    
+    @objc private func telemetryButtonTapped() {
+        dismissKeyboard()
+        
+        let service = TelemetryService.shared
+        
+        // If already running, stop first
+        if service.isRunning {
+            service.stop(reason: "user_restart")
+        }
+        
+        // Read the URL and (re)connect
+        let url = serverURLField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !url.isEmpty else {
+            telemetryStatusLabel.text = "Enter a server URL"
+            telemetryStatusLabel.textColor = UIColor(red: 1.0, green: 0.8, blue: 0.2, alpha: 1)
+            updateTelemetryUI(connected: false, url: "")
+            return
+        }
+        service.serverURL = url
+        service.start()
+        telemetryStatusLabel.text = "Connecting…"
+        telemetryStatusLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+        telemetryStatusDot.backgroundColor = .yellow
+    }
+    
+    private func updateTelemetryUI(connected: Bool, url: String) {
+        let running = TelemetryService.shared.isRunning
+        
+        if running {
+            telemetryButton.setTitle("Reconnect", for: .normal)
+            telemetryButton.backgroundColor = UIColor(red: 0.4, green: 0.2, blue: 0.8, alpha: 1)
+        } else {
+            telemetryButton.setTitle("Connect", for: .normal)
+            telemetryButton.backgroundColor = UIColor(red: 0.4, green: 0.2, blue: 0.8, alpha: 1)
+        }
+        
+        if connected {
+            telemetryStatusDot.backgroundColor = .green
+            telemetryStatusLabel.text = "Connected to \(url)"
+            telemetryStatusLabel.textColor = UIColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1)
+        } else if running {
+            telemetryStatusDot.backgroundColor = .yellow
+            telemetryStatusLabel.text = "Reconnecting…"
+            telemetryStatusLabel.textColor = UIColor(red: 1.0, green: 0.8, blue: 0.2, alpha: 1)
+        } else {
+            telemetryStatusDot.backgroundColor = .gray
+            telemetryStatusLabel.text = "Not connected"
+            telemetryStatusLabel.textColor = UIColor.white.withAlphaComponent(0.5)
         }
     }
     
@@ -308,6 +481,29 @@ class ControlPanelViewController: UIViewController {
     
     @objc private func dismissKeyboard() {
         view.endEditing(true)
+    }
+    
+    @objc private func keyboardWillShow(_ notification: Notification) {
+        guard let keyboardFrame = notification.userInfo?[UIResponder.keyboardFrameEndUserInfoKey] as? CGRect,
+              let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double else { return }
+        let keyboardHeight = keyboardFrame.height - view.safeAreaInsets.bottom
+        UIView.animate(withDuration: duration) {
+            self.scrollView.contentInset.bottom = keyboardHeight
+            self.scrollView.verticalScrollIndicatorInsets.bottom = keyboardHeight
+        }
+        // Scroll the active field into view
+        if let activeField = view.findFirstResponder() as? UIView {
+            let rect = activeField.convert(activeField.bounds, to: scrollView)
+            scrollView.scrollRectToVisible(rect.insetBy(dx: 0, dy: -20), animated: true)
+        }
+    }
+    
+    @objc private func keyboardWillHide(_ notification: Notification) {
+        guard let duration = notification.userInfo?[UIResponder.keyboardAnimationDurationUserInfoKey] as? Double else { return }
+        UIView.animate(withDuration: duration) {
+            self.scrollView.contentInset.bottom = 0
+            self.scrollView.verticalScrollIndicatorInsets.bottom = 0
+        }
     }
     
     // MARK: - Sheet gesture control
@@ -370,6 +566,14 @@ class ControlPanelViewController: UIViewController {
     }
 }
 
+// MARK: - UIGestureRecognizerDelegate
+extension ControlPanelViewController: UIGestureRecognizerDelegate {
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {
+        // Don't fire the dismiss-keyboard tap when touching a text field
+        return !(touch.view is UITextField)
+    }
+}
+
 // MARK: - UITextFieldDelegate
 extension ControlPanelViewController: UITextFieldDelegate {
     func textFieldShouldReturn(_ textField: UITextField) -> Bool {
@@ -377,7 +581,20 @@ extension ControlPanelViewController: UITextFieldDelegate {
             passwordField.becomeFirstResponder()
         } else if textField == passwordField {
             sendWifiTapped()
+        } else if textField == serverURLField {
+            telemetryButtonTapped()
         }
         return true
+    }
+}
+
+// MARK: - UIView first responder helper
+private extension UIView {
+    func findFirstResponder() -> UIResponder? {
+        if isFirstResponder { return self }
+        for sub in subviews {
+            if let responder = sub.findFirstResponder() { return responder }
+        }
+        return nil
     }
 }

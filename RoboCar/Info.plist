@@ -2,12 +2,11 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>NSBluetoothAlwaysUsageDescription</key>
-	<string>RoboCar uses Bluetooth to connect to the ESP32 motor controller.</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>RoboCar uses the microphone for voice commands to control the car.</string>
-	<key>NSSpeechRecognitionUsageDescription</key>
-	<string>RoboCar uses speech recognition to understand voice commands for driving the car.</string>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsArbitraryLoads</key>
+		<true/>
+	</dict>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>
