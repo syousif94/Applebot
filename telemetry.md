@@ -353,6 +353,7 @@ struct RoutePlanned {
 | `replan_path_exhausted` | Ran out of waypoints before reaching target       |
 | `exploration`           | Autonomous exploration selected a frontier target |
 | `voice`                 | Voice assistant commanded navigation              |
+| `server`                | Server sent a `set_nav_target` command            |
 
 ---
 
@@ -531,6 +532,32 @@ When the server receives a `session_start` and the previous session has no `sess
 
 ---
 
+### 12. `nav_command_ack`
+
+Emitted in response to every server-initiated navigation command (`set_nav_target`, `start_navigation`, `stop_navigation`). Lets the server and web client confirm that commands were received and whether they succeeded.
+
+```rust
+struct NavCommandAck {
+    cmd: String,              // "set_nav_target" | "start_navigation" | "stop_navigation"
+    success: bool,
+    message: String,          // human-readable result or error
+    target: Option<Vec2>,     // echo of target point (present for set_nav_target)
+    waypoint_count: Option<u32>, // path length (present for set_nav_target on success)
+}
+```
+
+**Failure cases:**
+
+| Command            | Failure reason                                     |
+| ------------------ | -------------------------------------------------- |
+| `set_nav_target`   | Missing `x`/`y` parameters                         |
+| `set_nav_target`   | No mesh data in grid (nothing scanned yet)         |
+| `set_nav_target`   | No path found (A\* and greedy both failed)         |
+| `start_navigation` | No planned path — must send `set_nav_target` first |
+| `stop_navigation`  | _(always succeeds, even if already idle)_          |
+
+---
+
 ## Algorithm Reference
 
 This section describes the navigation algorithms so the Rust server and Three.js client can visualize decisions meaningfully.
@@ -632,6 +659,10 @@ Documents/telemetry/
 - On disconnect, events accumulate in the `.jsonl` file
 - On reconnect, unsent events (seq > last ACK'd) are replayed from the file
 - Server can request a full grid snapshot: `{"cmd": "request_mesh_snapshot"}`
+- Server can set a navigation target: `{"cmd": "set_nav_target", "x": 1.5, "y": 2.3}`
+- Server can start navigation along the planned path: `{"cmd": "start_navigation"}`
+- Server can stop active navigation: `{"cmd": "stop_navigation"}`
+- All navigation commands receive a `nav_command_ack` event in response
 
 ---
 

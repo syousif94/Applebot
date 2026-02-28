@@ -800,7 +800,7 @@ class OccupancyGrid {
     /// Returns false if any cell along the line is occupied or within `bufferCells`
     /// of an occupied cell. Must be called while lock is held.
     private func lineOfSight(fromX: Int, fromY: Int, toX: Int, toY: Int) -> Bool {
-        let bufferCells = 4  // 20cm buffer at 5cm/cell — accounts for 35cm car width (half-width ~17.5cm)
+        let bufferCells = 6  // 30cm buffer at 5cm/cell — generous clearance for 35cm car width
         var x = fromX
         var y = fromY
         let dx = abs(toX - fromX)
@@ -838,6 +838,15 @@ class OccupancyGrid {
         }
     }
     
+    /// Public thread-safe wrapper for line-of-sight check.
+    /// Returns true if a straight line between two grid cells is clear of obstacles
+    /// with adequate buffer for the car body.
+    func hasLineOfSight(fromX: Int, fromY: Int, toX: Int, toY: Int) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return lineOfSight(fromX: fromX, fromY: fromY, toX: toX, toY: toY)
+    }
+    
     /// Find a path from start to goal using A* on the occupancy grid.
     /// Only traverses free cells, avoiding occupied and unknown cells.
     /// Returns an array of world-coordinate waypoints (smoothed), or empty if no path found.
@@ -864,15 +873,16 @@ class OccupancyGrid {
         
         if start.x == goal.x && start.y == goal.y { return [] }
         
-        // Clearance: accounts for car body width (35cm → half-width 17.5cm).
-        // Inner cells are near-impassable so the path never clips obstacles;
-        // outer cells get a softer penalty that nudges the path away.
-        let clearanceCells = 6  // 30cm total buffer at 5cm/cell
-        let hardBlockRadius = 4 // cells within 20cm of obstacles are near-impassable (≥ 17.5cm half-width)
+        // Clearance: accounts for car body width (35cm → half-width 17.5cm)
+        // plus extra margin so the path doesn't hug walls.
+        // Inner cells are impassable; outer cells get a steep penalty.
+        let clearanceCells = 8  // 40cm total buffer at 5cm/cell
+        let hardBlockRadius = 5 // cells within 25cm of obstacles are impassable
         
         /// Returns a proximity penalty for (x,y): very high if within car-body
-        /// clearance, moderate further out, 0 if far away.
+        /// clearance, steep further out, 0 if far away.
         func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
+            var minR = Int.max
             for r in 1...clearanceCells {
                 for ddx in -r...r {
                     for ddy in -r...r {
@@ -881,13 +891,18 @@ class OccupancyGrid {
                         if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
                             if cells[cx][cy] == CellState.occupied.rawValue {
                                 if r <= hardBlockRadius {
-                                    return 1000.0  // near-impassable — car body would clip
+                                    return 5000.0  // impassable — car body would clip
                                 }
-                                return 25.0 * Float(clearanceCells + 1 - r) / Float(clearanceCells - hardBlockRadius)
+                                minR = min(minR, r)
                             }
                         }
                     }
                 }
+                if minR <= r { break } // found closest obstacle ring
+            }
+            if minR <= clearanceCells {
+                // Steep inverse penalty: closer to obstacle = much higher cost
+                return 50.0 * Float(clearanceCells + 1 - minR) / Float(clearanceCells - hardBlockRadius)
             }
             return 0
         }
@@ -1033,10 +1048,11 @@ class OccupancyGrid {
         
         if start.x == goal.x && start.y == goal.y { return [] }
         
-        let clearanceCells = 6  // 30cm total buffer at 5cm/cell — 35cm car width
-        let hardBlockRadius = 4 // cells within 20cm are near-impassable (≥ 17.5cm half-width)
+        let clearanceCells = 8  // 40cm total buffer at 5cm/cell
+        let hardBlockRadius = 5 // cells within 25cm are impassable
         
         func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
+            var minR = Int.max
             for r in 1...clearanceCells {
                 for ddx in -r...r {
                     for ddy in -r...r {
@@ -1045,13 +1061,17 @@ class OccupancyGrid {
                         if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
                             if cells[cx][cy] == CellState.occupied.rawValue {
                                 if r <= hardBlockRadius {
-                                    return 1000.0  // near-impassable — car body would clip
+                                    return 5000.0  // impassable — car body would clip
                                 }
-                                return 25.0 * Float(clearanceCells + 1 - r) / Float(clearanceCells - hardBlockRadius)
+                                minR = min(minR, r)
                             }
                         }
                     }
                 }
+                if minR <= r { break }
+            }
+            if minR <= clearanceCells {
+                return 50.0 * Float(clearanceCells + 1 - minR) / Float(clearanceCells - hardBlockRadius)
             }
             return 0
         }

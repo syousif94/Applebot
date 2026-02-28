@@ -41,8 +41,15 @@ class PathNavigator {
     /// Distance to consider "arrived" at the final target (meters)
     var arrivalThreshold: Float = 0.12
     
-    /// Maximum time to wait for an obstacle to clear before re-planning (seconds)
-    let obstaclePauseTimeout: TimeInterval = 5.0
+    /// Maximum time to wait for an obstacle to clear before reversing (seconds)
+    let obstaclePauseTimeout: TimeInterval = 3.0
+    
+    /// Grace period after resuming from a pause — ignore obstacles briefly so
+    /// the new path has time to steer away (seconds).
+    private let resumeGracePeriod: TimeInterval = 1.0
+    
+    /// Timestamp when we last resumed from paused → navigating
+    private var lastResumeTime: Date = .distantPast
     
     /// Half-angle of the forward cone used to decide if an obstacle is "blocking"
     /// the direction of travel (radians). Obstacles outside this cone trigger a
@@ -182,6 +189,7 @@ class PathNavigator {
         if state == .paused {
             state = .navigating
             pauseStartTime = nil
+            lastResumeTime = Date()
             log("▶️ Resumed navigation with new path")
         }
         
@@ -228,7 +236,11 @@ class PathNavigator {
             return
         }
         
-        if detector.obstacleDetected {
+        // Grace period: right after resuming from a pause, skip obstacle checks
+        // so the car has a chance to follow the newly replanned path.
+        let inGracePeriod = Date().timeIntervalSince(lastResumeTime) < resumeGracePeriod
+        
+        if detector.obstacleDetected && !inGracePeriod {
             // Determine the intended travel direction so we can check whether
             // the obstacle is actually blocking our path, not just off to the side.
             let travelHeading: Float
@@ -242,26 +254,29 @@ class PathNavigator {
             let blocking = isObstacleBlockingTravel(detector: detector, travelHeading: travelHeading)
             
             if blocking {
-                // Obstacle is in the forward travel cone — stop and reverse
                 if state != .paused {
+                    // First response: just stop and request a re-plan around the obstacle.
+                    // Do NOT reverse — let A* find a new route.
                     ESP32BLEManager.shared.stopAll()
                     state = .paused
                     pauseStartTime = Date()
-                    log("⏸️ Obstacle ahead — reversing")
-                    startReverse(detector: detector)
+                    lastReplanTime = .distantPast  // force immediate replan
+                    log("⏸️ Obstacle blocking — stopping for replan")
                 } else if let start = pauseStartTime,
                           Date().timeIntervalSince(start) > obstaclePauseTimeout {
-                    log("⏱️ Still blocked ahead — reversing again")
+                    // We've waited long enough for a clear path — reverse to escape
+                    log("⏱️ Still blocked after \(String(format: "%.1f", obstaclePauseTimeout))s — reversing")
                     startReverse(detector: detector)
                     pauseStartTime = Date()
                 }
                 return
             } else {
-                // Obstacle is off to the side — don't reverse, but force a
+                // Obstacle is off to the side — don't stop, but force a
                 // re-plan so A* routes around it. Keep navigating.
                 if state == .paused {
                     state = .navigating
                     pauseStartTime = nil
+                    lastResumeTime = Date()
                     log("▶️ Obstacle no longer ahead — resuming")
                 }
                 // Trigger an early re-plan so the path steers clear
@@ -270,10 +285,11 @@ class PathNavigator {
                 }
             }
         } else {
-            // No obstacle at all — resume if we were paused
+            // No obstacle (or in grace period) — resume if we were paused
             if state == .paused {
                 state = .navigating
                 pauseStartTime = nil
+                lastResumeTime = Date()
                 log("▶️ Obstacle cleared — resuming")
             }
         }
@@ -332,20 +348,29 @@ class PathNavigator {
         while headingError > .pi  { headingError -= 2 * .pi }
         while headingError < -.pi { headingError += 2 * .pi }
         
-        // Convert to drive commands using differential steering directly.
-        // Proportional steering: turn harder when heading error is large.
-        // At full turn, one side goes forward and the other reverses (spin in place).
-        let turnGain: Float = 1.5  // Proportional gain for steering
-        let turn = max(-1.0, min(1.0, headingError * turnGain))
+        let absError = fabsf(headingError)
+        let turnSign: Float = headingError >= 0 ? 1.0 : -1.0
         
-        // Both sides get equal base power, steering is differential on top
-        let basePower: Float = cruiseSpeed  // 55% nominal
+        // Threshold for "large turn" — above this we spin in place instead of arcing
+        let sharpTurnThreshold: Float = .pi / 4.0  // 45°
         
-        // Differential: positive turn = turn right (more left, less right)
-        // At full turn (1.0), left = base + base = 2*base, right = base - base = 0
-        // We scale turn component by basePower so a full turn gives opposite sides
-        var leftPower  = basePower + turn * basePower
-        var rightPower = basePower - turn * basePower
+        var leftPower: Float
+        var rightPower: Float
+        
+        if absError > sharpTurnThreshold {
+            // Sharp turn: spin in place with opposite wheel directions.
+            // Scale power by how far off we are (full power at 180°, moderate at 45°).
+            let spinPower: Float = min(0.7, 0.45 + 0.25 * (absError / .pi))
+            leftPower  =  turnSign * spinPower
+            rightPower = -turnSign * spinPower
+        } else {
+            // Small correction: proportional differential steering while driving forward
+            let turnGain: Float = 2.0
+            let turn = max(-1.0, min(1.0, headingError * turnGain))
+            let basePower: Float = cruiseSpeed
+            leftPower  = basePower + turn * basePower
+            rightPower = basePower - turn * basePower
+        }
         
         // Clamp to [-100%, 100%] and enforce minimum |50%| (dead zone avoidance)
         // Values between -50% and 50% don't have enough torque to move.
@@ -470,19 +495,49 @@ class PathNavigator {
     
     // MARK: - Pure Pursuit Helpers
     
-    /// Advance the waypoint index past any waypoints we've already passed.
+    /// Advance the waypoint index: skip waypoints that are behind the car or
+    /// that can be bypassed because a farther waypoint has clear line-of-sight.
     private func advanceWaypoint(pos: DevicePosition) {
+        let headingVecX = sinf(pos.heading)
+        let headingVecY = cosf(pos.heading)
+        
+        // 1. Skip any waypoints that are behind us or that we're close to
         while currentWaypointIndex < currentPath.count - 1 {
             let wp = currentPath[currentWaypointIndex]
             let dx = wp.x - pos.x
             let dy = wp.y - pos.y
             let dist = sqrtf(dx * dx + dy * dy)
             
-            // If we're close enough to the current waypoint, advance
-            if dist < lookaheadDistance * 0.6 {
+            // Dot product with heading: negative means the waypoint is behind the car
+            let dot = dx * headingVecX + dy * headingVecY
+            
+            if dist < lookaheadDistance * 0.8 || (dot < 0 && dist < 0.5) {
                 currentWaypointIndex += 1
             } else {
                 break
+            }
+        }
+        
+        // 2. Look-ahead skip: jump to the farthest reachable waypoint that has
+        //    no obstacles on the occupancy grid between us and it.
+        if let grid = occupancyGrid, currentWaypointIndex < currentPath.count - 1 {
+            if let posGrid = grid.worldToGrid(pos.x, pos.y) {
+                var farthestClear = currentWaypointIndex
+                let searchLimit = min(currentPath.count, currentWaypointIndex + 12) // check up to 12 ahead
+                for i in (currentWaypointIndex + 1)..<searchLimit {
+                    let wp = currentPath[i]
+                    if let wpGrid = grid.worldToGrid(wp.x, wp.y) {
+                        if grid.hasLineOfSight(fromX: posGrid.x, fromY: posGrid.y,
+                                               toX: wpGrid.x, toY: wpGrid.y) {
+                            farthestClear = i
+                        } else {
+                            break  // no point checking farther once LOS is lost
+                        }
+                    }
+                }
+                if farthestClear > currentWaypointIndex {
+                    currentWaypointIndex = farthestClear
+                }
             }
         }
     }

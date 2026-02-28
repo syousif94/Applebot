@@ -153,7 +153,7 @@ class LiDARViewController: UIViewController {
         
         // Handle tap for pathfinding
         gridMapView.onTapWorldPosition = { [weak self] worldX, worldY in
-            self?.planPath(toX: worldX, toY: worldY)
+            self?.planPath(toX: worldX, toY: worldY, reason: "user_tap")
         }
         
         view.addSubview(gridMapView)
@@ -469,6 +469,11 @@ class LiDARViewController: UIViewController {
         // Start telemetry service
         TelemetryService.shared.start()
         
+        // Listen for server-initiated navigation commands
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerSetNavTarget(_:)), name: .serverSetNavTarget, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerStartNavigation), name: .serverStartNavigation, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerStopNavigation), name: .serverStopNavigation, object: nil)
+        
         let previousOnStateChanged = pathNavigator.onStateChanged
         pathNavigator.onStateChanged = { [weak self] state in
             // Telemetry: log nav state change
@@ -522,6 +527,67 @@ class LiDARViewController: UIViewController {
             // Start navigating along the current planned path
             pathNavigator.startNavigation(to: target, path: plannedPath)
         }
+    }
+    
+    // MARK: - Server Navigation Commands
+    
+    @objc private func handleServerSetNavTarget(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let x = info["x"] as? Float,
+              let y = info["y"] as? Float else {
+            TelemetryService.shared.logNavCommandAck(cmd: "set_nav_target", success: false, message: "Invalid parameters")
+            return
+        }
+        
+        guard occupancyGrid.freeCount > 0 else {
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "set_nav_target", success: false,
+                message: "No mesh data in grid",
+                target: Vec2(x: x, y: y)
+            )
+            return
+        }
+        
+        // If navigation is active, stop it before planning a new path
+        if pathNavigator.state == .navigating || pathNavigator.state == .paused {
+            pathNavigator.stopNavigation()
+        }
+        
+        planPath(toX: x, toY: y, reason: "server")
+    }
+    
+    @objc private func handleServerStartNavigation() {
+        guard !plannedPath.isEmpty, let target = gridMapView.pathTargetPoint else {
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "start_navigation", success: false,
+                message: "No planned path — send set_nav_target first"
+            )
+            return
+        }
+        
+        pathNavigator.startNavigation(to: target, path: plannedPath)
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "start_navigation", success: true,
+            message: "Navigation started to (\(String(format: "%.2f", target.x)), \(String(format: "%.2f", target.y)))",
+            target: Vec2(x: target.x, y: target.y),
+            waypointCount: plannedPath.count
+        )
+    }
+    
+    @objc private func handleServerStopNavigation() {
+        let wasNavigating = pathNavigator.state == .navigating || pathNavigator.state == .paused
+        pathNavigator.stopNavigation()
+        gridMapView.pathTargetPoint = nil
+        plannedPath.removeAll()
+        gridMapView.plannedPath = []
+        pathAnchor?.removeFromParent()
+        pathAnchor = nil
+        gridMapView.setNeedsDisplay()
+        
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "stop_navigation", success: true,
+            message: wasNavigating ? "Navigation stopped" : "Already idle"
+        )
     }
     
     private func updateNavigateButtonForState(_ state: NavigationState) {
@@ -618,7 +684,8 @@ class LiDARViewController: UIViewController {
     /// Plan a path from the current device position to the tapped world position.
     /// Runs A* on a background thread, then updates the grid and AR overlays on main.
     /// Falls back to greedy search (through unknown cells) if A* finds nothing.
-    private func planPath(toX: Float, toY: Float) {
+    /// - Parameter reason: Why the path is being planned ("user_tap", "server", "voice", etc.)
+    private func planPath(toX: Float, toY: Float, reason: String = "user_tap") {
         // Don't attempt pathfinding when the grid has no scanned data
         guard occupancyGrid.freeCount > 0 else {
             print("[Path] ⚠️ No mesh data in grid — ignoring tap")
@@ -662,7 +729,7 @@ class LiDARViewController: UIViewController {
                     origin: (x: startX, y: startY),
                     waypoints: path,
                     algorithm: algorithm,
-                    reason: "user_tap",
+                    reason: reason,
                     planDurationMs: planDurationMs,
                     occupancyGrid: self.occupancyGrid,
                     cameraTransform: TelemetryService.shared.lastCameraTransform
@@ -727,12 +794,29 @@ class LiDARViewController: UIViewController {
                 if path.isEmpty {
                     print("[Path] ❌ No path found to (\(String(format: "%.2f", toX)), \(String(format: "%.2f", toY)))")
                     self.navigateButton.isHidden = true
+                    // Ack server command with failure
+                    if reason == "server" {
+                        TelemetryService.shared.logNavCommandAck(
+                            cmd: "set_nav_target", success: false,
+                            message: "No path found to (\(String(format: "%.2f", toX)), \(String(format: "%.2f", toY)))",
+                            target: Vec2(x: toX, y: toY)
+                        )
+                    }
                 } else {
                     print("[Path] ✅ Path found: \(path.count) waypoints, \(densePath.count) mesh points")
                     // Show navigate button
                     self.navigateButton.setTitle("Navigate", for: .normal)
                     self.navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
                     self.navigateButton.isHidden = false
+                    // Ack server command with success
+                    if reason == "server" {
+                        TelemetryService.shared.logNavCommandAck(
+                            cmd: "set_nav_target", success: true,
+                            message: "Path planned — \(path.count) waypoints to (\(String(format: "%.2f", toX)), \(String(format: "%.2f", toY)))",
+                            target: Vec2(x: toX, y: toY),
+                            waypointCount: path.count
+                        )
+                    }
                 }
             }
         }

@@ -594,6 +594,21 @@ final class TelemetryService {
         }
     }
 
+    /// Log an acknowledgment for a server-initiated navigation command.
+    func logNavCommandAck(cmd: String, success: Bool, message: String, target: Vec2? = nil, waypointCount: Int? = nil) {
+        let event = NavCommandAckEvent(
+            cmd: cmd,
+            success: success,
+            message: message,
+            target: target,
+            waypointCount: waypointCount
+        )
+        addRecentLog("[NavCmd] \(cmd): \(success ? "ok" : "fail") — \(message)")
+        queue.async { [weak self] in
+            self?.send(type: "nav_command_ack", payload: event)
+        }
+    }
+
     // MARK: - Mesh Snapshot
 
     private func emitMeshSnapshot(occupancyGrid: OccupancyGrid, pose: Pose) {
@@ -795,17 +810,16 @@ final class TelemetryService {
             case .success(let message):
                 switch message {
                 case .string(let text):
-                    // Parse ACK: {"ack": seq}
                     if let data = text.data(using: .utf8),
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let _ = json["ack"] as? UInt64 {
-                        // Could track upload cursor here for resume support
-                    }
-                    // Parse commands: {"cmd": "request_mesh_snapshot"}
-                    if let data = text.data(using: .utf8),
-                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                       let cmd = json["cmd"] as? String {
-                        self.handleServerCommand(cmd)
+                       let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                        // Parse ACK: {"ack": seq}
+                        if let _ = json["ack"] as? UInt64 {
+                            // Could track upload cursor here for resume support
+                        }
+                        // Parse commands: {"cmd": "...", ...}
+                        if let cmd = json["cmd"] as? String {
+                            self.handleServerCommand(cmd, params: json)
+                        }
                     }
                 default:
                     break
@@ -820,13 +834,41 @@ final class TelemetryService {
         }
     }
 
-    private func handleServerCommand(_ cmd: String) {
+    private func handleServerCommand(_ cmd: String, params: [String: Any]) {
         switch cmd {
         case "request_mesh_snapshot":
             // Emit a full mesh snapshot on next opportunity
             framesSinceLastMesh = meshSnapshotInterval
+
+        case "set_nav_target":
+            guard let x = (params["x"] as? NSNumber)?.floatValue,
+                  let y = (params["y"] as? NSNumber)?.floatValue else {
+                logNavCommandAck(cmd: cmd, success: false, message: "Missing x/y parameters")
+                return
+            }
+            print("[Telemetry] Server command: set_nav_target (\(x), \(y))")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .serverSetNavTarget,
+                    object: nil,
+                    userInfo: ["x": x, "y": y]
+                )
+            }
+
+        case "start_navigation":
+            print("[Telemetry] Server command: start_navigation")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .serverStartNavigation, object: nil)
+            }
+
+        case "stop_navigation":
+            print("[Telemetry] Server command: stop_navigation")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
+            }
+
         default:
-            break
+            print("[Telemetry] Unknown server command: \(cmd)")
         }
     }
 
@@ -992,4 +1034,15 @@ final class TelemetryService {
             }
         }
     }
+}
+
+// MARK: - Server Command Notifications
+
+extension Notification.Name {
+    /// Server sent a target point for path planning. userInfo: ["x": Float, "y": Float]
+    static let serverSetNavTarget = Notification.Name("serverSetNavTarget")
+    /// Server requested navigation to start along the already-planned path.
+    static let serverStartNavigation = Notification.Name("serverStartNavigation")
+    /// Server requested navigation to stop.
+    static let serverStopNavigation = Notification.Name("serverStopNavigation")
 }

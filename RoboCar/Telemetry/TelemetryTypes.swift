@@ -266,7 +266,7 @@ struct RoutePlannedEvent: Codable {
     let planDurationMs: Float
     /// "astar" | "greedy"
     let algorithm: String
-    /// "user_tap" | "replan_periodic" | "replan_obstacle" | "replan_stuck" | "replan_path_exhausted" | "exploration" | "voice"
+    /// "user_tap" | "replan_periodic" | "replan_obstacle" | "replan_stuck" | "replan_path_exhausted" | "exploration" | "voice" | "server"
     let reason: String
     let replacesRouteId: String?
     let gridAtPlanTime: GridSnapshot?
@@ -380,6 +380,19 @@ struct CrashBreadcrumb: Codable {
     let nearestObstacleDist: Float?
     let steeringMode: String
     let recentLogs: [String]
+}
+
+// MARK: - 12. NavCommandAck (type: "nav_command_ack")
+
+struct NavCommandAckEvent: Codable {
+    /// The command that was received: "set_nav_target" | "start_navigation" | "stop_navigation"
+    let cmd: String
+    let success: Bool
+    let message: String
+    /// Echo back the target point (present for set_nav_target)
+    let target: Vec2?
+    /// Number of waypoints in the planned path (present for set_nav_target on success)
+    let waypointCount: Int?
 }
 
 // MARK: - Encoding Helpers
