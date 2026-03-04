@@ -296,31 +296,6 @@ class PathNavigator {
         
         guard state == .navigating else { return }
         
-        // Stuck detection: if power is being applied but the car isn't moving, reverse
-        if let lastPos = lastStuckCheckPos, let lastTime = lastStuckCheckTime {
-            if Date().timeIntervalSince(lastTime) >= stuckCheckInterval {
-                let movedDx = pos.x - lastPos.x
-                let movedDy = pos.y - lastPos.y
-                let movedDist = sqrtf(movedDx * movedDx + movedDy * movedDy)
-                
-                if movedDist < stuckMinDistance {
-                    log("🚧 Stuck — power applied but not moving, reversing")
-                    startReverse(detector: ObstacleDetector.shared)
-                    state = .paused
-                    pauseStartTime = Date()
-                    lastStuckCheckPos = (pos.x, pos.y)
-                    lastStuckCheckTime = Date()
-                    return
-                }
-                
-                lastStuckCheckPos = (pos.x, pos.y)
-                lastStuckCheckTime = Date()
-            }
-        } else {
-            lastStuckCheckPos = (pos.x, pos.y)
-            lastStuckCheckTime = Date()
-        }
-        
         // Advance waypoint index past waypoints we've already passed
         advanceWaypoint(pos: pos)
         
@@ -354,13 +329,48 @@ class PathNavigator {
         // Threshold for "large turn" — above this we spin in place instead of arcing
         let sharpTurnThreshold: Float = .pi / 4.0  // 45°
         
+        let isSpinning = absError > sharpTurnThreshold
+        
+        // Stuck detection: if power is being applied but the car isn't moving, reverse.
+        // Skip this check when we're intentionally spinning in place (no translation expected).
+        if !isSpinning {
+            if let lastPos = lastStuckCheckPos, let lastTime = lastStuckCheckTime {
+                if Date().timeIntervalSince(lastTime) >= stuckCheckInterval {
+                    let movedDx = pos.x - lastPos.x
+                    let movedDy = pos.y - lastPos.y
+                    let movedDist = sqrtf(movedDx * movedDx + movedDy * movedDy)
+                    
+                    if movedDist < stuckMinDistance {
+                        log("🚧 Stuck — power applied but not moving, reversing")
+                        startReverse(detector: ObstacleDetector.shared)
+                        state = .paused
+                        pauseStartTime = Date()
+                        lastStuckCheckPos = (pos.x, pos.y)
+                        lastStuckCheckTime = Date()
+                        return
+                    }
+                    
+                    lastStuckCheckPos = (pos.x, pos.y)
+                    lastStuckCheckTime = Date()
+                }
+            } else {
+                lastStuckCheckPos = (pos.x, pos.y)
+                lastStuckCheckTime = Date()
+            }
+        } else {
+            // Reset stuck timer while spinning — we expect no translation
+            lastStuckCheckPos = (pos.x, pos.y)
+            lastStuckCheckTime = Date()
+        }
+        
         var leftPower: Float
         var rightPower: Float
         
-        if absError > sharpTurnThreshold {
+        if isSpinning {
             // Sharp turn: spin in place with opposite wheel directions.
-            // Scale power by how far off we are (full power at 180°, moderate at 45°).
-            let spinPower: Float = min(0.7, 0.45 + 0.25 * (absError / .pi))
+            // Needs high power since wheels fight each other's friction on carpet/floor.
+            // Use 85-100% power to guarantee the motors overcome static friction.
+            let spinPower: Float = min(1.0, 0.85 + 0.15 * (absError / .pi))
             leftPower  =  turnSign * spinPower
             rightPower = -turnSign * spinPower
         } else {
