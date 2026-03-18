@@ -217,6 +217,21 @@ class OccupancyGrid {
         return h > -Float.greatestFiniteMagnitude ? h : nil
     }
     
+    /// Thread-safe cell state by grid indices (convenience alias for ObstacleDetector)
+    func getCellState(gridX: Int, gridY: Int) -> CellState {
+        return getState(gridX: gridX, gridY: gridY)
+    }
+    
+    /// Thread-safe classification lookup by grid indices
+    func getCellClassification(gridX: Int, gridY: Int) -> MeshClassification {
+        lock.lock()
+        defer { lock.unlock() }
+        guard gridX >= 0 && gridX < gridSize && gridY >= 0 && gridY < gridSize else {
+            return .none
+        }
+        return MeshClassification(rawValue: classifications[gridX][gridY]) ?? .none
+    }
+    
     /// Set the state of a cell at world coordinates
     func setState(worldX: Float, worldY: Float, state: CellState) {
         lock.lock()
@@ -1082,8 +1097,9 @@ class OccupancyGrid {
             (-1, -1, sqrt2), (-1, 1, sqrt2), (1, -1, sqrt2), (1, 1, sqrt2)
         ]
         
-        // Cost penalty for traversing unknown cells
-        let unknownPenalty: Float = 3.0
+        // Cost penalty for traversing unknown cells — low enough to prefer
+        // a shorter path through unexplored territory over a long detour.
+        let unknownPenalty: Float = 1.5
         
         func heuristic(_ x: Int, _ y: Int) -> Float {
             let dx = Float(abs(x - goal.x))

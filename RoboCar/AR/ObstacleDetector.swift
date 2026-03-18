@@ -45,13 +45,17 @@ class ObstacleDetector {
     
     // MARK: - Configuration
     
-    /// Protective radius in meters — any obstacle within this distance triggers avoidance.
-    /// Must exceed the car’s half-width (17.5cm for a 35cm car) to stop before contact.
-    var stopRadius: Float = 0.20  // 20cm
+    /// Protective radius in meters — any obstacle within this distance triggers a full stop.
+    /// Must exceed the car's half-width (17.5cm for a 35cm car) to stop before contact.
+    var stopRadius: Float = 0.25  // 25cm
     
     /// Detection radius for the LiDAR depth map (meters) — wider than stopRadius
     /// to catch dynamic obstacles early and allow evasive steering
-    var depthDetectionRadius: Float = 0.30  // 30cm
+    var depthDetectionRadius: Float = 0.40  // 40cm
+    
+    /// "Slow zone" outer radius — obstacles between stopRadius and this distance
+    /// cause the car to reduce speed rather than full-stop.
+    var slowZoneRadius: Float = 0.40  // 40cm
     
     /// Whether obstacle avoidance is enabled
     var isEnabled: Bool = true
@@ -599,11 +603,24 @@ class ObstacleDetector {
     
     /// Checks if any detected obstacle lies within a rectangular corridor
     /// defined by a world-space heading from the device position.
-    /// The corridor is `stopRadius` long and `2 × carHalfWidth` wide.
+    /// The corridor extends to `corridorLength` (default = slowZoneRadius) and
+    /// is `2 × carHalfWidth` wide. Checks:
+    ///   1. Pre-collected obstacle positions (from the update() bubble)
+    ///   2. Raw LiDAR depth obstacle at extended range
+    ///   3. The occupancy grid directly for cells in the corridor
     /// Only obstacles AHEAD (positive projection) are considered.
-    func hasObstacleInPath(heading: Float) -> Bool {
-        guard let grid = occupancyGrid else { return false }
+    func hasObstacleInPath(heading: Float, corridorLength: Float? = nil) -> Bool {
+        return corridorObstacleDistance(heading: heading, corridorLength: corridorLength) != nil
+    }
+    
+    /// Returns the distance to the nearest obstacle in a rectangular corridor
+    /// ahead of the device, or `nil` if the corridor is clear.
+    /// The corridor extends to `corridorLength` (default = slowZoneRadius) and
+    /// is `2 × carHalfWidth` wide.
+    func corridorObstacleDistance(heading: Float, corridorLength: Float? = nil) -> Float? {
+        guard let grid = occupancyGrid else { return nil }
         let pos = grid.devicePosition
+        let maxDist = corridorLength ?? slowZoneRadius
         
         // Unit vector along the travel heading
         let fwdX = sinf(heading)
@@ -612,36 +629,68 @@ class ObstacleDetector {
         let rightX = cosf(heading)
         let rightY = -sinf(heading)
         
-        // Check mesh/grid-based obstacle positions
-        for cell in obstacleWorldPositions {
-            let dx = cell.x - pos.x
-            let dy = cell.y - pos.y
-            // Project onto forward axis
-            let fwd = dx * fwdX + dy * fwdY
-            if fwd < 0 { continue }  // behind us
-            if fwd > stopRadius { continue }  // beyond stop radius
-            // Project onto lateral axis
-            let lat = dx * rightX + dy * rightY
-            if fabsf(lat) < carHalfWidth {
-                return true
+        var nearest: Float? = nil
+        
+        func consider(_ fwd: Float) {
+            if let cur = nearest {
+                if fwd < cur { nearest = fwd }
+            } else {
+                nearest = fwd
             }
         }
         
-        // Check LiDAR depth obstacle
-        if let depthDist = depthObstacleDistance, depthDist <= stopRadius,
+        // 1. Check pre-collected obstacle positions (from update() bubble)
+        for cell in obstacleWorldPositions {
+            let dx = cell.x - pos.x
+            let dy = cell.y - pos.y
+            let fwd = dx * fwdX + dy * fwdY
+            if fwd < 0 { continue }  // behind us
+            if fwd > maxDist { continue }
+            let lat = dx * rightX + dy * rightY
+            if fabsf(lat) < carHalfWidth {
+                consider(fwd)
+            }
+        }
+        
+        // 2. Check raw LiDAR depth obstacle at extended range
+        if let depthDist = depthObstacleDistance, depthDist <= maxDist,
            let depthPos = depthObstacleWorldPosition {
             let dx = depthPos.x - pos.x
             let dy = depthPos.y - pos.y
             let fwd = dx * fwdX + dy * fwdY
-            if fwd > 0 && fwd <= stopRadius {
+            if fwd > 0 && fwd <= maxDist {
                 let lat = dx * rightX + dy * rightY
                 if fabsf(lat) < carHalfWidth {
-                    return true
+                    consider(fwd)
                 }
             }
         }
         
-        return false
+        // 3. Scan the occupancy grid directly along the corridor.
+        //    Walk forward in grid-cell steps sampling cells across the car width.
+        let cellSize = grid.cellSize
+        let stepSize = cellSize  // step forward one cell at a time
+        let lateralSteps = Int(carHalfWidth / cellSize) + 1
+        var d: Float = cellSize  // start one cell ahead (skip cell we're standing on)
+        while d <= maxDist {
+            for latStep in -lateralSteps...lateralSteps {
+                let sampleX = pos.x + fwdX * d + rightX * (Float(latStep) * cellSize)
+                let sampleY = pos.y + fwdY * d + rightY * (Float(latStep) * cellSize)
+                if let gridCoord = grid.worldToGrid(sampleX, sampleY) {
+                    let state = grid.getCellState(gridX: gridCoord.x, gridY: gridCoord.y)
+                    if state == .occupied {
+                        let classif = grid.getCellClassification(gridX: gridCoord.x, gridY: gridCoord.y)
+                        // Ignore floor and ceiling — not real path obstacles
+                        if classif != .floor && classif != .ceiling {
+                            consider(d)
+                        }
+                    }
+                }
+            }
+            d += stepSize
+        }
+        
+        return nearest
     }
     
     /// Finds the world-space heading closest to `preferred` that has a clear

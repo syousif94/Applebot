@@ -43,6 +43,8 @@ class ESP32BLEManager: NSObject {
     static let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
     static let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
     static let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
+    static let motorCountUUID = CBUUID(string: "E3910005-4567-4321-ABCD-ABCDEF012345")
+    static let batteryUUID    = CBUUID(string: "E3910006-4567-4321-ABCD-ABCDEF012345")
     
     /// Expected device advertisement name
     static let deviceName = "ESP32 Motor"
@@ -60,6 +62,15 @@ class ESP32BLEManager: NSObject {
     /// Callback when connection state changes
     var onStateChanged: ((ESP32ConnectionState) -> Void)?
     
+    /// Callback when battery data updates (percentage 0-100, voltage in volts)
+    var onBatteryUpdated: ((UInt8, Double) -> Void)?
+    
+    /// Latest battery percentage (0–100)
+    private(set) var batteryPercentage: UInt8 = 0
+    
+    /// Latest battery voltage in volts
+    private(set) var batteryVoltage: Double = 0.0
+    
     /// Discovered peripheral name (for display)
     private(set) var peripheralName: String?
     
@@ -71,6 +82,11 @@ class ESP32BLEManager: NSObject {
     private var servoChar: CBCharacteristic?
     private var motorsChar: CBCharacteristic?
     private var wifiConfigChar: CBCharacteristic?
+    private var motorCountChar: CBCharacteristic?
+    private var batteryChar: CBCharacteristic?
+    
+    /// Number of active motors reported by the ESP32 (2 or 4, default 4)
+    private(set) var motorCount: Int = 4
     
     /// Motor write state: latest-value-wins pattern
     private var isMotorWriteInFlight = false
@@ -90,6 +106,12 @@ class ESP32BLEManager: NSObject {
     
     /// Callback when WiFi credentials have been written
     var onWifiWriteResult: ((Bool) -> Void)?
+    
+    /// Battery poll timer (fallback if notifications aren't delivered)
+    private var batteryPollTimer: Timer?
+    
+    /// Battery poll interval in seconds
+    private let batteryPollInterval: TimeInterval = 5.0
     
     /// Scan timeout timer
     private var scanTimer: Timer?
@@ -184,19 +206,25 @@ class ESP32BLEManager: NSObject {
         p.writeValue(Data([clamped]), for: char, type: .withResponse)
     }
     
-    /// Set all four motor powers at once (single 4-byte write)
+    /// Set motor powers (sends 2 or 4 bytes depending on motorCount)
     /// Uses latest-value-wins: if a write is in flight, the new value
     /// replaces any pending value and is sent once the current write completes.
     func setAllMotors(a: Int8, b: Int8, c: Int8, d: Int8) {
         // Negate: motor wiring is reversed (positive software = backward physical)
         let a = -a, b = -b, c = -c, d = -d
         guard peripheral != nil, motorsChar != nil else { return }
-        let data = Data([
-            UInt8(bitPattern: max(-100, min(100, a))),
-            UInt8(bitPattern: max(-100, min(100, b))),
-            UInt8(bitPattern: max(-100, min(100, c))),
-            UInt8(bitPattern: max(-100, min(100, d)))
-        ])
+        
+        let clampA = UInt8(bitPattern: max(-100, min(100, a)))
+        let clampB = UInt8(bitPattern: max(-100, min(100, b)))
+        
+        let data: Data
+        if motorCount == 2 {
+            data = Data([clampA, clampB])
+        } else {
+            let clampC = UInt8(bitPattern: max(-100, min(100, c)))
+            let clampD = UInt8(bitPattern: max(-100, min(100, d)))
+            data = Data([clampA, clampB, clampC, clampD])
+        }
         
         lastMotorData = data
         
@@ -337,14 +365,40 @@ class ESP32BLEManager: NSObject {
         }
     }
     
+    // MARK: - Battery polling
+    
+    /// Start polling the battery characteristic periodically
+    private func startBatteryPolling() {
+        stopBatteryPolling()
+        batteryPollTimer = Timer.scheduledTimer(withTimeInterval: batteryPollInterval, repeats: true) { [weak self] _ in
+            self?.pollBattery()
+        }
+    }
+    
+    /// Stop the battery poll timer
+    private func stopBatteryPolling() {
+        batteryPollTimer?.invalidate()
+        batteryPollTimer = nil
+    }
+    
+    /// Read battery characteristic value
+    private func pollBattery() {
+        guard let p = peripheral, let char = batteryChar else { return }
+        p.readValue(for: char)
+    }
+    
     private func clearCharacteristics() {
         servoChar = nil
         motorsChar = nil
         wifiConfigChar = nil
+        motorCountChar = nil
+        batteryChar = nil
+        motorCount = 4
         isMotorWriteInFlight = false
         pendingMotorData = nil
         lastMotorData = nil
         stopHeartbeat()
+        stopBatteryPolling()
     }
 }
 
@@ -440,6 +494,14 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             case Self.servoAngleUUID:  servoChar = char
             case Self.motorsUUID:     motorsChar = char
             case Self.wifiConfigUUID: wifiConfigChar = char
+            case Self.motorCountUUID:
+                motorCountChar = char
+                // Read motor count on discovery
+                peripheral.readValue(for: char)
+            case Self.batteryUUID:
+                batteryChar = char
+                // Read initial battery value
+                peripheral.readValue(for: char)
             default: break
             }
             // Enable notifications
@@ -447,14 +509,48 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 peripheral.setNotifyValue(true, for: char)
             }
         }
-        print("[BLE] Ready — servo: \(servoChar != nil), motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil)")
+        print("[BLE] Ready — servo: \(servoChar != nil), motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil), motorCount: \(motorCountChar != nil), battery: \(batteryChar != nil)")
+        if batteryChar != nil {
+            startBatteryPolling()
+        }
         connectionState = .connected
     }
     
     func peripheral(_ peripheral: CBPeripheral,
                     didUpdateValueFor characteristic: CBCharacteristic,
                     error: Error?) {
-        // Handle notifications if needed in the future
+        guard let data = characteristic.value else { return }
+        switch characteristic.uuid {
+        case Self.motorCountUUID:
+            if let byte = data.first {
+                let count = Int(byte)
+                if count == 2 || count == 4 {
+                    motorCount = count
+                    print("[BLE] Motor count: \(motorCount)")
+                } else {
+                    print("[BLE] Unexpected motor count value: \(count), keeping default \(motorCount)")
+                }
+            }
+        case Self.motorsUUID:
+            let powers = data.prefix(motorCount).map { Int8(bitPattern: $0) }
+            print("[BLE] Motors notification: \(powers)")
+        case Self.servoAngleUUID:
+            if let byte = data.first {
+                print("[BLE] Servo angle notification: \(byte)")
+            }
+        case Self.batteryUUID:
+            if data.count >= 3 {
+                let pct = data[0]
+                let mv = (UInt16(data[1]) << 8) | UInt16(data[2])
+                let volts = Double(mv) / 1000.0
+                batteryPercentage = pct
+                batteryVoltage = volts
+                print("[BLE] Battery: \(pct)% \(volts)V")
+                onBatteryUpdated?(pct, volts)
+            }
+        default:
+            break
+        }
     }
     
     func peripheral(_ peripheral: CBPeripheral,

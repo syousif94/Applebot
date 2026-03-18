@@ -712,12 +712,47 @@ class LiDARViewController: UIViewController {
             
             let planStart = CFAbsoluteTimeGetCurrent()
             
-            // Try strict A* first (free cells only), then greedy fallback (allows unknown)
-            var path = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
-            var algorithm = "astar"
-            if path.isEmpty {
-                path = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            // Helper: total Euclidean length of a path in meters
+            func pathLength(_ p: [(x: Float, y: Float)]) -> Float {
+                var total: Float = 0
+                for i in 1..<p.count {
+                    let dx = p[i].x - p[i-1].x
+                    let dy = p[i].y - p[i-1].y
+                    total += sqrtf(dx * dx + dy * dy)
+                }
+                return total
+            }
+            
+            // Run both pathfinders: strict (free-only) and greedy (allows unknown)
+            let strictPath = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            let greedyPath = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            
+            // Pick the best path:
+            //  - If only one succeeded, use it
+            //  - If both succeeded, prefer the greedy (exploration) path when it's
+            //    meaningfully shorter — the car will scan unknown cells as it drives.
+            //    Threshold: use greedy if it's < 75% of the strict path length.
+            let path: [(x: Float, y: Float)]
+            let algorithm: String
+            if strictPath.isEmpty && greedyPath.isEmpty {
+                path = []
+                algorithm = "none"
+            } else if strictPath.isEmpty {
+                path = greedyPath
                 algorithm = "greedy"
+            } else if greedyPath.isEmpty {
+                path = strictPath
+                algorithm = "astar"
+            } else {
+                let strictLen = pathLength(strictPath)
+                let greedyLen = pathLength(greedyPath)
+                if greedyLen < strictLen * 0.75 {
+                    path = greedyPath
+                    algorithm = "greedy_shorter"
+                } else {
+                    path = strictPath
+                    algorithm = "astar"
+                }
             }
             
             let planDurationMs = Float((CFAbsoluteTimeGetCurrent() - planStart) * 1000)
@@ -1067,11 +1102,43 @@ class LiDARViewController: UIViewController {
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
                 let replanStart = CFAbsoluteTimeGetCurrent()
-                var path = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
-                var algorithm = "astar"
-                if path.isEmpty {
-                    path = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                
+                // Helper: total Euclidean length of a path in meters
+                func pathLength(_ p: [(x: Float, y: Float)]) -> Float {
+                    var total: Float = 0
+                    for i in 1..<p.count {
+                        let dx = p[i].x - p[i-1].x
+                        let dy = p[i].y - p[i-1].y
+                        total += sqrtf(dx * dx + dy * dy)
+                    }
+                    return total
+                }
+                
+                // Run both pathfinders and pick the better one
+                let strictPath = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                let greedyPath = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                
+                let path: [(x: Float, y: Float)]
+                let algorithm: String
+                if strictPath.isEmpty && greedyPath.isEmpty {
+                    path = []
+                    algorithm = "none"
+                } else if strictPath.isEmpty {
+                    path = greedyPath
                     algorithm = "greedy"
+                } else if greedyPath.isEmpty {
+                    path = strictPath
+                    algorithm = "astar"
+                } else {
+                    let strictLen = pathLength(strictPath)
+                    let greedyLen = pathLength(greedyPath)
+                    if greedyLen < strictLen * 0.75 {
+                        path = greedyPath
+                        algorithm = "greedy_shorter"
+                    } else {
+                        path = strictPath
+                        algorithm = "astar"
+                    }
                 }
                 let replanDurationMs = Float((CFAbsoluteTimeGetCurrent() - replanStart) * 1000)
                 

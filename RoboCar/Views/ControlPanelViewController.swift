@@ -30,6 +30,14 @@ class ControlPanelViewController: UIViewController {
     private let sendWifiButton = UIButton(type: .custom)
     private let wifiStatusLabel = UILabel()
     
+    // Battery views
+    private let batteryLabel = UILabel()
+    private let batteryPercentLabel = UILabel()
+    private let batteryVoltageLabel = UILabel()
+    private let batteryBar = UIView()
+    private let batteryBarFill = UIView()
+    private var batteryBarFillWidth: NSLayoutConstraint!
+    
     // Telemetry views
     private let telemetryLabel = UILabel()
     private let serverURLField = UITextField()
@@ -50,6 +58,7 @@ class ControlPanelViewController: UIViewController {
         setupGrabber()
         setupHeader()
         setupConnectionRow()
+        setupBatteryStatus()
         setupJoystick()
         setupWiFiConfig()
         setupTelemetryConfig()
@@ -64,6 +73,9 @@ class ControlPanelViewController: UIViewController {
         ble.onStateChanged = { [weak self] state in
             DispatchQueue.main.async { self?.updateConnectionUI(state) }
         }
+        ble.onBatteryUpdated = { [weak self] pct, volts in
+            DispatchQueue.main.async { self?.updateBatteryUI(percentage: pct, voltage: volts) }
+        }
         updateConnectionUI(ble.connectionState)
         
         // Adjust scroll view insets when keyboard appears/disappears
@@ -74,6 +86,9 @@ class ControlPanelViewController: UIViewController {
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         statusDot.layer.cornerRadius = statusDot.bounds.width / 2
+        telemetryStatusDot.layer.cornerRadius = telemetryStatusDot.bounds.width / 2
+        batteryBar.layer.cornerRadius = 4
+        batteryBarFill.layer.cornerRadius = 3
     }
     
     // MARK: - Setup
@@ -169,6 +184,96 @@ class ControlPanelViewController: UIViewController {
         ])
     }
     
+    private func setupBatteryStatus() {
+        // Section label
+        batteryLabel.translatesAutoresizingMaskIntoConstraints = false
+        batteryLabel.text = "Battery"
+        batteryLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        batteryLabel.textColor = UIColor.white.withAlphaComponent(0.6)
+        contentView.addSubview(batteryLabel)
+        
+        // Percentage label
+        batteryPercentLabel.translatesAutoresizingMaskIntoConstraints = false
+        batteryPercentLabel.text = "—"
+        batteryPercentLabel.font = .monospacedSystemFont(ofSize: 14, weight: .bold)
+        batteryPercentLabel.textColor = .white
+        contentView.addSubview(batteryPercentLabel)
+        
+        // Voltage label
+        batteryVoltageLabel.translatesAutoresizingMaskIntoConstraints = false
+        batteryVoltageLabel.text = ""
+        batteryVoltageLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        batteryVoltageLabel.textColor = UIColor.white.withAlphaComponent(0.5)
+        contentView.addSubview(batteryVoltageLabel)
+        
+        // Progress bar background
+        batteryBar.translatesAutoresizingMaskIntoConstraints = false
+        batteryBar.backgroundColor = UIColor(white: 0.25, alpha: 1)
+        batteryBar.clipsToBounds = true
+        contentView.addSubview(batteryBar)
+        
+        // Progress bar fill
+        batteryBarFill.translatesAutoresizingMaskIntoConstraints = false
+        batteryBarFill.backgroundColor = UIColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1)
+        batteryBar.addSubview(batteryBarFill)
+        
+        batteryBarFillWidth = batteryBarFill.widthAnchor.constraint(equalToConstant: 0)
+        
+        NSLayoutConstraint.activate([
+            batteryLabel.topAnchor.constraint(equalTo: connectButton.bottomAnchor, constant: 20),
+            batteryLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            
+            batteryPercentLabel.centerYAnchor.constraint(equalTo: batteryLabel.centerYAnchor),
+            batteryPercentLabel.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            
+            batteryVoltageLabel.centerYAnchor.constraint(equalTo: batteryLabel.centerYAnchor),
+            batteryVoltageLabel.trailingAnchor.constraint(equalTo: batteryPercentLabel.leadingAnchor, constant: -8),
+            
+            batteryBar.topAnchor.constraint(equalTo: batteryLabel.bottomAnchor, constant: 8),
+            batteryBar.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            batteryBar.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            batteryBar.heightAnchor.constraint(equalToConstant: 8),
+            
+            batteryBarFill.leadingAnchor.constraint(equalTo: batteryBar.leadingAnchor, constant: 1),
+            batteryBarFill.topAnchor.constraint(equalTo: batteryBar.topAnchor, constant: 1),
+            batteryBarFill.bottomAnchor.constraint(equalTo: batteryBar.bottomAnchor, constant: -1),
+            batteryBarFillWidth,
+        ])
+        
+        // Initial hidden state
+        updateBatteryUI(percentage: 0, voltage: 0)
+    }
+    
+    private func updateBatteryUI(percentage: UInt8, voltage: Double) {
+        let pct = Int(percentage)
+        if pct == 0 && voltage == 0 {
+            batteryPercentLabel.text = "—"
+            batteryVoltageLabel.text = ""
+            batteryBarFillWidth.constant = 0
+            batteryBarFill.backgroundColor = .gray
+        } else {
+            batteryPercentLabel.text = "\(pct)%"
+            batteryVoltageLabel.text = String(format: "%.2fV", voltage)
+            
+            // Bar width = fraction of (bar width - 2px inset)
+            let barMaxWidth = view.bounds.width - 42 // 20+20 margins + 2 inset
+            batteryBarFillWidth.constant = max(0, barMaxWidth * CGFloat(pct) / 100.0)
+            
+            // Color: green > 50%, yellow 20-50%, red < 20%
+            if pct > 50 {
+                batteryBarFill.backgroundColor = UIColor(red: 0.2, green: 0.9, blue: 0.4, alpha: 1)
+            } else if pct > 20 {
+                batteryBarFill.backgroundColor = UIColor(red: 1.0, green: 0.8, blue: 0.2, alpha: 1)
+            } else {
+                batteryBarFill.backgroundColor = UIColor(red: 1.0, green: 0.3, blue: 0.3, alpha: 1)
+            }
+        }
+        
+        UIView.animate(withDuration: 0.3) {
+            self.batteryBar.layoutIfNeeded()
+        }
+    }
+    
     private func setupJoystick() {
         // Joystick label
         joystickLabel.translatesAutoresizingMaskIntoConstraints = false
@@ -190,7 +295,7 @@ class ControlPanelViewController: UIViewController {
         contentView.addSubview(joystickView)
         
         NSLayoutConstraint.activate([
-            joystickLabel.topAnchor.constraint(equalTo: connectButton.bottomAnchor, constant: 24),
+            joystickLabel.topAnchor.constraint(equalTo: batteryBar.bottomAnchor, constant: 24),
             joystickLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             
             motorLabel.centerYAnchor.constraint(equalTo: joystickLabel.centerYAnchor),

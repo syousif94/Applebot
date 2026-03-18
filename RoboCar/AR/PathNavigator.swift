@@ -36,7 +36,7 @@ class PathNavigator {
     var cruiseSpeed: Float = 0.55
     
     /// Lookahead distance for pure pursuit (meters)
-    var lookaheadDistance: Float = 0.30
+    var lookaheadDistance: Float = 0.45
     
     /// Distance to consider "arrived" at the final target (meters)
     var arrivalThreshold: Float = 0.12
@@ -46,7 +46,7 @@ class PathNavigator {
     
     /// Grace period after resuming from a pause — ignore obstacles briefly so
     /// the new path has time to steer away (seconds).
-    private let resumeGracePeriod: TimeInterval = 1.0
+    private let resumeGracePeriod: TimeInterval = 0.3
     
     /// Timestamp when we last resumed from paused → navigating
     private var lastResumeTime: Date = .distantPast
@@ -97,12 +97,12 @@ class PathNavigator {
     private var reverseStartTime: Date?
     
     /// Duration of the reverse phase (seconds)
-    private let reverseDuration: TimeInterval = 0.6
+    private let reverseDuration: TimeInterval = 0.35
     
-    /// Duration of the turn-away phase after reversing (seconds)
-    private let reverseTurnDuration: TimeInterval = 0.5
+    /// Duration of the pause after reversing to let sensors update (seconds)
+    private let reversePauseDuration: TimeInterval = 0.5
     
-    /// Phase of reverse maneuver: 0 = backing up, 1 = turning away
+    /// Phase of reverse maneuver: 0 = backing up, 1 = pause
     private var reversePhase: Int = 0
     
     /// Stuck detection: last recorded position
@@ -116,6 +116,12 @@ class PathNavigator {
     
     /// Minimum distance to have moved in stuckCheckInterval to not be stuck (meters)
     private let stuckMinDistance: Float = 0.03  // 3cm
+    
+    /// Spinning stuck detection: timestamp when continuous spinning started
+    private var spinStartTime: Date?
+    
+    /// Maximum time to spin in place before triggering an escape (seconds)
+    private let maxSpinDuration: TimeInterval = 2.0
     
     /// Reference to the occupancy grid
     weak var occupancyGrid: OccupancyGrid?
@@ -145,6 +151,7 @@ class PathNavigator {
         pauseStartTime = nil
         lastStuckCheckPos = nil
         lastStuckCheckTime = nil
+        spinStartTime = nil
         state = .navigating
         
         log("🧭 Navigation started — \(path.count) waypoints to (\(String(format: "%.2f", target.x)), \(String(format: "%.2f", target.y)))")
@@ -168,6 +175,7 @@ class PathNavigator {
         reverseStartTime = nil
         lastStuckCheckPos = nil
         lastStuckCheckTime = nil
+        spinStartTime = nil
         
         if state != .idle {
             ESP32BLEManager.shared.stopAll()
@@ -317,6 +325,79 @@ class PathNavigator {
         // Target heading in world space (same convention as OccupancyGrid)
         let targetHeading = atan2f(dx, dy)
         
+        // ------------------------------------------------------------------
+        // Forward corridor obstacle check (grid + raw LiDAR depth)
+        // Scans a car-width corridor along the travel heading up to the slow
+        // zone radius. If an obstacle is within stopRadius → full stop.
+        // If between stopRadius and slowZoneRadius → reduce speed.
+        // Skip during grace period so the car can follow a newly replanned path.
+        // ------------------------------------------------------------------
+        
+        // Also check the direct heading to the next waypoint, not just the
+        // lookahead point — catches obstacles between us and the immediate
+        // next waypoint that the lookahead might skip over.
+        let waypointHeading: Float
+        if currentWaypointIndex < currentPath.count {
+            let wp = currentPath[currentWaypointIndex]
+            waypointHeading = atan2f(wp.x - pos.x, wp.y - pos.y)
+        } else {
+            waypointHeading = targetHeading
+        }
+        
+        // Always check the corridor for obstacles in the travel direction,
+        // even during the grace period. The grace period only suppresses the
+        // radial bubble check above — the directional corridor scan must
+        // remain active so the car never drives blind into a front obstacle.
+        let corridorDist: Float?
+        do {
+            // Check both the lookahead heading and the direct waypoint heading;
+            // take the nearer obstacle of the two.
+            let d1 = detector.corridorObstacleDistance(heading: targetHeading)
+            let d2 = (targetHeading == waypointHeading) ? nil
+                : detector.corridorObstacleDistance(heading: waypointHeading)
+            switch (d1, d2) {
+            case let (a?, b?): corridorDist = min(a, b)
+            case let (a?, nil): corridorDist = a
+            case let (nil, b?): corridorDist = b
+            case (nil, nil):    corridorDist = nil
+            }
+        }
+        
+        if let dist = corridorDist, dist <= detector.stopRadius {
+            // Near the final destination? Declare arrived early rather than
+            // fighting through the last few centimeters into an obstacle.
+            if distToTarget < arrivalThreshold * 3 {
+                ESP32BLEManager.shared.stopAll()
+                state = .arrived
+                log("✅ Arrived near target (obstacle in final approach)")
+                navTimer?.invalidate()
+                navTimer = nil
+                return
+            }
+            
+            // Obstacle within hard-stop distance along travel direction —
+            // always stop, then replan.
+            ESP32BLEManager.shared.stopAll()
+            if state != .paused {
+                state = .paused
+                pauseStartTime = Date()
+                log("🛑 Corridor obstacle at \(String(format: "%.0f", dist * 1000))mm — stopping")
+            }
+            lastReplanTime = .distantPast  // force immediate replan
+            return
+        }
+        
+        // Slow-zone factor: 1.0 = full speed, 0.5 = half speed near obstacles
+        let corridorSlowFactor: Float
+        if let dist = corridorDist, dist <= detector.slowZoneRadius {
+            // Linear ramp from 0.5 (at stopRadius) to 1.0 (at slowZoneRadius)
+            let range = detector.slowZoneRadius - detector.stopRadius
+            let progress = (dist - detector.stopRadius) / max(range, 0.01)
+            corridorSlowFactor = 0.5 + 0.5 * progress
+        } else {
+            corridorSlowFactor = 1.0
+        }
+        
         // Heading error (how much we need to turn)
         var headingError = targetHeading - pos.heading
         // Normalize to [-π, π]
@@ -333,7 +414,9 @@ class PathNavigator {
         
         // Stuck detection: if power is being applied but the car isn't moving, reverse.
         // Skip this check when we're intentionally spinning in place (no translation expected).
+        // BUT track how long we've been spinning — if we spin too long, we're stuck.
         if !isSpinning {
+            spinStartTime = nil  // not spinning, reset spin timer
             if let lastPos = lastStuckCheckPos, let lastTime = lastStuckCheckTime {
                 if Date().timeIntervalSince(lastTime) >= stuckCheckInterval {
                     let movedDx = pos.x - lastPos.x
@@ -341,7 +424,7 @@ class PathNavigator {
                     let movedDist = sqrtf(movedDx * movedDx + movedDy * movedDy)
                     
                     if movedDist < stuckMinDistance {
-                        log("🚧 Stuck — power applied but not moving, reversing")
+                        log("🚧 Stuck — power applied but not moving, escaping")
                         startReverse(detector: ObstacleDetector.shared)
                         state = .paused
                         pauseStartTime = Date()
@@ -358,7 +441,19 @@ class PathNavigator {
                 lastStuckCheckTime = Date()
             }
         } else {
-            // Reset stuck timer while spinning — we expect no translation
+            // Spinning in place — track how long and trigger escape if too long
+            if spinStartTime == nil {
+                spinStartTime = Date()
+            } else if let spinStart = spinStartTime,
+                      Date().timeIntervalSince(spinStart) >= maxSpinDuration {
+                log("🚧 Stuck spinning for \(String(format: "%.1f", maxSpinDuration))s — escaping")
+                startReverse(detector: ObstacleDetector.shared)
+                state = .paused
+                pauseStartTime = Date()
+                spinStartTime = nil
+                return
+            }
+            // Reset translation stuck timer while spinning
             lastStuckCheckPos = (pos.x, pos.y)
             lastStuckCheckTime = Date()
         }
@@ -368,16 +463,18 @@ class PathNavigator {
         
         if isSpinning {
             // Sharp turn: spin in place with opposite wheel directions.
-            // Needs high power since wheels fight each other's friction on carpet/floor.
-            // Use 85-100% power to guarantee the motors overcome static friction.
-            let spinPower: Float = min(1.0, 0.85 + 0.15 * (absError / .pi))
+            let spinPower: Float = 0.40
             leftPower  =  turnSign * spinPower
             rightPower = -turnSign * spinPower
         } else {
-            // Small correction: proportional differential steering while driving forward
-            let turnGain: Float = 2.0
+            // Small correction: proportional differential steering while driving forward.
+            // Reduce cruise speed proportionally when heading error is large to
+            // avoid carrying too much speed into a turn.
+            // Apply corridor slow factor when approaching obstacles ahead.
+            let turnGain: Float = 1.2
             let turn = max(-1.0, min(1.0, headingError * turnGain))
-            let basePower: Float = cruiseSpeed
+            let slowdownFactor: Float = 1.0 - 0.5 * (absError / sharpTurnThreshold)
+            let basePower: Float = max(0.40, cruiseSpeed * max(0.5, slowdownFactor) * corridorSlowFactor)
             leftPower  = basePower + turn * basePower
             rightPower = basePower - turn * basePower
         }
@@ -401,21 +498,26 @@ class PathNavigator {
         ESP32BLEManager.shared.setAllMotors(a: leftInt, b: rightInt, c: leftInt, d: rightInt)
     }
     
-    // MARK: - Reverse Maneuver
+    // MARK: - Escape Maneuver
     
-    /// Start a reverse-and-turn maneuver to escape an obstacle.
+    /// Start an escape maneuver: back up first to create clearance, then
+    /// pause for sensors to update, re-evaluate the clear heading, spin and drive out.
+    /// Falls back to blind reverse + turn if no clear heading exists.
     private func startReverse(detector: ObstacleDetector) {
         isReversing = true
-        reversePhase = 0
+        reversePhase = 0  // always start with backup
         reverseStartTime = Date()
         
-        // Phase 0: reverse at 60% power
+        // Phase 0: always reverse first to create clearance
         let reversePower: Int8 = -60
         ESP32BLEManager.shared.setAllMotors(a: reversePower, b: reversePower, c: reversePower, d: reversePower)
-        log("↩️ Reversing...")
+        log("↩️ Backing up to create clearance...")
     }
     
-    /// Called each tick while isReversing is true — manages the reverse phases.
+    /// Called each tick while isReversing is true — manages the escape phases.
+    /// Phase 0: back up to create clearance
+    /// Phase 1: pause — stop motors, let sensors update
+    /// After the pause, finish and force a replan so A* picks a fresh route.
     private func tickReverse() {
         guard let startTime = reverseStartTime else {
             finishReverse()
@@ -426,40 +528,25 @@ class PathNavigator {
         
         switch reversePhase {
         case 0:
-            // Phase 0: reversing
+            // Phase 0: backing up
             if elapsed >= reverseDuration {
-                // Move to phase 1: turn away from the obstacle
+                // Stop and pause to let sensors refresh
+                ESP32BLEManager.shared.stopAll()
                 reversePhase = 1
                 reverseStartTime = Date()
-                
-                // Determine turn direction: turn away from the blocked side
-                let detector = ObstacleDetector.shared
-                let turnRight: Bool
-                if let blocked = detector.blockedLocalDirection {
-                    // blocked.x > 0 means obstacle is to the right → turn left
-                    turnRight = blocked.x < 0
-                } else {
-                    turnRight = Bool.random()
-                }
-                
-                let turnPower: Int8 = 60
-                if turnRight {
-                    ESP32BLEManager.shared.setAllMotors(a: turnPower, b: -turnPower, c: turnPower, d: -turnPower)
-                } else {
-                    ESP32BLEManager.shared.setAllMotors(a: -turnPower, b: turnPower, c: -turnPower, d: turnPower)
-                }
-                log("↩️ Turning \(turnRight ? "right" : "left") to avoid obstacle")
+                log("↩️ Backup done — pausing for sensor update")
             }
             
         default:
-            // Phase 1: turning away
-            if elapsed >= reverseTurnDuration {
+            // Phase 1: paused — waiting for LiDAR / obstacle detector to update
+            if elapsed >= reversePauseDuration {
+                log("↩️ Pause done — requesting replan from new position")
                 finishReverse()
             }
         }
     }
     
-    /// End the reverse maneuver and request a re-plan.
+    /// End the escape maneuver and request a re-plan.
     private func finishReverse() {
         ESP32BLEManager.shared.stopAll()
         isReversing = false
@@ -505,49 +592,37 @@ class PathNavigator {
     
     // MARK: - Pure Pursuit Helpers
     
-    /// Advance the waypoint index: skip waypoints that are behind the car or
-    /// that can be bypassed because a farther waypoint has clear line-of-sight.
+    /// Advance the waypoint index: only skip a waypoint if the car has passed
+    /// it along the direction toward the next waypoint (i.e. it is behind the
+    /// next waypoint from the car's perspective on the path).
     private func advanceWaypoint(pos: DevicePosition) {
-        let headingVecX = sinf(pos.heading)
-        let headingVecY = cosf(pos.heading)
-        
-        // 1. Skip any waypoints that are behind us or that we're close to
         while currentWaypointIndex < currentPath.count - 1 {
             let wp = currentPath[currentWaypointIndex]
-            let dx = wp.x - pos.x
-            let dy = wp.y - pos.y
-            let dist = sqrtf(dx * dx + dy * dy)
+            let next = currentPath[currentWaypointIndex + 1]
             
-            // Dot product with heading: negative means the waypoint is behind the car
-            let dot = dx * headingVecX + dy * headingVecY
+            // Direction along the path segment from current waypoint to next
+            let segDx = next.x - wp.x
+            let segDy = next.y - wp.y
+            let segLenSq = segDx * segDx + segDy * segDy
             
-            if dist < lookaheadDistance * 0.8 || (dot < 0 && dist < 0.5) {
+            guard segLenSq > 1e-8 else {
+                // Degenerate zero-length segment — skip it
+                currentWaypointIndex += 1
+                continue
+            }
+            
+            // Project the car position onto the segment direction
+            let toPosX = pos.x - wp.x
+            let toPosY = pos.y - wp.y
+            let dot = toPosX * segDx + toPosY * segDy
+            
+            // dot > 0 means the car is past the current waypoint in the
+            // direction of the next waypoint, so the current wp is "behind"
+            // the next wp from our point of view — safe to skip.
+            if dot > 0 {
                 currentWaypointIndex += 1
             } else {
                 break
-            }
-        }
-        
-        // 2. Look-ahead skip: jump to the farthest reachable waypoint that has
-        //    no obstacles on the occupancy grid between us and it.
-        if let grid = occupancyGrid, currentWaypointIndex < currentPath.count - 1 {
-            if let posGrid = grid.worldToGrid(pos.x, pos.y) {
-                var farthestClear = currentWaypointIndex
-                let searchLimit = min(currentPath.count, currentWaypointIndex + 12) // check up to 12 ahead
-                for i in (currentWaypointIndex + 1)..<searchLimit {
-                    let wp = currentPath[i]
-                    if let wpGrid = grid.worldToGrid(wp.x, wp.y) {
-                        if grid.hasLineOfSight(fromX: posGrid.x, fromY: posGrid.y,
-                                               toX: wpGrid.x, toY: wpGrid.y) {
-                            farthestClear = i
-                        } else {
-                            break  // no point checking farther once LOS is lost
-                        }
-                    }
-                }
-                if farthestClear > currentWaypointIndex {
-                    currentWaypointIndex = farthestClear
-                }
             }
         }
     }
