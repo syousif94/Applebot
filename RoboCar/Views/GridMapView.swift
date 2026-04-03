@@ -6,6 +6,7 @@
 //
 
 import UIKit
+import simd
 
 /// A view that renders the 2D top-down occupancy grid
 class GridMapView: UIView {
@@ -62,11 +63,33 @@ class GridMapView: UIView {
     /// Planned path in world coordinates (set externally after pathfinding)
     var plannedPath: [(x: Float, y: Float)] = []
     
-    /// Target point the user tapped (world coordinates)
+    /// Target point the user tapped (world coordinates) — legacy single target
     var pathTargetPoint: (x: Float, y: Float)?
+    
+    /// Multi-point route waypoints in world coordinates (ordered)
+    var routeWaypoints: [(x: Float, y: Float)] = []
+    
+    /// Planned paths between consecutive route waypoints (for preview)
+    /// Index i holds the path from waypoint[i] to waypoint[i+1] (index 0 = device → WP1)
+    var routePreviewPaths: [[(x: Float, y: Float)]] = []
+    
+    /// Index of the waypoint currently being navigated to (for visual highlighting)
+    var activeRouteWaypointIndex: Int = 0
+
+    /// Detected people positions on the grid (id, world position, label)
+    var personPositions: [PersonBoxInfo] = []
     
     /// Callback when the user taps a world position on the grid
     var onTapWorldPosition: ((Float, Float) -> Void)?
+    
+    // MARK: - Pan Offset
+    
+    /// Pan offset in world-coordinate meters (applied to shift the view center)
+    private var panOffsetX: Float = 0
+    private var panOffsetY: Float = 0
+    
+    /// Whether the view is currently panned away from center
+    var isPanned: Bool { panOffsetX != 0 || panOffsetY != 0 }
     
     // MARK: - Initialization
     
@@ -83,9 +106,21 @@ class GridMapView: UIView {
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch(_:)))
         addGestureRecognizer(pinch)
         
-        // Add tap gesture for pathfinding
+        // Add 2-finger pan gesture for panning around the map
+        let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan(_:)))
+        pan.minimumNumberOfTouches = 2
+        pan.maximumNumberOfTouches = 2
+        addGestureRecognizer(pan)
+        
+        // Add tap gesture for adding route waypoints
         let tap = UITapGestureRecognizer(target: self, action: #selector(handleTap(_:)))
         addGestureRecognizer(tap)
+        
+        // Add double-tap gesture to recenter the view
+        let doubleTap = UITapGestureRecognizer(target: self, action: #selector(handleDoubleTap(_:)))
+        doubleTap.numberOfTapsRequired = 2
+        addGestureRecognizer(doubleTap)
+        tap.require(toFail: doubleTap)
     }
     
     required init?(coder: NSCoder) {
@@ -100,6 +135,37 @@ class GridMapView: UIView {
             gesture.scale = 1.0
             setNeedsDisplay()
         }
+    }
+    
+    @objc private func handlePan(_ gesture: UIPanGestureRecognizer) {
+        guard gesture.state == .changed else { return }
+        let translation = gesture.translation(in: self)
+        // Convert screen-pixel delta to world-meter delta
+        // Invert because dragging right should move view left in world coords
+        let heading = lastRelativeHeading
+        let cosH = cos(-heading)
+        let sinH = sin(-heading)
+        // Undo the rotation to get world-aligned deltas
+        let worldDx = Float(translation.x * cosH - translation.y * sinH) / Float(lastScale)
+        let worldDy = Float(translation.x * sinH + translation.y * cosH) / Float(lastScale)
+        panOffsetX += worldDx
+        panOffsetY += worldDy
+        gesture.setTranslation(.zero, in: self)
+        setNeedsDisplay()
+    }
+    
+    @objc private func handleDoubleTap(_ gesture: UITapGestureRecognizer) {
+        guard gesture.state == .ended else { return }
+        panOffsetX = 0
+        panOffsetY = 0
+        setNeedsDisplay()
+    }
+    
+    /// Programmatically recenter the view on the device
+    func recenterOnDevice() {
+        panOffsetX = 0
+        panOffsetY = 0
+        setNeedsDisplay()
     }
     
     @objc private func handleTap(_ gesture: UITapGestureRecognizer) {
@@ -120,10 +186,12 @@ class GridMapView: UIView {
         let unrotatedX = centerX + dx * cosH - dy * sinH
         let unrotatedY = centerY + dx * sinH + dy * cosH
         
-        // Convert from screen to world coordinates
+        // Convert from screen to world coordinates (account for pan offset)
         let devicePos = grid.devicePosition
-        let worldX = devicePos.x + Float((centerX - unrotatedX) / lastScale)
-        let worldY = devicePos.y + Float((centerY - unrotatedY) / lastScale)
+        let viewCenterX = devicePos.x - panOffsetX
+        let viewCenterY = devicePos.y - panOffsetY
+        let worldX = viewCenterX + Float((centerX - unrotatedX) / lastScale)
+        let worldY = viewCenterY + Float((centerY - unrotatedY) / lastScale)
         
         print("[GridMapView] Tap at screen (\(tapPoint.x), \(tapPoint.y)) → world (\(String(format: "%.2f", worldX)), \(String(format: "%.2f", worldY)))")
         
@@ -139,6 +207,28 @@ class GridMapView: UIView {
         lastRecordedPosition = nil
         plannedPath.removeAll()
         pathTargetPoint = nil
+        routeWaypoints.removeAll()
+        routePreviewPaths.removeAll()
+        activeRouteWaypointIndex = 0
+        panOffsetX = 0
+        panOffsetY = 0
+    }
+    
+    /// Remove the last-added route waypoint
+    func removeLastRouteWaypoint() {
+        guard !routeWaypoints.isEmpty else { return }
+        routeWaypoints.removeLast()
+        setNeedsDisplay()
+    }
+    
+    /// Clear all route waypoints
+    func clearRouteWaypoints() {
+        routeWaypoints.removeAll()
+        routePreviewPaths.removeAll()
+        activeRouteWaypointIndex = 0
+        pathTargetPoint = nil
+        plannedPath.removeAll()
+        setNeedsDisplay()
     }
     
     // MARK: - Position History
@@ -219,11 +309,15 @@ class GridMapView: UIView {
         context.rotate(by: relativeHeading)
         context.translateBy(x: -centerX, y: -centerY)
         
-        // Draw grid lines (1 meter spacing) - rotated
-        drawGridLines(context: context, rect: rect, devicePos: devicePos)
+        // View center in world coordinates (device pos shifted by pan offset)
+        let viewCenterWorldX = devicePos.x - panOffsetX
+        let viewCenterWorldY = devicePos.y - panOffsetY
         
-        // Get region around device
-        let region = grid.getRegion(centerX: devicePos.x, centerY: devicePos.y, radiusMeters: viewRadiusMeters * 1.5)  // Slightly larger for rotation
+        // Draw grid lines (1 meter spacing) - rotated
+        drawGridLines(context: context, rect: rect, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY)
+        
+        // Get region around view center (not device)
+        let region = grid.getRegion(centerX: viewCenterWorldX, centerY: viewCenterWorldY, radiusMeters: viewRadiusMeters * 1.5)  // Slightly larger for rotation
         
         // Calculate height range for rainbow gradient
         let minHeight = region.minHeight
@@ -247,7 +341,7 @@ class GridMapView: UIView {
         
         for (xi, column) in region.cells.enumerated() {
             let worldX = region.originX + Float(xi) * cellSize
-            let relX = CGFloat(worldX - devicePos.x) * scale
+            let relX = CGFloat(worldX - viewCenterWorldX) * scale
             // Negate X to fix horizontal flip
             let screenX = centerX - relX - cellPixelSize / 2
             
@@ -255,7 +349,7 @@ class GridMapView: UIView {
                 guard state != .unknown else { continue }
                 
                 let worldY = region.originY + Float(yi) * cellSize
-                let relY = CGFloat(worldY - devicePos.y) * scale
+                let relY = CGFloat(worldY - viewCenterWorldY) * scale
                 // Y increases upward in world, but downward on screen, so negate
                 let screenY = centerY - relY - cellPixelSize / 2
                 
@@ -344,13 +438,15 @@ class GridMapView: UIView {
         }
         
         // Draw position trail (in rotated coordinate system)
-        drawTrail(context: context, centerX: centerX, centerY: centerY, devicePos: devicePos)
+        drawTrail(context: context, centerX: centerX, centerY: centerY, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY)
         
         // Restore state (remove rotation)
         context.restoreGState()
         
-        // Draw device indicator (always pointing up, not rotated)
-        drawDevice(context: context, centerX: centerX, centerY: centerY)
+        // Draw device indicator (at its correct position relative to view center)
+        let deviceScreenX = centerX - CGFloat(devicePos.x - viewCenterWorldX) * scale
+        let deviceScreenY = centerY - CGFloat(devicePos.y - viewCenterWorldY) * scale
+        drawDevice(context: context, centerX: deviceScreenX, centerY: deviceScreenY)
         
         // Draw scale indicator
         drawScaleIndicator(context: context, rect: rect)
@@ -363,14 +459,27 @@ class GridMapView: UIView {
         context.translateBy(x: centerX, y: centerY)
         context.rotate(by: relativeHeading)
         context.translateBy(x: -centerX, y: -centerY)
-        drawObstacleHighlights(context: context, centerX: centerX, centerY: centerY, devicePos: devicePos, cellPixelSize: cellPixelSize)
-        drawPlannedPath(context: context, centerX: centerX, centerY: centerY, devicePos: devicePos, cellPixelSize: cellPixelSize)
+        drawObstacleHighlights(context: context, centerX: centerX, centerY: centerY, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY, cellPixelSize: cellPixelSize)
+        drawPlannedPath(context: context, centerX: centerX, centerY: centerY, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY, cellPixelSize: cellPixelSize)
+        drawRouteWaypoints(context: context, centerX: centerX, centerY: centerY, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY, cellPixelSize: cellPixelSize)
+        drawPersonPositions(context: context, centerX: centerX, centerY: centerY, viewCenterX: viewCenterWorldX, viewCenterY: viewCenterWorldY)
         context.restoreGState()
+        
+        // Draw "panned" indicator if offset from device
+        if isPanned {
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: UIColor.white.withAlphaComponent(0.7),
+                .font: UIFont.systemFont(ofSize: 11, weight: .medium)
+            ]
+            let label = "Double-tap to recenter"
+            let size = label.size(withAttributes: attrs)
+            label.draw(at: CGPoint(x: rect.midX - size.width / 2, y: 8), withAttributes: attrs)
+        }
     }
     
     // MARK: - Planned Path Drawing
     
-    private func drawPlannedPath(context: CGContext, centerX: CGFloat, centerY: CGFloat, devicePos: DevicePosition, cellPixelSize: CGFloat) {
+    private func drawPlannedPath(context: CGContext, centerX: CGFloat, centerY: CGFloat, viewCenterX: Float, viewCenterY: Float, cellPixelSize: CGFloat) {
         let pathColor = UIColor(red: 0.0, green: 0.9, blue: 0.3, alpha: 0.9).cgColor
         
         if !plannedPath.isEmpty {
@@ -380,12 +489,14 @@ class GridMapView: UIView {
             context.setLineCap(.round)
             context.setLineJoin(.round)
             
-            // Start from device position (center of screen)
-            context.move(to: CGPoint(x: centerX, y: centerY))
+            // Start from device position
+            let deviceScreenX = centerX - CGFloat((occupancyGrid?.devicePosition.x ?? viewCenterX) - viewCenterX) * scale
+            let deviceScreenY = centerY - CGFloat((occupancyGrid?.devicePosition.y ?? viewCenterY) - viewCenterY) * scale
+            context.move(to: CGPoint(x: deviceScreenX, y: deviceScreenY))
             
             for pt in plannedPath {
-                let screenX = centerX - CGFloat(pt.x - devicePos.x) * scale
-                let screenY = centerY - CGFloat(pt.y - devicePos.y) * scale
+                let screenX = centerX - CGFloat(pt.x - viewCenterX) * scale
+                let screenY = centerY - CGFloat(pt.y - viewCenterY) * scale
                 context.addLine(to: CGPoint(x: screenX, y: screenY))
             }
             context.strokePath()
@@ -394,8 +505,8 @@ class GridMapView: UIView {
             let dotSize = max(cellPixelSize * 2, 6)
             context.setFillColor(pathColor)
             for pt in plannedPath {
-                let screenX = centerX - CGFloat(pt.x - devicePos.x) * scale - dotSize / 2
-                let screenY = centerY - CGFloat(pt.y - devicePos.y) * scale - dotSize / 2
+                let screenX = centerX - CGFloat(pt.x - viewCenterX) * scale - dotSize / 2
+                let screenY = centerY - CGFloat(pt.y - viewCenterY) * scale - dotSize / 2
                 context.fillEllipse(in: CGRect(x: screenX, y: screenY, width: dotSize, height: dotSize))
             }
         } else if let target = pathTargetPoint {
@@ -405,9 +516,11 @@ class GridMapView: UIView {
             context.setLineDash(phase: 0, lengths: [6, 4])
             context.setLineCap(.round)
             
-            let targetScreenX = centerX - CGFloat(target.x - devicePos.x) * scale
-            let targetScreenY = centerY - CGFloat(target.y - devicePos.y) * scale
-            context.move(to: CGPoint(x: centerX, y: centerY))
+            let deviceScreenX = centerX - CGFloat((occupancyGrid?.devicePosition.x ?? viewCenterX) - viewCenterX) * scale
+            let deviceScreenY = centerY - CGFloat((occupancyGrid?.devicePosition.y ?? viewCenterY) - viewCenterY) * scale
+            let targetScreenX = centerX - CGFloat(target.x - viewCenterX) * scale
+            let targetScreenY = centerY - CGFloat(target.y - viewCenterY) * scale
+            context.move(to: CGPoint(x: deviceScreenX, y: deviceScreenY))
             context.addLine(to: CGPoint(x: targetScreenX, y: targetScreenY))
             context.strokePath()
             context.setLineDash(phase: 0, lengths: [])  // Reset dash
@@ -416,8 +529,8 @@ class GridMapView: UIView {
         // Always draw target point when set
         if let target = pathTargetPoint {
             let targetDotSize = max(cellPixelSize * 4, 14)
-            let targetScreenX = centerX - CGFloat(target.x - devicePos.x) * scale - targetDotSize / 2
-            let targetScreenY = centerY - CGFloat(target.y - devicePos.y) * scale - targetDotSize / 2
+            let targetScreenX = centerX - CGFloat(target.x - viewCenterX) * scale - targetDotSize / 2
+            let targetScreenY = centerY - CGFloat(target.y - viewCenterY) * scale - targetDotSize / 2
             context.setFillColor(UIColor(red: 0.0, green: 1.0, blue: 0.3, alpha: 1.0).cgColor)
             context.fillEllipse(in: CGRect(x: targetScreenX, y: targetScreenY, width: targetDotSize, height: targetDotSize))
             // White border
@@ -427,7 +540,113 @@ class GridMapView: UIView {
         }
     }
     
-    private func drawObstacleHighlights(context: CGContext, centerX: CGFloat, centerY: CGFloat, devicePos: DevicePosition, cellPixelSize: CGFloat) {
+    // MARK: - Route Waypoints Drawing
+    
+    private func drawRouteWaypoints(context: CGContext, centerX: CGFloat, centerY: CGFloat, viewCenterX: Float, viewCenterY: Float, cellPixelSize: CGFloat) {
+        guard !routeWaypoints.isEmpty else { return }
+        
+        // Draw planned preview paths between waypoints (green lines)
+        let previewPathColor = UIColor(red: 0.0, green: 0.9, blue: 0.3, alpha: 0.7).cgColor
+        for segmentPath in routePreviewPaths {
+            guard segmentPath.count >= 2 else { continue }
+            context.setStrokeColor(previewPathColor)
+            context.setLineWidth(2.5)
+            context.setLineCap(.round)
+            context.setLineJoin(.round)
+            
+            let first = segmentPath[0]
+            let firstSX = centerX - CGFloat(first.x - viewCenterX) * scale
+            let firstSY = centerY - CGFloat(first.y - viewCenterY) * scale
+            context.move(to: CGPoint(x: firstSX, y: firstSY))
+            
+            for pt in segmentPath.dropFirst() {
+                let sx = centerX - CGFloat(pt.x - viewCenterX) * scale
+                let sy = centerY - CGFloat(pt.y - viewCenterY) * scale
+                context.addLine(to: CGPoint(x: sx, y: sy))
+            }
+            context.strokePath()
+        }
+        
+        // If no preview paths yet, draw dashed fallback lines
+        if routePreviewPaths.isEmpty {
+            // Dashed line from device to first waypoint
+            if let grid = occupancyGrid {
+                let dPos = grid.devicePosition
+                let dSX = centerX - CGFloat(dPos.x - viewCenterX) * scale
+                let dSY = centerY - CGFloat(dPos.y - viewCenterY) * scale
+                let wp0 = routeWaypoints[0]
+                let wp0SX = centerX - CGFloat(wp0.x - viewCenterX) * scale
+                let wp0SY = centerY - CGFloat(wp0.y - viewCenterY) * scale
+                context.setStrokeColor(UIColor(white: 1.0, alpha: 0.4).cgColor)
+                context.setLineWidth(1.5)
+                context.setLineDash(phase: 0, lengths: [4, 4])
+                context.move(to: CGPoint(x: dSX, y: dSY))
+                context.addLine(to: CGPoint(x: wp0SX, y: wp0SY))
+                context.strokePath()
+                context.setLineDash(phase: 0, lengths: [])
+            }
+            
+            for i in 1..<routeWaypoints.count {
+                let prev = routeWaypoints[i - 1]
+                let cur = routeWaypoints[i]
+                let prevSX = centerX - CGFloat(prev.x - viewCenterX) * scale
+                let prevSY = centerY - CGFloat(prev.y - viewCenterY) * scale
+                let curSX = centerX - CGFloat(cur.x - viewCenterX) * scale
+                let curSY = centerY - CGFloat(cur.y - viewCenterY) * scale
+                context.setStrokeColor(UIColor(white: 1.0, alpha: 0.4).cgColor)
+                context.setLineWidth(1.5)
+                context.setLineDash(phase: 0, lengths: [4, 4])
+                context.move(to: CGPoint(x: prevSX, y: prevSY))
+                context.addLine(to: CGPoint(x: curSX, y: curSY))
+                context.strokePath()
+                context.setLineDash(phase: 0, lengths: [])
+            }
+        }
+        
+        // Draw waypoint circles on top
+        let waypointSize = max(cellPixelSize * 5, 18)
+        let numberFont = UIFont.boldSystemFont(ofSize: 12)
+        
+        for (index, wp) in routeWaypoints.enumerated() {
+            let screenX = centerX - CGFloat(wp.x - viewCenterX) * scale
+            let screenY = centerY - CGFloat(wp.y - viewCenterY) * scale
+            
+            let isActive = index == activeRouteWaypointIndex
+            let isCompleted = index < activeRouteWaypointIndex
+            
+            // Dot color: blue for pending, orange for active, green for completed
+            let dotColor: UIColor
+            if isCompleted {
+                dotColor = UIColor(red: 0.2, green: 0.8, blue: 0.3, alpha: 0.9)
+            } else if isActive {
+                dotColor = UIColor(red: 1.0, green: 0.6, blue: 0.1, alpha: 1.0)
+            } else {
+                dotColor = UIColor(red: 0.3, green: 0.6, blue: 1.0, alpha: 0.9)
+            }
+            
+            // Draw filled circle
+            let dotRect = CGRect(x: screenX - waypointSize / 2, y: screenY - waypointSize / 2,
+                                 width: waypointSize, height: waypointSize)
+            context.setFillColor(dotColor.cgColor)
+            context.fillEllipse(in: dotRect)
+            
+            // White border
+            context.setStrokeColor(UIColor.white.cgColor)
+            context.setLineWidth(2)
+            context.strokeEllipse(in: dotRect)
+            
+            // Draw number label
+            let label = "\(index + 1)"
+            let attrs: [NSAttributedString.Key: Any] = [
+                .foregroundColor: UIColor.white,
+                .font: numberFont
+            ]
+            let size = label.size(withAttributes: attrs)
+            label.draw(at: CGPoint(x: screenX - size.width / 2, y: screenY - size.height / 2), withAttributes: attrs)
+        }
+    }
+    
+    private func drawObstacleHighlights(context: CGContext, centerX: CGFloat, centerY: CGFloat, viewCenterX: Float, viewCenterY: Float, cellPixelSize: CGFloat) {
         guard let detector = obstacleDetector, detector.obstacleDetected else { return }
         
         let positions = detector.obstacleWorldPositions
@@ -443,8 +662,8 @@ class GridMapView: UIView {
         rects.reserveCapacity(positions.count)
         
         for pos in positions {
-            let relX = CGFloat(pos.x - devicePos.x) * scale
-            let relY = CGFloat(pos.y - devicePos.y) * scale
+            let relX = CGFloat(pos.x - viewCenterX) * scale
+            let relY = CGFloat(pos.y - viewCenterY) * scale
             let screenX = centerX - relX - dotSize / 2
             let screenY = centerY - relY - dotSize / 2
             rects.append(CGRect(x: screenX, y: screenY, width: dotSize, height: dotSize))
@@ -452,14 +671,16 @@ class GridMapView: UIView {
         
         context.fill(rects)
         
-        // Draw the stop-radius circle as a dashed ring
+        // Draw the stop-radius circle as a dashed ring (centered on device, not view center)
+        let deviceScreenX = centerX - CGFloat((occupancyGrid?.devicePosition.x ?? viewCenterX) - viewCenterX) * scale
+        let deviceScreenY = centerY - CGFloat((occupancyGrid?.devicePosition.y ?? viewCenterY) - viewCenterY) * scale
         let radiusPixels = CGFloat(detector.stopRadius) * scale
         context.setStrokeColor(UIColor(red: 1.0, green: 0.2, blue: 0.1, alpha: 0.8).cgColor)
         context.setLineWidth(2)
         context.setLineDash(phase: 0, lengths: [4, 4])
         context.addEllipse(in: CGRect(
-            x: centerX - radiusPixels,
-            y: centerY - radiusPixels,
+            x: deviceScreenX - radiusPixels,
+            y: deviceScreenY - radiusPixels,
             width: radiusPixels * 2,
             height: radiusPixels * 2
         ))
@@ -467,7 +688,93 @@ class GridMapView: UIView {
         context.setLineDash(phase: 0, lengths: [])  // Reset dash
     }
     
-    private func drawGridLines(context: CGContext, rect: CGRect, devicePos: DevicePosition) {
+    // MARK: - Person Positions Drawing
+
+    /// Fixed palette matching PersonBoundingBoxOverlay.
+    private static let personPalette: [UIColor] = [
+        UIColor(red: 0.12, green: 0.72, blue: 0.96, alpha: 1),
+        UIColor(red: 1.00, green: 0.42, blue: 0.42, alpha: 1),
+        UIColor(red: 0.30, green: 0.90, blue: 0.40, alpha: 1),
+        UIColor(red: 1.00, green: 0.78, blue: 0.20, alpha: 1),
+        UIColor(red: 0.70, green: 0.40, blue: 1.00, alpha: 1),
+        UIColor(red: 1.00, green: 0.55, blue: 0.15, alpha: 1),
+        UIColor(red: 0.95, green: 0.45, blue: 0.75, alpha: 1),
+        UIColor(red: 0.40, green: 0.85, blue: 0.75, alpha: 1),
+        UIColor(red: 0.55, green: 0.72, blue: 1.00, alpha: 1),
+        UIColor(red: 0.85, green: 0.70, blue: 0.45, alpha: 1),
+        UIColor(red: 0.60, green: 0.90, blue: 0.20, alpha: 1),
+        UIColor(red: 0.80, green: 0.60, blue: 0.90, alpha: 1),
+    ]
+
+    private func personColor(for id: UUID) -> UIColor {
+        let hash = abs(id.hashValue)
+        return Self.personPalette[hash % Self.personPalette.count]
+    }
+
+    private func drawPersonPositions(context: CGContext, centerX: CGFloat, centerY: CGFloat, viewCenterX: Float, viewCenterY: Float) {
+        guard !personPositions.isEmpty else { return }
+
+        let dotRadius: CGFloat = 5
+        let labelFont = UIFont.systemFont(ofSize: 9, weight: .bold)
+
+        for person in personPositions {
+            guard let pos = person.worldPosition else { continue }
+
+            let screenX = centerX - CGFloat(pos.x - viewCenterX) * scale
+            let screenY = centerY - CGFloat(pos.y - viewCenterY) * scale
+
+            let color = person.isActive ? UIColor.white : personColor(for: person.id)
+
+            // Filled circle
+            context.setFillColor(color.cgColor)
+            context.fillEllipse(in: CGRect(
+                x: screenX - dotRadius,
+                y: screenY - dotRadius,
+                width: dotRadius * 2,
+                height: dotRadius * 2
+            ))
+
+            // White border
+            context.setStrokeColor(UIColor.white.cgColor)
+            context.setLineWidth(1.5)
+            context.strokeEllipse(in: CGRect(
+                x: screenX - dotRadius,
+                y: screenY - dotRadius,
+                width: dotRadius * 2,
+                height: dotRadius * 2
+            ))
+
+            // Active indicator — outer ring
+            if person.isActive {
+                context.setStrokeColor(color.withAlphaComponent(0.5).cgColor)
+                context.setLineWidth(2)
+                let outerR = dotRadius + 4
+                context.strokeEllipse(in: CGRect(
+                    x: screenX - outerR,
+                    y: screenY - outerR,
+                    width: outerR * 2,
+                    height: outerR * 2
+                ))
+            }
+
+            // Label below
+            let label = person.label as NSString
+            let labelAttrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: color,
+            ]
+            let labelSize = label.size(withAttributes: labelAttrs)
+            let shadowAttrs: [NSAttributedString.Key: Any] = [
+                .font: labelFont,
+                .foregroundColor: UIColor.black,
+            ]
+            let labelPt = CGPoint(x: screenX - labelSize.width / 2, y: screenY + dotRadius + 2)
+            label.draw(at: CGPoint(x: labelPt.x + 1, y: labelPt.y + 1), withAttributes: shadowAttrs)
+            label.draw(at: labelPt, withAttributes: labelAttrs)
+        }
+    }
+
+    private func drawGridLines(context: CGContext, rect: CGRect, viewCenterX: Float, viewCenterY: Float) {
         context.setStrokeColor(gridLineColor.cgColor)
         context.setLineWidth(0.5)
         
@@ -475,21 +782,21 @@ class GridMapView: UIView {
         let centerY = rect.midY
         
         // Draw vertical lines (every meter)
-        let startX = floor(devicePos.x - viewRadiusMeters * 1.5)
-        let endX = ceil(devicePos.x + viewRadiusMeters * 1.5)
+        let startX = floor(viewCenterX - viewRadiusMeters * 1.5)
+        let endX = ceil(viewCenterX + viewRadiusMeters * 1.5)
         
         for x in stride(from: startX, through: endX, by: 1.0) {
-            let screenX = centerX - CGFloat(x - devicePos.x) * scale
+            let screenX = centerX - CGFloat(x - viewCenterX) * scale
             context.move(to: CGPoint(x: screenX, y: -rect.height))
             context.addLine(to: CGPoint(x: screenX, y: rect.height * 2))
         }
         
         // Draw horizontal lines (every meter)
-        let startY = floor(devicePos.y - viewRadiusMeters * 1.5)
-        let endY = ceil(devicePos.y + viewRadiusMeters * 1.5)
+        let startY = floor(viewCenterY - viewRadiusMeters * 1.5)
+        let endY = ceil(viewCenterY + viewRadiusMeters * 1.5)
         
         for y in stride(from: startY, through: endY, by: 1.0) {
-            let screenY = centerY - CGFloat(y - devicePos.y) * scale
+            let screenY = centerY - CGFloat(y - viewCenterY) * scale
             context.move(to: CGPoint(x: -rect.width, y: screenY))
             context.addLine(to: CGPoint(x: rect.width * 2, y: screenY))
         }
@@ -497,7 +804,7 @@ class GridMapView: UIView {
         context.strokePath()
     }
     
-    private func drawTrail(context: CGContext, centerX: CGFloat, centerY: CGFloat, devicePos: DevicePosition) {
+    private func drawTrail(context: CGContext, centerX: CGFloat, centerY: CGFloat, viewCenterX: Float, viewCenterY: Float) {
         guard positionHistory.count > 1 else { return }
         
         // Draw trail as a gradient line from old (faded) to new (bright)
@@ -505,8 +812,8 @@ class GridMapView: UIView {
         
         for (index, pos) in positionHistory.enumerated() {
             let alpha = CGFloat(index) / CGFloat(positionHistory.count) * 0.7
-            let relX = CGFloat(pos.x - devicePos.x) * scale
-            let relY = CGFloat(pos.y - devicePos.y) * scale
+            let relX = CGFloat(pos.x - viewCenterX) * scale
+            let relY = CGFloat(pos.y - viewCenterY) * scale
             let screenX = centerX - relX
             let screenY = centerY - relY
             
@@ -527,18 +834,20 @@ class GridMapView: UIView {
             context.setLineWidth(2)
             
             let firstPos = positionHistory[0]
-            let firstX = centerX - CGFloat(firstPos.x - devicePos.x) * scale
-            let firstY = centerY - CGFloat(firstPos.y - devicePos.y) * scale
+            let firstX = centerX - CGFloat(firstPos.x - viewCenterX) * scale
+            let firstY = centerY - CGFloat(firstPos.y - viewCenterY) * scale
             context.move(to: CGPoint(x: firstX, y: firstY))
             
             for pos in positionHistory.dropFirst() {
-                let screenX = centerX - CGFloat(pos.x - devicePos.x) * scale
-                let screenY = centerY - CGFloat(pos.y - devicePos.y) * scale
+                let screenX = centerX - CGFloat(pos.x - viewCenterX) * scale
+                let screenY = centerY - CGFloat(pos.y - viewCenterY) * scale
                 context.addLine(to: CGPoint(x: screenX, y: screenY))
             }
             
-            // Connect to current position (center)
-            context.addLine(to: CGPoint(x: centerX, y: centerY))
+            // Connect to current device position
+            let deviceScreenX = centerX - CGFloat((occupancyGrid?.devicePosition.x ?? viewCenterX) - viewCenterX) * scale
+            let deviceScreenY = centerY - CGFloat((occupancyGrid?.devicePosition.y ?? viewCenterY) - viewCenterY) * scale
+            context.addLine(to: CGPoint(x: deviceScreenX, y: deviceScreenY))
             context.strokePath()
         }
     }

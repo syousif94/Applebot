@@ -357,6 +357,48 @@ struct RoutePlanned {
 
 ---
 
+### 4b. `route_preview_segment`
+
+Emitted for each leg of a multi-waypoint route as its path is computed during preview planning. When the user adds waypoints via `add_route_point`, the app plans paths between consecutive pairs (device → WP1 → WP2 → …). Each segment emits its own event as soon as the path is calculated, so the server/client can render the preview incrementally.
+
+All segments from the same planning pass share a `preview_id`. The `segment_index` and `segment_count` fields let the receiver reconstruct ordering and detect completeness.
+
+```rust
+struct RoutePreviewSegment {
+    pose: Pose,                      // device pose at plan time
+    preview_id: String,              // UUID shared across all segments in this preview pass
+    segment_index: u32,              // 0-based index of this segment
+    segment_count: u32,              // total number of segments being planned
+    origin: Vec2,                    // start of this segment
+    target: Vec2,                    // destination of this segment (user-placed waypoint)
+    waypoints: Vec<Vec2>,            // the computed A*/greedy path for this segment
+    waypoint_count: u32,
+    path_length_meters: f32,         // sum of segment distances
+    algorithm: String,               // "astar" | "greedy" | "greedy_shorter" | "direct_fallback"
+    route_waypoint_count: u32,       // total number of user-placed waypoints
+    route_waypoints: Vec<Vec2>,      // all user-placed waypoint destinations (for context)
+}
+```
+
+**`algorithm` values:**
+
+| Value             | Description                                                  |
+| ----------------- | ------------------------------------------------------------ |
+| `astar`           | Strict A\* path through free cells only                      |
+| `greedy`          | Greedy path through free + unknown cells (A\* found nothing) |
+| `greedy_shorter`  | Greedy was ≥25% shorter than A\*, so it was preferred        |
+| `direct_fallback` | Neither pathfinder found a route; straight line used         |
+
+**Example sequence** for a 3-waypoint route (device → A → B → C):
+
+```json
+{"type":"route_preview_segment","preview_id":"abc-123","segment_index":0,"segment_count":3,"origin":{...},"target":{"x":1.5,"y":2.0},...}
+{"type":"route_preview_segment","preview_id":"abc-123","segment_index":1,"segment_count":3,"origin":{"x":1.5,"y":2.0},"target":{"x":3.0,"y":4.0},...}
+{"type":"route_preview_segment","preview_id":"abc-123","segment_index":2,"segment_count":3,"origin":{"x":3.0,"y":4.0},"target":{"x":5.0,"y":1.0},...}
+```
+
+---
+
 ### 5. `nav_state_change`
 
 Emitted on every navigation state machine transition. States: `idle`, `navigating`, `paused`, `arrived`.
@@ -558,6 +600,93 @@ struct NavCommandAck {
 
 ---
 
+### 13. `person_tracking` (~2 Hz during scanning/tracking)
+
+Emitted periodically while the PersonTracker is active (scanning for people or tracking one). Contains all currently identified people, their world positions, gesture state, and which person (if any) is being actively followed. Allows the web client to render person positions on the map and show the gesture-based activation flow.
+
+```rust
+struct PersonTracking {
+    pose: Pose,
+    tracking_state: String,           // "idle" | "scanning" | "tracking" | "reacquiring" | "lost"
+    people_count: u32,                // total people currently visible
+    people: Vec<PersonSnapshot>,      // per-person snapshots
+    active_person_id: Option<String>, // UUID prefix (8 chars) of the person being followed
+    active_person_pos: Option<Vec2>,  // world position of the actively tracked person
+    event: String,                    // what triggered this emission (see below)
+    message: String,                  // human-readable description
+}
+```
+
+#### `PersonSnapshot`
+
+A single detected person. Each person is assigned a stable UUID when first detected, maintained across frames via IoU matching and OSNet ReID embedding similarity.
+
+```rust
+struct PersonSnapshot {
+    id: String,                       // stable session-level UUID prefix (8 chars)
+    world_pos: Option<Vec2>,          // world position (ARKit X, ARKit Z)
+    bbox: BBoxRect,                   // bounding box in normalized Vision coordinates (origin bottom-left)
+    is_gesturing: bool,               // currently showing the activation gesture (open palm)
+    gesture_streak: u32,              // consecutive detection cycles with gesture present
+    is_active: bool,                  // true if this is the person being followed
+    last_seen_ago: f32,               // seconds since last detection
+}
+```
+
+#### `BBoxRect`
+
+Bounding box in Vision normalized coordinates (origin at bottom-left, range 0–1).
+
+```rust
+struct BBoxRect {
+    x: f32,
+    y: f32,
+    width: f32,
+    height: f32,
+}
+```
+
+**`event` values:**
+
+| Value              | Description                                          |
+| ------------------ | ---------------------------------------------------- |
+| `scan_update`      | Periodic scan detected/updated people                |
+| `gesture_detected` | A person started showing the activation gesture      |
+| `person_activated` | A person was selected via gesture and tracking began |
+| `tracking_update`  | Periodic position update while actively tracking     |
+| `person_lost`      | The tracked person could not be re-acquired          |
+| `state_change`     | The tracking state machine transitioned              |
+
+**`tracking_state` values:**
+
+| State         | Description                                                                   |
+| ------------- | ----------------------------------------------------------------------------- |
+| `idle`        | PersonTracker is not active                                                   |
+| `scanning`    | Detecting all visible people; waiting for one to raise an open hand           |
+| `tracking`    | VN object tracker is following the activated person frame-to-frame            |
+| `reacquiring` | Tracker lost the person; running detection + ReID matching to find them again |
+| `lost`        | Could not re-acquire after ~1 second of attempts                              |
+
+**Activation flow:**
+
+1. User triggers follow mode (button or voice command "follow me")
+2. PersonTracker enters `scanning` — detects all people, assigns stable IDs via IoU + ReID
+3. Each detected hand is checked for an open-palm gesture (all 5 fingers extended, spread apart)
+4. Hands are matched to person bounding boxes by wrist position containment
+5. When a person holds the gesture for 3 consecutive detection cycles (~0.75s), they are activated
+6. PersonTracker transitions to `tracking` — VNTrackObjectRequest follows the activated person
+7. If the tracker loses them, it falls back to ReID-based re-acquisition (`reacquiring` → `tracking` or `lost`)
+
+**Person identity stability:**
+
+People are matched frame-to-frame using:
+
+- **IoU matching** (bounding box overlap > 0.25) — fast, used first
+- **OSNet ReID embedding similarity** (cosine similarity > 0.55) — used as fallback for unmatched detections
+- People not seen for >3 seconds are pruned from the tracked set
+
+---
+
 ## Algorithm Reference
 
 This section describes the navigation algorithms so the Rust server and Three.js client can visualize decisions meaningfully.
@@ -662,21 +791,59 @@ Documents/telemetry/
 - Server can set a navigation target: `{"cmd": "set_nav_target", "x": 1.5, "y": 2.3}`
 - Server can start navigation along the planned path: `{"cmd": "start_navigation"}`
 - Server can stop active navigation: `{"cmd": "stop_navigation"}`
-- All navigation commands receive a `nav_command_ack` event in response
+- Server can send remote drive commands: `{"cmd": "drive", "x": 0.5, "y": 1.0}` (x = turn -1…+1, y = throttle -1…+1)
+- Server can add a waypoint to the multi-point route: `{"cmd": "add_route_point", "x": 1.5, "y": 2.3}`
+- Server can start navigating the route: `{"cmd": "run_route"}`
+- Server can pause the active route: `{"cmd": "pause_route"}`
+- Server can clear all route waypoints: `{"cmd": "clear_route"}`
+- All navigation and route commands receive a `nav_command_ack` event in response
+
+### Server → iPhone Commands
+
+The server sends JSON text frames to the iPhone. Each message has a `cmd` field as discriminator, plus command-specific parameters.
+
+| Command                 | Parameters                         | Description                                                                                                                                                                             |
+| ----------------------- | ---------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `request_mesh_snapshot` | —                                  | Requests a full 3D mesh snapshot on the next frame                                                                                                                                      |
+| `set_nav_target`        | `x`, `y` (f32, meters)             | Sets a single-point navigation target in world coords                                                                                                                                   |
+| `start_navigation`      | —                                  | Starts autonomous navigation to the current target                                                                                                                                      |
+| `stop_navigation`       | —                                  | Stops active autonomous navigation and halts motors                                                                                                                                     |
+| `drive`                 | `x` (f32, -1…+1), `y` (f32, -1…+1) | Remote joystick drive. `x` = turn (negative left, positive right), `y` = throttle (negative backward, positive forward). Stops any active autonomous navigation first.                  |
+| `add_route_point`       | `x`, `y` (f32, meters)             | Appends a waypoint to the multi-point route. The app computes and previews A\*/greedy paths between all consecutive waypoints (device → WP1 → WP2 → …) on both the 2D grid and AR view. |
+| `run_route`             | —                                  | Starts autonomous navigation along the route, visiting each waypoint in order.                                                                                                          |
+| `pause_route`           | —                                  | Pauses the active route (can be resumed with another `run_route`).                                                                                                                      |
+| `clear_route`           | —                                  | Clears all route waypoints, preview paths, and resets route state.                                                                                                                      |
+
+Every command (except `request_mesh_snapshot`) triggers a `nav_command_ack` event back to the server:
+
+```json
+{"type": "nav_command_ack", "cmd": "add_route_point", "success": true, "message": "Waypoint #3 added", "waypoint_count": 3, ...}
+```
+
+The `nav_command_ack` includes the standard envelope fields plus:
+
+| Field            | Type    | Description                                                  |
+| ---------------- | ------- | ------------------------------------------------------------ |
+| `cmd`            | string  | The command being acknowledged                               |
+| `success`        | bool    | Whether the command was executed successfully                |
+| `message`        | string  | Human-readable status or error message                       |
+| `target`         | `Vec2?` | Target coordinates (for `set_nav_target`, `add_route_point`) |
+| `waypoint_count` | u32?    | Current number of route waypoints (for route commands)       |
 
 ---
 
 ## Bandwidth Estimates
 
-| Event            | Size/msg  | Frequency                      | Bandwidth    |
-| ---------------- | --------- | ------------------------------ | ------------ |
-| `nav_frame`      | ~800 B    | 10 Hz                          | ~8 KB/s      |
-| `obstacle_map`   | ~2-10 KB  | 1 Hz                           | ~5 KB/s      |
-| `mesh_snapshot`  | ~20-50 KB | 0.5 Hz                         | ~15 KB/s     |
-| `route_planned`  | ~2 KB     | on replan (~0.5 Hz during nav) | ~1 KB/s      |
-| `obstacle_event` | ~1 KB     | on change                      | <1 KB/s      |
-| Other events     | ~200 B    | rare                           | <0.1 KB/s    |
-| **Total**        |           |                                | **~30 KB/s** |
+| Event                   | Size/msg  | Frequency                      | Bandwidth    |
+| ----------------------- | --------- | ------------------------------ | ------------ |
+| `nav_frame`             | ~800 B    | 10 Hz                          | ~8 KB/s      |
+| `obstacle_map`          | ~2-10 KB  | 1 Hz                           | ~5 KB/s      |
+| `mesh_snapshot`         | ~20-50 KB | 0.5 Hz                         | ~15 KB/s     |
+| `route_planned`         | ~2 KB     | on replan (~0.5 Hz during nav) | ~1 KB/s      |
+| `route_preview_segment` | ~1-2 KB   | on waypoint add/remove         | <0.5 KB/s    |
+| `obstacle_event`        | ~1 KB     | on change                      | <1 KB/s      |
+| Other events            | ~200 B    | rare                           | <0.1 KB/s    |
+| **Total**               |           |                                | **~30 KB/s** |
 
 Per-message deflate on the WebSocket would roughly halve this. The base64-encoded mesh/grid data is the dominant cost and compresses well.
 

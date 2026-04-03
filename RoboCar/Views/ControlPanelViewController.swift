@@ -240,9 +240,18 @@ class ControlPanelViewController: UIViewController {
             batteryBarFillWidth,
         ])
         
-        // Initial hidden state
-        updateBatteryUI(percentage: 0, voltage: 0)
+        // Load cached battery level if available
+        let cachedPct = UserDefaults.standard.integer(forKey: Self.cachedBatteryPercentKey)
+        let cachedVolts = UserDefaults.standard.double(forKey: Self.cachedBatteryVoltageKey)
+        if cachedPct > 0 {
+            updateBatteryUI(percentage: UInt8(cachedPct), voltage: cachedVolts)
+        } else {
+            updateBatteryUI(percentage: 0, voltage: 0)
+        }
     }
+    
+    private static let cachedBatteryPercentKey = "cachedBatteryPercent"
+    private static let cachedBatteryVoltageKey = "cachedBatteryVoltage"
     
     private func updateBatteryUI(percentage: UInt8, voltage: Double) {
         let pct = Int(percentage)
@@ -252,6 +261,10 @@ class ControlPanelViewController: UIViewController {
             batteryBarFillWidth.constant = 0
             batteryBarFill.backgroundColor = .gray
         } else {
+            // Cache latest values
+            UserDefaults.standard.set(Int(percentage), forKey: Self.cachedBatteryPercentKey)
+            UserDefaults.standard.set(voltage, forKey: Self.cachedBatteryVoltageKey)
+            
             batteryPercentLabel.text = "\(pct)%"
             batteryVoltageLabel.text = String(format: "%.2fV", voltage)
             

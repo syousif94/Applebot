@@ -117,6 +117,10 @@ class OccupancyGrid {
     /// Update ID per cell to track which mesh generated it
     private var cellUpdates: [[UInt64]]
     
+    /// Tracks which grid cells each mesh anchor currently owns.
+    /// Encoded as  `gridX * gridSize + gridY`.
+    private var anchorCells: [UUID: Set<Int>] = [:]
+    
     /// Global min and max recorded heights
     private(set) var globalMinHeight: Float = .greatestFiniteMagnitude
     private(set) var globalMaxHeight: Float = -.greatestFiniteMagnitude
@@ -137,6 +141,37 @@ class OccupancyGrid {
     
     /// Number of free cells
     private(set) var freeCount: Int = 0
+    
+    // MARK: - Stuck Zone Memory
+    
+    /// Records a location+heading where the robot got stuck.
+    struct StuckRecord {
+        let gridX: Int
+        let gridY: Int
+        /// Heading the robot was trying to travel when it got stuck (radians)
+        let heading: Float
+        /// How many times the robot got stuck at (approximately) this spot+heading
+        var count: Int = 1
+        /// Timestamp of the most recent stuck event
+        var lastTime: Date = Date()
+    }
+    
+    /// All recorded stuck events. Keyed by a spatial hash (grid cell) so
+    /// lookups during A* are fast.
+    private var stuckRecords: [Int: [StuckRecord]] = [:]
+    
+    /// Radius (in grid cells) around a stuck point that receives a penalty.
+    private let stuckPenaltyRadius: Int = 4  // ~20cm at 5cm/cell
+    
+    /// Base cost added per stuck event in the penalty zone.
+    private let stuckPenaltyBase: Float = 40.0
+    
+    /// Two headings are considered "same direction" if within this angle (radians).
+    private let stuckHeadingSimilarity: Float = .pi / 3.0  // 60°
+    
+    /// Time-to-live for a stuck record (seconds). Records older than this are
+    /// ignored during pathfinding and pruned lazily.
+    private let stuckRecordTTL: TimeInterval = 20.0
     
     // MARK: - Initialization
     
@@ -196,6 +231,29 @@ class OccupancyGrid {
         return CellState(rawValue: cells[gx][gy]) ?? .unknown
     }
     
+    /// Find the nearest free world-coordinate point to the given position.
+    /// Returns the input point itself if it's already free, otherwise searches
+    /// outward for the closest free cell and returns its world position.
+    /// Returns nil only if no free cell exists within the search radius.
+    func nearestFreeWorldPoint(x: Float, y: Float) -> (x: Float, y: Float)? {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let gridCoord = worldToGrid(x, y) else { return nil }
+        
+        // Already free — return as-is
+        if cells[gridCoord.x][gridCoord.y] == CellState.free.rawValue {
+            return (x, y)
+        }
+        
+        // Search outward for nearest free cell
+        if let nearest = findNearestFreeCell(gridX: gridCoord.x, gridY: gridCoord.y) {
+            let world = gridToWorld(nearest.x, nearest.y)
+            return (world.x, world.y)
+        }
+        return nil
+    }
+    
     /// Get the state of a cell at grid coordinates
     func getState(gridX: Int, gridY: Int) -> CellState {
         lock.lock()
@@ -205,6 +263,15 @@ class OccupancyGrid {
             return .unknown
         }
         return CellState(rawValue: cells[gridX][gridY]) ?? .unknown
+    }
+    
+    /// Get the state of a cell at world coordinates
+    func getStateAtWorld(x: Float, y: Float) -> CellState {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let coord = worldToGrid(x, y) else { return .unknown }
+        return CellState(rawValue: cells[coord.x][coord.y]) ?? .unknown
     }
     
     /// Get the max height of a cell at world coordinates, or nil if no height data
@@ -448,6 +515,101 @@ class OccupancyGrid {
         }
     }
     
+    /// Atomically replace all grid data for a mesh anchor.
+    /// Clears any cells the anchor previously owned, writes new floor and obstacle
+    /// data, and records the new cell set for future replacement.
+    func replaceAnchorData(
+        anchorId: UUID,
+        obstaclePoints: [(x: Float, y: Float, height: Float, classification: MeshClassification)],
+        floorPoints: [(x: Float, y: Float, classification: MeshClassification)],
+        updateId: UInt64
+    ) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        // 1. Clear cells from the previous version of this anchor
+        if let oldCells = anchorCells.removeValue(forKey: anchorId) {
+            for encoded in oldCells {
+                let gx = encoded / gridSize
+                let gy = encoded % gridSize
+                guard gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize else { continue }
+                setStateUnsafe(gridX: gx, gridY: gy, state: .unknown)
+                classifications[gx][gy] = MeshClassification.none.rawValue
+                minHeights[gx][gy] = Float.greatestFiniteMagnitude
+                maxHeights[gx][gy] = -Float.greatestFiniteMagnitude
+                cellUpdates[gx][gy] = 0
+            }
+        }
+        
+        var newCells = Set<Int>()
+        
+        // 2. Write floor / free cells first
+        for point in floorPoints {
+            guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
+            let encoded = gx * gridSize + gy
+            if updateId > cellUpdates[gx][gy] {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                classifications[gx][gy] = point.classification.rawValue
+                minHeights[gx][gy] = Float.greatestFiniteMagnitude
+                maxHeights[gx][gy] = -Float.greatestFiniteMagnitude
+                cellUpdates[gx][gy] = updateId
+                newCells.insert(encoded)
+            } else if updateId == cellUpdates[gx][gy] {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .free)
+                if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                    classifications[gx][gy] = point.classification.rawValue
+                }
+                newCells.insert(encoded)
+            }
+        }
+        
+        // 3. Write obstacle cells (overrides floor where they overlap)
+        for point in obstaclePoints {
+            guard let (gx, gy) = worldToGrid(point.x, point.y) else { continue }
+            let encoded = gx * gridSize + gy
+            if updateId > cellUpdates[gx][gy] {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                classifications[gx][gy] = point.classification.rawValue
+                minHeights[gx][gy] = point.height
+                maxHeights[gx][gy] = point.height
+                if point.height < globalMinHeight { globalMinHeight = point.height }
+                if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                cellUpdates[gx][gy] = updateId
+                newCells.insert(encoded)
+            } else if updateId == cellUpdates[gx][gy] {
+                setStateUnsafe(gridX: gx, gridY: gy, state: .occupied)
+                if point.classification != .none || classifications[gx][gy] == MeshClassification.none.rawValue {
+                    classifications[gx][gy] = point.classification.rawValue
+                }
+                if point.height < minHeights[gx][gy] { minHeights[gx][gy] = point.height }
+                if point.height > maxHeights[gx][gy] { maxHeights[gx][gy] = point.height }
+                if point.height < globalMinHeight { globalMinHeight = point.height }
+                if point.height > globalMaxHeight { globalMaxHeight = point.height }
+                newCells.insert(encoded)
+            }
+        }
+        
+        anchorCells[anchorId] = newCells
+    }
+    
+    /// Remove all grid data owned by a mesh anchor (e.g. when ARKit removes it).
+    func removeAnchorData(_ anchorId: UUID) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let oldCells = anchorCells.removeValue(forKey: anchorId) else { return }
+        for encoded in oldCells {
+            let gx = encoded / gridSize
+            let gy = encoded % gridSize
+            guard gx >= 0 && gx < gridSize && gy >= 0 && gy < gridSize else { continue }
+            setStateUnsafe(gridX: gx, gridY: gy, state: .unknown)
+            classifications[gx][gy] = MeshClassification.none.rawValue
+            minHeights[gx][gy] = Float.greatestFiniteMagnitude
+            maxHeights[gx][gy] = -Float.greatestFiniteMagnitude
+            cellUpdates[gx][gy] = 0
+        }
+    }
+    
     /// Mark multiple points as free with classification (batch operation)
     func markFreeBatchWithClassification(_ points: [(x: Float, y: Float, classification: MeshClassification)], updateId: UInt64? = nil) {
         lock.lock()
@@ -497,6 +659,9 @@ class OccupancyGrid {
         }
         occupiedCount = 0
         freeCount = 0
+        
+        // Reset anchor cell tracking
+        anchorCells.removeAll()
         
         // Reset origin offset so new AR session coordinates map correctly
         originOffset = .zero
@@ -811,11 +976,30 @@ class OccupancyGrid {
         return nil
     }
     
+    /// Find the nearest cell that is not occupied (free or unknown).
+    /// Useful for greedy pathfinding where unknown cells are traversable.
+    private func findNearestNonOccupiedCell(gridX: Int, gridY: Int, maxRadius: Int = 50) -> (x: Int, y: Int)? {
+        for r in 1...maxRadius {
+            for dx in -r...r {
+                for dy in -r...r {
+                    guard abs(dx) == r || abs(dy) == r else { continue }
+                    let nx = gridX + dx
+                    let ny = gridY + dy
+                    guard nx >= 0 && nx < gridSize && ny >= 0 && ny < gridSize else { continue }
+                    if cells[nx][ny] != CellState.occupied.rawValue {
+                        return (nx, ny)
+                    }
+                }
+            }
+        }
+        return nil
+    }
+    
     /// Check line-of-sight between two grid cells, respecting an obstacle buffer.
     /// Returns false if any cell along the line is occupied or within `bufferCells`
     /// of an occupied cell. Must be called while lock is held.
     private func lineOfSight(fromX: Int, fromY: Int, toX: Int, toY: Int) -> Bool {
-        let bufferCells = 6  // 30cm buffer at 5cm/cell — generous clearance for 35cm car width
+        let bufferCells = 5  // 25cm buffer — preserves waypoints around corners
         var x = fromX
         var y = fromY
         let dx = abs(toX - fromX)
@@ -862,6 +1046,94 @@ class OccupancyGrid {
         return lineOfSight(fromX: fromX, fromY: fromY, toX: toX, toY: toY)
     }
     
+    // MARK: - Stuck Zone API
+    
+    /// Record that the robot got stuck at the given world position while
+    /// heading in `heading` direction.  Nearby duplicate headings are merged
+    /// (count incremented) rather than creating new records.
+    func recordStuckZone(worldX: Float, worldY: Float, heading: Float) {
+        lock.lock()
+        defer { lock.unlock() }
+        
+        guard let cell = worldToGrid(worldX, worldY) else { return }
+        let k = cell.x * gridSize + cell.y
+        
+        // Check for existing record with similar heading in this or adjacent cells
+        let searchRadius = 2  // merge within ~10cm
+        for dx in -searchRadius...searchRadius {
+            for dy in -searchRadius...searchRadius {
+                let sx = cell.x + dx, sy = cell.y + dy
+                guard sx >= 0 && sx < gridSize && sy >= 0 && sy < gridSize else { continue }
+                let sk = sx * gridSize + sy
+                if var records = stuckRecords[sk] {
+                    for i in records.indices {
+                        var angleDiff = records[i].heading - heading
+                        while angleDiff >  .pi { angleDiff -= 2 * .pi }
+                        while angleDiff < -.pi { angleDiff += 2 * .pi }
+                        if fabsf(angleDiff) < stuckHeadingSimilarity {
+                            records[i].count += 1
+                            records[i].lastTime = Date()
+                            stuckRecords[sk] = records
+                            print("[OccGrid] Stuck zone reinforced at (\(sx),\(sy)) heading \(String(format: "%.1f°", heading * 180 / .pi)) count=\(records[i].count)")
+                            return
+                        }
+                    }
+                }
+            }
+        }
+        
+        // New record
+        var records = stuckRecords[k] ?? []
+        records.append(StuckRecord(gridX: cell.x, gridY: cell.y, heading: heading))
+        stuckRecords[k] = records
+        print("[OccGrid] New stuck zone at (\(cell.x),\(cell.y)) heading \(String(format: "%.1f°", heading * 180 / .pi))")
+    }
+    
+    /// Compute the stuck penalty for a grid cell being approached from `approachHeading`.
+    /// Must be called while `lock` is held.
+    private func stuckZonePenalty(_ x: Int, _ y: Int) -> Float {
+        var totalPenalty: Float = 0
+        let now = Date()
+        let r = stuckPenaltyRadius
+        for dx in -r...r {
+            for dy in -r...r {
+                let sx = x + dx, sy = y + dy
+                guard sx >= 0 && sx < gridSize && sy >= 0 && sy < gridSize else { continue }
+                let sk = sx * gridSize + sy
+                guard let records = stuckRecords[sk] else { continue }
+                let cellDist = sqrtf(Float(dx * dx + dy * dy))
+                guard cellDist <= Float(r) else { continue }
+                // Distance falloff: full penalty at center, linear decay to edge
+                let distFactor = 1.0 - (cellDist / Float(r + 1))
+                for record in records {
+                    let age = now.timeIntervalSince(record.lastTime)
+                    guard age < stuckRecordTTL else { continue }
+                    // Fade out penalty as the record ages
+                    let ageFactor = Float(1.0 - age / stuckRecordTTL)
+                    // Penalty scales with how many times stuck here
+                    let countFactor = Float(min(record.count, 5))  // cap at 5x
+                    totalPenalty += stuckPenaltyBase * countFactor * distFactor * ageFactor
+                }
+            }
+        }
+        return totalPenalty
+    }
+    
+    /// Remove all stuck-zone records (e.g. when a new high-level goal is set).
+    func clearStuckZones() {
+        lock.lock()
+        defer { lock.unlock() }
+        stuckRecords.removeAll()
+        print("[OccGrid] Stuck zones cleared")
+    }
+    
+    /// Number of stuck records currently stored.
+    var stuckZoneCount: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return stuckRecords.values.reduce(0) { $0 + $1.count }
+    }
+    
     /// Find a path from start to goal using A* on the occupancy grid.
     /// Only traverses free cells, avoiding occupied and unknown cells.
     /// Returns an array of world-coordinate waypoints (smoothed), or empty if no path found.
@@ -888,14 +1160,14 @@ class OccupancyGrid {
         
         if start.x == goal.x && start.y == goal.y { return [] }
         
-        // Clearance: accounts for car body width (35cm → half-width 17.5cm)
-        // plus extra margin so the path doesn't hug walls.
-        // Inner cells are impassable; outer cells get a steep penalty.
-        let clearanceCells = 8  // 40cm total buffer at 5cm/cell
-        let hardBlockRadius = 5 // cells within 25cm of obstacles are impassable
+        // Clearance: light proximity penalty near walls.
+        // Real-time ObstacleDetector handles close-range avoidance at 15cm,
+        // so the planner only needs a soft preference to stay away from walls.
+        let clearanceCells = 3  // 15cm proximity zone at 5cm/cell
+        let hardBlockRadius = 2 // 10cm — match car half-width for corridor clearance
         
-        /// Returns a proximity penalty for (x,y): very high if within car-body
-        /// clearance, steep further out, 0 if far away.
+        /// Returns a proximity penalty for (x,y): high within car half-width
+        /// of an obstacle, lighter further out, 0 if far away.
         func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
             var minR = Int.max
             for r in 1...clearanceCells {
@@ -906,7 +1178,7 @@ class OccupancyGrid {
                         if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
                             if cells[cx][cy] == CellState.occupied.rawValue {
                                 if r <= hardBlockRadius {
-                                    return 5000.0  // impassable — car body would clip
+                                    return 50.0  // discouraged — directly adjacent to wall
                                 }
                                 minR = min(minR, r)
                             }
@@ -916,8 +1188,7 @@ class OccupancyGrid {
                 if minR <= r { break } // found closest obstacle ring
             }
             if minR <= clearanceCells {
-                // Steep inverse penalty: closer to obstacle = much higher cost
-                return 50.0 * Float(clearanceCells + 1 - minR) / Float(clearanceCells - hardBlockRadius)
+                return 10.0 * Float(clearanceCells + 1 - minR) / Float(max(clearanceCells - hardBlockRadius, 1))
             }
             return 0
         }
@@ -984,8 +1255,8 @@ class OccupancyGrid {
                 }
                 gridPath.reverse()
                 
-                // Smooth path using line-of-sight optimization
-                let smoothed = smoothPath(gridPath)
+                // Smooth path using line-of-sight optimization, then round corners
+                let smoothed = roundCorners(smoothPath(gridPath))
                 
                 // Convert to world coordinates
                 return smoothed.map { cell in
@@ -1024,7 +1295,7 @@ class OccupancyGrid {
                     }
                 }
                 
-                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny)
+                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny) + stuckZonePenalty(nx, ny)
                 if tentativeG < (gScore[nKey] ?? .greatestFiniteMagnitude) {
                     gScore[nKey] = tentativeG
                     cameFrom[nKey] = currentKey
@@ -1047,24 +1318,25 @@ class OccupancyGrid {
         guard var start = worldToGrid(fromX, fromY),
               var goal = worldToGrid(toX, toY) else { return [] }
         
-        // If start isn't free, find nearest free cell
-        if cells[start.x][start.y] != CellState.free.rawValue {
-            if let nearest = findNearestFreeCell(gridX: start.x, gridY: start.y) {
+        // Start can be on free or unknown cells (both are traversable in greedy mode).
+        // Only snap when the cell is occupied (e.g. device drifted onto a wall cell).
+        if cells[start.x][start.y] == CellState.occupied.rawValue {
+            if let nearest = findNearestNonOccupiedCell(gridX: start.x, gridY: start.y) {
                 start = nearest
             } else { return [] }
         }
         
-        // Goal can be in unknown territory — find nearest non-occupied cell
+        // Goal can be in unknown territory — only snap if occupied
         if cells[goal.x][goal.y] == CellState.occupied.rawValue {
-            if let nearest = findNearestFreeCell(gridX: goal.x, gridY: goal.y) {
+            if let nearest = findNearestNonOccupiedCell(gridX: goal.x, gridY: goal.y) {
                 goal = nearest
             } else { return [] }
         }
         
         if start.x == goal.x && start.y == goal.y { return [] }
         
-        let clearanceCells = 8  // 40cm total buffer at 5cm/cell
-        let hardBlockRadius = 5 // cells within 25cm are impassable
+        let clearanceCells = 3  // 15cm proximity zone at 5cm/cell
+        let hardBlockRadius = 2 // 10cm — match car half-width for corridor clearance
         
         func obstaclePenalty(_ x: Int, _ y: Int) -> Float {
             var minR = Int.max
@@ -1076,7 +1348,7 @@ class OccupancyGrid {
                         if cx >= 0 && cx < gridSize && cy >= 0 && cy < gridSize {
                             if cells[cx][cy] == CellState.occupied.rawValue {
                                 if r <= hardBlockRadius {
-                                    return 5000.0  // impassable — car body would clip
+                                    return 50.0  // discouraged — directly adjacent to wall
                                 }
                                 minR = min(minR, r)
                             }
@@ -1086,7 +1358,7 @@ class OccupancyGrid {
                 if minR <= r { break }
             }
             if minR <= clearanceCells {
-                return 50.0 * Float(clearanceCells + 1 - minR) / Float(clearanceCells - hardBlockRadius)
+                return 10.0 * Float(clearanceCells + 1 - minR) / Float(max(clearanceCells - hardBlockRadius, 1))
             }
             return 0
         }
@@ -1097,9 +1369,10 @@ class OccupancyGrid {
             (-1, -1, sqrt2), (-1, 1, sqrt2), (1, -1, sqrt2), (1, 1, sqrt2)
         ]
         
-        // Cost penalty for traversing unknown cells — low enough to prefer
-        // a shorter path through unexplored territory over a long detour.
-        let unknownPenalty: Float = 1.5
+        // Cost penalty for traversing unknown cells — high enough to strongly
+        // prefer known-free paths, but still allows exploration when no
+        // free path exists.  Each unknown cell adds 5x its base cost.
+        let unknownPenalty: Float = 5.0
         
         func heuristic(_ x: Int, _ y: Int) -> Float {
             let dx = Float(abs(x - goal.x))
@@ -1147,7 +1420,7 @@ class OccupancyGrid {
                     ck = parentKey
                 }
                 gridPath.reverse()
-                let smoothed = smoothPath(gridPath)
+                let smoothed = roundCorners(smoothPath(gridPath))
                 return smoothed.map { cell in
                     let world = gridToWorld(cell.x, cell.y)
                     return (x: world.x, y: world.y)
@@ -1184,7 +1457,7 @@ class OccupancyGrid {
                 
                 // Unknown cells get a penalty but are traversable
                 let extraCost: Float = (cellState == .unknown) ? unknownPenalty : 0
-                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny) + extraCost
+                let tentativeG = current.g + dir.cost + obstaclePenalty(nx, ny) + extraCost + stuckZonePenalty(nx, ny)
                 
                 if tentativeG < (gScore[nKey] ?? .greatestFiniteMagnitude) {
                     gScore[nKey] = tentativeG
@@ -1196,6 +1469,96 @@ class OccupancyGrid {
         }
         
         return []
+    }
+    
+    /// Insert waypoints at sharp corners to route through corridor centers.
+    /// Prevents the path from cutting corners at corridor entrances.
+    /// Must be called while lock is held.
+    private func roundCorners(_ path: [(x: Int, y: Int)]) -> [(x: Int, y: Int)] {
+        guard path.count >= 3 else { return path }
+        
+        var result = [path[0]]
+        
+        for i in 1..<(path.count - 1) {
+            let a = path[i - 1]
+            let b = path[i]
+            let c = path[i + 1]
+            
+            // Vectors for the two segments meeting at B
+            let abx = Float(b.x - a.x), aby = Float(b.y - a.y)
+            let bcx = Float(c.x - b.x), bcy = Float(c.y - b.y)
+            let lenAB = sqrtf(abx * abx + aby * aby)
+            let lenBC = sqrtf(bcx * bcx + bcy * bcy)
+            
+            guard lenAB > 2 && lenBC > 2 else {
+                result.append(b)
+                continue
+            }
+            
+            // Turn angle at B
+            let cosAngle = (abx * bcx + aby * bcy) / (lenAB * lenBC)
+            let turnAngle = acosf(min(max(cosAngle, -1.0), 1.0))
+            
+            // Sharp turn > ~30° — check if we're near a corridor
+            if turnAngle > 0.52 {
+                // Perpendicular to outgoing direction (B→C)
+                let ndx = bcx / lenBC, ndy = bcy / lenBC
+                let perpX = -ndy, perpY = ndx
+                
+                // Scan perpendicular from B to find corridor walls
+                let maxScan = 20  // 1m at 5cm/cell
+                var leftDist = maxScan, rightDist = maxScan
+                
+                for d in 1...maxScan {
+                    let sx = b.x + Int(roundf(Float(d) * perpX))
+                    let sy = b.y + Int(roundf(Float(d) * perpY))
+                    if sx < 0 || sx >= gridSize || sy < 0 || sy >= gridSize ||
+                       cells[sx][sy] == CellState.occupied.rawValue {
+                        leftDist = d
+                        break
+                    }
+                }
+                for d in 1...maxScan {
+                    let sx = b.x - Int(roundf(Float(d) * perpX))
+                    let sy = b.y - Int(roundf(Float(d) * perpY))
+                    if sx < 0 || sx >= gridSize || sy < 0 || sy >= gridSize ||
+                       cells[sx][sy] == CellState.occupied.rawValue {
+                        rightDist = d
+                        break
+                    }
+                }
+                
+                // If in a constrained area (wall within ~60cm on either side)
+                if leftDist <= 12 || rightDist <= 12 {
+                    // Shift B to the center of the corridor
+                    let offset = Float(leftDist - rightDist) / 2.0
+                    let cbx = b.x + Int(roundf(offset * perpX))
+                    let cby = b.y + Int(roundf(offset * perpY))
+                    
+                    // Insert an approach midpoint halfway between A and centered-B
+                    // so the robot arcs smoothly into the corridor center
+                    let mx = (a.x + cbx) / 2
+                    let my = (a.y + cby) / 2
+                    
+                    if mx >= 0 && mx < gridSize && my >= 0 && my < gridSize &&
+                       cells[mx][my] != CellState.occupied.rawValue {
+                        result.append((x: mx, y: my))
+                    }
+                    
+                    // Use corridor-centered position for B
+                    if cbx >= 0 && cbx < gridSize && cby >= 0 && cby < gridSize &&
+                       cells[cbx][cby] != CellState.occupied.rawValue {
+                        result.append((x: cbx, y: cby))
+                        continue
+                    }
+                }
+            }
+            
+            result.append(b)
+        }
+        
+        result.append(path.last!)
+        return result
     }
     
     /// Smooth a grid path by removing intermediate waypoints when line-of-sight exists.

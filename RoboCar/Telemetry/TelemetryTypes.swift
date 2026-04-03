@@ -272,6 +272,33 @@ struct RoutePlannedEvent: Codable {
     let gridAtPlanTime: GridSnapshot?
 }
 
+// MARK: - 4b. RoutePreviewSegment (type: "route_preview_segment")
+
+/// Emitted for each leg of a multi-waypoint route as its path is computed.
+struct RoutePreviewSegmentEvent: Codable {
+    let pose: Pose
+    /// Shared across all segments of this preview computation
+    let previewId: String
+    /// 0-based index of this segment in the multi-waypoint route
+    let segmentIndex: Int
+    /// Total number of segments being planned
+    let segmentCount: Int
+    /// Origin of this segment
+    let origin: Vec2
+    /// Destination of this segment (the user-placed waypoint)
+    let target: Vec2
+    /// The computed A*/greedy path for this segment
+    let waypoints: [Vec2]
+    let waypointCount: Int
+    let pathLengthMeters: Float
+    /// "astar" | "greedy" | "greedy_shorter" | "direct_fallback"
+    let algorithm: String
+    /// Total number of user-placed waypoints in the route
+    let routeWaypointCount: Int
+    /// All user-placed waypoint destinations (for context)
+    let routeWaypoints: [Vec2]
+}
+
 // MARK: - 5. NavStateChange (type: "nav_state_change")
 
 struct NavStateChangeEvent: Codable {
@@ -385,7 +412,7 @@ struct CrashBreadcrumb: Codable {
 // MARK: - 12. NavCommandAck (type: "nav_command_ack")
 
 struct NavCommandAckEvent: Codable {
-    /// The command that was received: "set_nav_target" | "start_navigation" | "stop_navigation"
+    /// The command that was received: "set_nav_target" | "start_navigation" | "stop_navigation" | "add_route_point" | "run_route" | "pause_route" | "clear_route"
     let cmd: String
     let success: Bool
     let message: String
@@ -393,6 +420,54 @@ struct NavCommandAckEvent: Codable {
     let target: Vec2?
     /// Number of waypoints in the planned path (present for set_nav_target on success)
     let waypointCount: Int?
+}
+
+// MARK: - 13. PersonTracking (type: "person_tracking", ~2 Hz during scanning/tracking)
+
+/// Emitted periodically while the PersonTracker is scanning or tracking.
+/// Contains all currently identified people, who is gesturing, and who is active.
+struct PersonTrackingEvent: Codable {
+    let pose: Pose
+    /// "idle" | "scanning" | "tracking" | "reacquiring" | "lost"
+    let trackingState: String
+    /// Total people currently visible
+    let peopleCount: Int
+    /// Per-person snapshots
+    let people: [PersonSnapshot]
+    /// The UUID (short prefix) of the person being actively followed, if any
+    let activePersonId: String?
+    /// World position of the actively tracked person
+    let activePersonPos: Vec2?
+    /// Optional event that triggered this emission
+    /// "scan_update" | "gesture_detected" | "person_activated" | "tracking_update" | "person_lost" | "state_change"
+    let event: String
+    /// Human-readable message
+    let message: String
+}
+
+/// Snapshot of a single detected person, included in PersonTrackingEvent.
+struct PersonSnapshot: Codable {
+    /// Stable session-level ID (UUID, first 8 chars)
+    let id: String
+    /// World position (ARKit X, ARKit Z) — matches occupancy grid convention
+    let worldPos: Vec2?
+    /// Bounding box in normalized Vision coordinates (origin bottom-left)
+    let bbox: BBoxRect
+    /// Whether this person is currently showing the activation gesture
+    let isGesturing: Bool
+    /// How many consecutive detection cycles they have been gesturing
+    let gestureStreak: Int
+    /// Whether this is the actively followed person
+    let isActive: Bool
+    /// Seconds since this person was last detected
+    let lastSeenAgo: Float
+}
+
+struct BBoxRect: Codable {
+    let x: Float
+    let y: Float
+    let width: Float
+    let height: Float
 }
 
 // MARK: - Encoding Helpers

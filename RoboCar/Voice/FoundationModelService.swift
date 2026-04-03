@@ -210,6 +210,52 @@ struct CalibrateMotorsTool: Tool {
     }
 }
 
+/// Tool that starts scanning for people and follows whoever raises an open hand
+struct FollowPersonTool: Tool {
+    let name = "followPerson"
+    let description = "Start scanning for people to follow. The car will detect all visible people using the camera and assign each a stable ID. To select which person to follow, that person should raise an open hand (palm facing the camera) for about one second. Once activated, the car will continuously drive to stay behind them at a safe distance. Say 'follow me' or 'follow that person' to trigger this."
+    
+    @Generable
+    struct Arguments {}
+    
+    func call(arguments: Arguments) async throws -> String {
+        await MainActor.run {
+            NotificationCenter.default.post(name: .startFollowing, object: nil)
+        }
+        // Brief delay for initial detection
+        try await Task.sleep(for: .seconds(0.5))
+        let state = await MainActor.run { PersonTracker.shared.state }
+        let count = await MainActor.run { PersonTracker.shared.detectedPeople.count }
+        if state == .tracking {
+            return "I can see you! Following you now. I'll stay about a meter behind you."
+        } else if state == .scanning {
+            if count > 0 {
+                return "I can see \(count) \(count == 1 ? "person" : "people"). Raise an open hand toward me so I know who to follow!"
+            } else {
+                return "I'm scanning for people now. Step into view of the camera and raise an open hand to start following."
+            }
+        } else {
+            return "I couldn't start scanning. Make sure you're visible to the camera and try again."
+        }
+    }
+}
+
+/// Tool that stops following the person
+struct StopFollowingTool: Tool {
+    let name = "stopFollowing"
+    let description = "Stop following the person and return to idle mode."
+    
+    @Generable
+    struct Arguments {}
+    
+    func call(arguments: Arguments) async throws -> String {
+        await MainActor.run {
+            NotificationCenter.default.post(name: .stopFollowing, object: nil)
+        }
+        return "Stopped following. Standing by."
+    }
+}
+
 // MARK: - Foundation Model Service
 
 /// Manages the Apple Foundation Models session with tool calling for car control
@@ -222,11 +268,13 @@ class FoundationModelService {
     private let instructions = """
     You are a helpful voice assistant that controls a robotic car via Bluetooth. \
     You can drive the car forward, backward, turn left, turn right, stop, set the steering servo, \
-    start autonomous exploration to map the entire room, and calibrate the motors to measure \
-    actual speed and turn rates. \
+    start autonomous exploration to map the entire room, calibrate the motors to measure \
+    actual speed and turn rates, and follow a person around. \
     When the user asks you to move the car, use the appropriate tool. \
     When the user asks to map the room or explore the area, use the exploreArea tool. \
     When the user asks to calibrate, test the motors, or measure speed, use the calibrateMotors tool. \
+    When the user asks to follow them or follow a person, use the followPerson tool. \
+    When the user asks to stop following, use the stopFollowing tool. \
     Keep your spoken responses very brief and conversational — you are being read aloud. \
     If the user asks something unrelated to the car, answer briefly. \
     Default to 50% speed and 1 second duration if the user doesn't specify.
@@ -247,7 +295,9 @@ class FoundationModelService {
                 SetServoTool(),
                 ExploreAreaTool(),
                 StopExplorationTool(),
-                CalibrateMotorsTool()
+                CalibrateMotorsTool(),
+                FollowPersonTool(),
+                StopFollowingTool()
             ],
             instructions: instructions
         )

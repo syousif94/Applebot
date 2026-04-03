@@ -1,0 +1,12 @@
+[project]
+name = "osnet-conversion"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "coremltools>=9.0",
+    "gdown>=5.2.1",
+    "torch>=2.10.0",
+    "torchvision>=0.25.0",
+]

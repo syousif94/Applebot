@@ -349,6 +349,8 @@ final class TelemetryService {
         case .navigating: navState = "navigating"
         case .paused: navState = "paused"
         case .arrived: navState = "arrived"
+        case .following: navState = "following"
+        case .followPaused: navState = "followPaused"
         }
 
         let frame = NavFrame(
@@ -455,6 +457,49 @@ final class TelemetryService {
         }
     }
 
+    /// Log a single segment of a multi-waypoint route preview. Called from planRoutePreview.
+    func logRoutePreviewSegment(
+        previewId: String,
+        segmentIndex: Int,
+        segmentCount: Int,
+        origin: (x: Float, y: Float),
+        target: (x: Float, y: Float),
+        waypoints: [(x: Float, y: Float)],
+        algorithm: String,
+        routeWaypoints: [(x: Float, y: Float)],
+        occupancyGrid: OccupancyGrid,
+        cameraTransform: simd_float4x4
+    ) {
+        let pose = Pose(from: occupancyGrid.devicePosition, arTransform: cameraTransform)
+
+        var pathLength: Float = 0
+        for i in 1..<waypoints.count {
+            let dx = waypoints[i].x - waypoints[i-1].x
+            let dy = waypoints[i].y - waypoints[i-1].y
+            pathLength += sqrtf(dx * dx + dy * dy)
+        }
+
+        let event = RoutePreviewSegmentEvent(
+            pose: pose,
+            previewId: previewId,
+            segmentIndex: segmentIndex,
+            segmentCount: segmentCount,
+            origin: Vec2(x: origin.x, y: origin.y),
+            target: Vec2(x: target.x, y: target.y),
+            waypoints: waypoints.map { Vec2(x: $0.x, y: $0.y) },
+            waypointCount: waypoints.count,
+            pathLengthMeters: pathLength,
+            algorithm: algorithm,
+            routeWaypointCount: routeWaypoints.count,
+            routeWaypoints: routeWaypoints.map { Vec2(x: $0.x, y: $0.y) }
+        )
+
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            self.send(type: "route_preview_segment", payload: event)
+        }
+    }
+
     /// Log a navigation state change. Called from PathNavigator.
     func logNavStateChange(
         from: NavigationState,
@@ -473,6 +518,8 @@ final class TelemetryService {
             case .navigating: return "navigating"
             case .paused: return "paused"
             case .arrived: return "arrived"
+            case .following: return "following"
+            case .followPaused: return "followPaused"
             }
         }
 
@@ -606,6 +653,61 @@ final class TelemetryService {
         addRecentLog("[NavCmd] \(cmd): \(success ? "ok" : "fail") — \(message)")
         queue.async { [weak self] in
             self?.send(type: "nav_command_ack", payload: event)
+        }
+    }
+
+    /// Log person tracking state — all detected people and their positions.
+    /// Called periodically during scanning/tracking (~2 Hz from updateFrame).
+    func logPersonTracking(
+        event: String,
+        message: String = "",
+        occupancyGrid: OccupancyGrid?,
+        cameraTransform: simd_float4x4
+    ) {
+        let tracker = PersonTracker.shared
+        let pos = occupancyGrid?.devicePosition ?? .zero
+        let pose = Pose(from: pos, arTransform: cameraTransform)
+        let now = Date()
+
+        let people: [PersonSnapshot] = tracker.detectedPeople.map { person in
+            PersonSnapshot(
+                id: String(person.id.uuidString.prefix(8)),
+                worldPos: person.worldPosition.map { Vec2(x: $0.x, y: $0.y) },
+                bbox: BBoxRect(
+                    x: Float(person.boundingBox.origin.x),
+                    y: Float(person.boundingBox.origin.y),
+                    width: Float(person.boundingBox.width),
+                    height: Float(person.boundingBox.height)
+                ),
+                isGesturing: person.isGesturing,
+                gestureStreak: person.gestureStreakCount,
+                isActive: person.id == tracker.activePersonID,
+                lastSeenAgo: Float(now.timeIntervalSince(person.lastSeen))
+            )
+        }
+
+        let activePos: Vec2?
+        if let wp = tracker.trackedWorldPosition {
+            activePos = Vec2(x: wp.x, y: wp.y)
+        } else {
+            activePos = nil
+        }
+
+        let payload = PersonTrackingEvent(
+            pose: pose,
+            trackingState: tracker.state.rawValue,
+            peopleCount: people.count,
+            people: people,
+            activePersonId: tracker.activePersonID.map { String($0.uuidString.prefix(8)) },
+            activePersonPos: activePos,
+            event: event,
+            message: message
+        )
+
+        addRecentLog("[PersonTrack] \(event): \(message)")
+
+        queue.async { [weak self] in
+            self?.send(type: "person_tracking", payload: payload)
         }
     }
 
@@ -867,6 +969,52 @@ final class TelemetryService {
                 NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
             }
 
+        case "add_route_point":
+            guard let x = (params["x"] as? NSNumber)?.floatValue,
+                  let y = (params["y"] as? NSNumber)?.floatValue else {
+                logNavCommandAck(cmd: cmd, success: false, message: "Missing x/y parameters")
+                return
+            }
+            print("[Telemetry] Server command: add_route_point (\(x), \(y))")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(
+                    name: .serverAddRoutePoint,
+                    object: nil,
+                    userInfo: ["x": x, "y": y]
+                )
+            }
+
+        case "run_route":
+            print("[Telemetry] Server command: run_route")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .serverRunRoute, object: nil)
+            }
+
+        case "pause_route":
+            print("[Telemetry] Server command: pause_route")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .serverPauseRoute, object: nil)
+            }
+
+        case "clear_route":
+            print("[Telemetry] Server command: clear_route")
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: .serverClearRoute, object: nil)
+            }
+
+        case "drive":
+            // Remote driving: x = turn (-1 left to +1 right), y = throttle (-1 back to +1 forward)
+            let x = (params["x"] as? NSNumber)?.floatValue ?? 0
+            let y = (params["y"] as? NSNumber)?.floatValue ?? 0
+            print("[Telemetry] Server command: drive (x: \(x), y: \(y))")
+            DispatchQueue.main.async {
+                // Stop any active autonomous navigation first
+                if PathNavigator.shared.state != .idle {
+                    NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
+                }
+                ESP32BLEManager.shared.drive(x: x, y: y)
+            }
+
         default:
             print("[Telemetry] Unknown server command: \(cmd)")
         }
@@ -1045,4 +1193,16 @@ extension Notification.Name {
     static let serverStartNavigation = Notification.Name("serverStartNavigation")
     /// Server requested navigation to stop.
     static let serverStopNavigation = Notification.Name("serverStopNavigation")
+    /// Server sent a route point to add. userInfo: ["x": Float, "y": Float]
+    static let serverAddRoutePoint = Notification.Name("serverAddRoutePoint")
+    /// Server requested the multi-point route to start (or resume).
+    static let serverRunRoute = Notification.Name("serverRunRoute")
+    /// Server requested the multi-point route to pause.
+    static let serverPauseRoute = Notification.Name("serverPauseRoute")
+    /// Server requested the multi-point route to be cleared.
+    static let serverClearRoute = Notification.Name("serverClearRoute")
+    /// Start follow mode — detect and follow the nearest person.
+    static let startFollowing = Notification.Name("startFollowing")
+    /// Stop follow mode.
+    static let stopFollowing = Notification.Name("stopFollowing")
 }

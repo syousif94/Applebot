@@ -8,6 +8,7 @@
 import UIKit
 import ARKit
 import RealityKit
+import Vision
 
 class LiDARViewController: UIViewController {
     
@@ -22,6 +23,8 @@ class LiDARViewController: UIViewController {
     private var micButton: UIButton!
     private var voiceStatusLabel: UILabel!
     private var obstaclePointOverlay: ObstaclePointOverlayView!
+    private var personBoundingBoxOverlay: PersonBoundingBoxOverlay!
+    private var handJointOverlay: HandJointOverlayView!
     private var navigateButton: UIButton!
     
     // MARK: - Voice Assistant
@@ -53,6 +56,11 @@ class LiDARViewController: UIViewController {
     
     /// Flag to pause mesh processing during reset
     private var isResetting = false
+
+    /// Anchor IDs that existed before the last grid reset.
+    /// These are ignored until ARKit removes them, preventing stale mesh
+    /// data from being re-ingested after a relocalizing reset.
+    private var preResetAnchorIds: Set<UUID> = []
     
     /// Guard against concurrent replan dispatches that retain ARFrames
     private var isReplanning = false
@@ -69,6 +77,47 @@ class LiDARViewController: UIViewController {
     /// Navigation controller for autonomous driving
     private let pathNavigator = PathNavigator.shared
     
+    /// Person tracker for follow mode
+    private let personTracker = PersonTracker.shared
+    
+    /// Follow button (shown when follow mode is not active)
+    private var followButton: UIButton!
+    
+    /// Whether we're currently re-planning for follow mode
+    private var isFollowReplanning = false
+
+    /// Always-on person detection results with stable ReID-based IDs
+    private var alwaysOnPersonBoxes: [PersonBoxInfo] = []
+    /// Known person embeddings keyed by stable UUID
+    private var knownPersonEmbeddings: [UUID: [Float]] = [:]
+    /// Whether a background detection request is in flight
+    private var personDetectionInFlight = false
+    /// ReID match threshold for always-on scanner
+    private let alwaysOnReidThreshold: Float = 0.55
+    /// Per-person activation gesture phase for always-on scanner (peace→fist→peace)
+    private var alwaysOnActivatePhase: [UUID: PersonTracker.ActivateGesturePhase] = [:]
+    /// Timestamps for activation gesture phase transitions
+    private var alwaysOnActivateTimestamp: [UUID: Date] = [:]
+    /// Cancel gesture phase for always-on scanner (index wag)
+    private var alwaysOnCancelPhase: PersonTracker.CancelGesturePhase = .idle
+    /// Last wrist X position for wag detection
+    private var alwaysOnCancelLastWristX: CGFloat?
+    /// Timestamp of last cancel gesture phase transition
+    private var alwaysOnCancelTimestamp: Date = .distantPast
+    /// Gesture timeout (seconds)
+    private let alwaysOnGestureTimeout: TimeInterval = 3.0
+    /// Minimum fingertip X delta for wag detection
+    private let alwaysOnWagMinDelta: CGFloat = 0.04
+    
+    /// Index of the current route waypoint being navigated to
+    private var currentRouteWaypointIndex = 0
+    
+    /// Whether we're navigating a multi-point route
+    private var isRouteActive = false
+    
+    /// Whether the route is paused (user-initiated pause, not obstacle pause)
+    private var isRoutePaused = false
+    
     // MARK: - Lifecycle
     
     override func viewDidLoad() {
@@ -84,7 +133,9 @@ class LiDARViewController: UIViewController {
         setupMicButton()
         setupVoiceAssistant()
         setupObstacleOverlay()
+        setupPersonBoundingBoxOverlay()
         setupNavigateButton()
+        setupFollowButton()
         setupMeshProcessor()
         setupObstacleDetector()
         setupNavigationController()
@@ -151,9 +202,9 @@ class LiDARViewController: UIViewController {
         gridMapView.translatesAutoresizingMaskIntoConstraints = false
         gridMapView.backgroundColor = UIColor(white: 0.1, alpha: 1.0)
         
-        // Handle tap for pathfinding
+        // Handle tap for adding/removing route waypoints
         gridMapView.onTapWorldPosition = { [weak self] worldX, worldY in
-            self?.planPath(toX: worldX, toY: worldY, reason: "user_tap")
+            self?.handleGridTap(x: worldX, y: worldY)
         }
         
         view.addSubview(gridMapView)
@@ -411,6 +462,10 @@ class LiDARViewController: UIViewController {
         // Clear the occupancy grid (resets originOffset and all data)
         occupancyGrid.clear()
         
+        // Remember which anchors existed before the reset so we can
+        // ignore them if ARKit updates them before removing them.
+        preResetAnchorIds = Set(processedMeshVersions.keys)
+        
         // Reset mesh tracking
         processedMeshVersions.removeAll()
         
@@ -442,6 +497,28 @@ class LiDARViewController: UIViewController {
         ])
     }
     
+    private func setupPersonBoundingBoxOverlay() {
+        personBoundingBoxOverlay = PersonBoundingBoxOverlay()
+        personBoundingBoxOverlay.translatesAutoresizingMaskIntoConstraints = false
+        arView.addSubview(personBoundingBoxOverlay)
+        NSLayoutConstraint.activate([
+            personBoundingBoxOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
+            personBoundingBoxOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
+            personBoundingBoxOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
+            personBoundingBoxOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
+        ])
+        
+        handJointOverlay = HandJointOverlayView()
+        handJointOverlay.translatesAutoresizingMaskIntoConstraints = false
+        arView.addSubview(handJointOverlay)
+        NSLayoutConstraint.activate([
+            handJointOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
+            handJointOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
+            handJointOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
+            handJointOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
+        ])
+    }
+
     private func setupNavigateButton() {
         navigateButton = UIButton(type: .system)
         navigateButton.translatesAutoresizingMaskIntoConstraints = false
@@ -463,6 +540,355 @@ class LiDARViewController: UIViewController {
         ])
     }
     
+    private func setupFollowButton() {
+        followButton = UIButton(type: .system)
+        followButton.translatesAutoresizingMaskIntoConstraints = false
+        
+        let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)
+        followButton.setImage(UIImage(systemName: "figure.walk", withConfiguration: config), for: .normal)
+        followButton.tintColor = .white
+        followButton.backgroundColor = UIColor(white: 0.2, alpha: 0.9)
+        followButton.layer.cornerRadius = 22
+        followButton.addTarget(self, action: #selector(followButtonTapped), for: .touchUpInside)
+        
+        view.addSubview(followButton)
+        
+        NSLayoutConstraint.activate([
+            followButton.widthAnchor.constraint(equalToConstant: 44),
+            followButton.heightAnchor.constraint(equalToConstant: 44),
+            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
+            followButton.topAnchor.constraint(equalTo: positionLabel.bottomAnchor, constant: 8),
+        ])
+    }
+    
+    @objc private func followButtonTapped() {
+        if personTracker.state == .idle {
+            startFollowMode()
+        } else {
+            stopFollowMode()
+        }
+    }
+    
+    private func updateFollowButtonAppearance(isFollowing: Bool) {
+        let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)
+        if isFollowing {
+            followButton.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: config), for: .normal)
+            followButton.tintColor = .systemRed
+        } else {
+            followButton.setImage(UIImage(systemName: "figure.walk", withConfiguration: config), for: .normal)
+            followButton.tintColor = .white
+        }
+    }
+    
+    // MARK: - Follow Mode
+    
+    private func startFollowMode() {
+        // Stop any existing navigation
+        pathNavigator.stopNavigation()
+        
+        // Start scanning for people — gesture activation will trigger tracking
+        personTracker.startScanning()
+        
+        // Update button to show stop icon
+        updateFollowButtonAppearance(isFollowing: true)
+        
+        // Wire cancel gesture to stop follow mode
+        personTracker.onCancelGesture = { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopFollowMode()
+            }
+        }
+        
+        // Wire up person tracker callbacks
+        personTracker.onPeopleUpdated = { [weak self] people in
+            guard let self = self else { return }
+            // Emit telemetry for detected people (~2 Hz, throttled by scanDetectionInterval)
+            TelemetryService.shared.logPersonTracking(
+                event: "scan_update",
+                message: "\(people.count) people visible",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+        }
+        
+        personTracker.onPersonActivated = { [weak self] person in
+            guard let self = self else { return }
+            let idPrefix = String(person.id.uuidString.prefix(8))
+            
+            SpeechSynthesisManager.shared.speak("Following started")
+            
+            TelemetryService.shared.logPersonTracking(
+                event: "person_activated",
+                message: "Person \(idPrefix) activated via gesture",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+            
+            // Now that a person is activated, start the follow navigation
+            DispatchQueue.main.async {
+                if let personPos = self.personTracker.trackedWorldPosition {
+                    self.obstacleDetector.excludedPersonPosition = simd_float2(personPos.x, personPos.y)
+                    self.pathNavigator.updateFollowTarget(x: personPos.x, y: personPos.y)
+                }
+                self.pathNavigator.startFollowing()
+                if let personPos = self.personTracker.trackedWorldPosition {
+                    self.planFollowPath(toX: personPos.x, toY: personPos.y)
+                }
+            }
+        }
+        
+        personTracker.onPositionUpdated = { [weak self] worldPos in
+            guard let self = self else { return }
+            self.pathNavigator.updateFollowTarget(x: worldPos.x, y: worldPos.y)
+            self.obstacleDetector.excludedPersonPosition = worldPos
+        }
+        
+        personTracker.onStateChanged = { [weak self] state in
+            guard let self = self else { return }
+            
+            TelemetryService.shared.logPersonTracking(
+                event: "state_change",
+                message: "State → \(state.rawValue)",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+            
+            DispatchQueue.main.async {
+                switch state {
+                case .scanning:
+                    self.voiceStatusLabel.text = "Scanning — raise open hand to follow"
+                    self.voiceStatusLabel.textColor = .cyan
+                    self.voiceStatusLabel.alpha = 1
+                case .lost:
+                    // Person lost — pause motors and announce
+                    ESP32BLEManager.shared.stopAll()
+                    self.voiceStatusLabel.text = "Lost tracked person"
+                    self.voiceStatusLabel.textColor = .orange
+                    self.voiceStatusLabel.alpha = 1
+                case .tracking:
+                    self.voiceStatusLabel.text = "Following person"
+                    self.voiceStatusLabel.textColor = UIColor(red: 0.7, green: 0.5, blue: 1.0, alpha: 1)
+                    self.voiceStatusLabel.alpha = 1
+                    UIView.animate(withDuration: 0.3, delay: 2.0) {
+                        self.voiceStatusLabel.alpha = 0
+                    }
+                case .reacquiring:
+                    self.voiceStatusLabel.text = "Re-acquiring person..."
+                    self.voiceStatusLabel.textColor = .yellow
+                    self.voiceStatusLabel.alpha = 1
+                case .idle:
+                    break
+                }
+            }
+        }
+    }
+    
+    /// Start follow mode for a specific person identified by the always-on scanner.
+    private func startFollowModeForPerson(id: UUID, embedding: [Float], boundingBox: CGRect, worldPosition: simd_float2?) {
+        // Stop any existing navigation
+        pathNavigator.stopNavigation()
+        
+        SpeechSynthesisManager.shared.speak("Following started")
+        
+        // Wire up callbacks (same as startFollowMode)
+        personTracker.onCancelGesture = { [weak self] in
+            DispatchQueue.main.async {
+                self?.stopFollowMode()
+            }
+        }
+        
+        personTracker.onPeopleUpdated = { [weak self] people in
+            guard let self = self else { return }
+            TelemetryService.shared.logPersonTracking(
+                event: "scan_update",
+                message: "\(people.count) people visible",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+        }
+        
+        personTracker.onPersonActivated = { [weak self] person in
+            guard let self = self else { return }
+            let idPrefix = String(person.id.uuidString.prefix(8))
+            
+            TelemetryService.shared.logPersonTracking(
+                event: "person_activated",
+                message: "Person \(idPrefix) activated via gesture",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+            
+            DispatchQueue.main.async {
+                if let personPos = self.personTracker.trackedWorldPosition {
+                    self.obstacleDetector.excludedPersonPosition = simd_float2(personPos.x, personPos.y)
+                    self.pathNavigator.updateFollowTarget(x: personPos.x, y: personPos.y)
+                }
+                self.pathNavigator.startFollowing()
+                if let personPos = self.personTracker.trackedWorldPosition {
+                    self.planFollowPath(toX: personPos.x, toY: personPos.y)
+                }
+            }
+        }
+        
+        personTracker.onPositionUpdated = { [weak self] worldPos in
+            guard let self = self else { return }
+            self.pathNavigator.updateFollowTarget(x: worldPos.x, y: worldPos.y)
+            self.obstacleDetector.excludedPersonPosition = worldPos
+        }
+        
+        personTracker.onStateChanged = { [weak self] state in
+            guard let self = self else { return }
+            
+            TelemetryService.shared.logPersonTracking(
+                event: "state_change",
+                message: "State → \(state.rawValue)",
+                occupancyGrid: self.occupancyGrid,
+                cameraTransform: TelemetryService.shared.lastCameraTransform
+            )
+            
+            DispatchQueue.main.async {
+                switch state {
+                case .scanning:
+                    self.voiceStatusLabel.text = "Scanning — raise open hand to follow"
+                    self.voiceStatusLabel.textColor = .cyan
+                    self.voiceStatusLabel.alpha = 1
+                case .lost:
+                    ESP32BLEManager.shared.stopAll()
+                    self.voiceStatusLabel.text = "Lost tracked person"
+                    self.voiceStatusLabel.textColor = .orange
+                    self.voiceStatusLabel.alpha = 1
+                case .tracking:
+                    self.voiceStatusLabel.text = "Following person"
+                    self.voiceStatusLabel.textColor = UIColor(red: 0.7, green: 0.5, blue: 1.0, alpha: 1)
+                    self.voiceStatusLabel.alpha = 1
+                    UIView.animate(withDuration: 0.3, delay: 2.0) {
+                        self.voiceStatusLabel.alpha = 0
+                    }
+                case .reacquiring:
+                    self.voiceStatusLabel.text = "Re-acquiring person..."
+                    self.voiceStatusLabel.textColor = .yellow
+                    self.voiceStatusLabel.alpha = 1
+                case .idle:
+                    break
+                }
+            }
+        }
+        
+        // Activate the person directly — skip scanning since we already identified them
+        personTracker.activateExternalPerson(id: id, embedding: embedding, boundingBox: boundingBox, worldPosition: worldPosition)
+        
+        // Update button to show stop icon
+        updateFollowButtonAppearance(isFollowing: true)
+    }
+    
+    private func stopFollowMode() {
+        SpeechSynthesisManager.shared.speak("Following stopped")
+        
+        TelemetryService.shared.logPersonTracking(
+            event: "state_change",
+            message: "Follow mode stopped by user",
+            occupancyGrid: occupancyGrid,
+            cameraTransform: TelemetryService.shared.lastCameraTransform
+        )
+        personTracker.stopTracking()
+        pathNavigator.stopNavigation()
+        obstacleDetector.excludedPersonPosition = nil
+        personBoundingBoxOverlay.people = []
+        personBoundingBoxOverlay.setNeedsDisplay()
+        handJointOverlay.hands = []
+        handJointOverlay.setNeedsDisplay()
+        gridMapView.personPositions = []
+        isFollowReplanning = false
+        
+        gridMapView.pathTargetPoint = nil
+        plannedPath.removeAll()
+        gridMapView.plannedPath = []
+        pathAnchor?.removeFromParent()
+        pathAnchor = nil
+        gridMapView.setNeedsDisplay()
+        
+        updateFollowButtonAppearance(isFollowing: false)
+        
+        // Reset gesture state machines
+        alwaysOnActivatePhase.removeAll()
+        alwaysOnActivateTimestamp.removeAll()
+        alwaysOnCancelPhase = .idle
+        alwaysOnCancelLastWristX = nil
+    }
+    
+    @objc private func handleStartFollowing() {
+        startFollowMode()
+    }
+    
+    @objc private func handleStopFollowing() {
+        stopFollowMode()
+    }
+    
+    /// Plan a path to the followed person's current position (with standoff).
+    private func planFollowPath(toX: Float, toY: Float) {
+        guard !isFollowReplanning else { return }
+        isFollowReplanning = true
+        
+        let pos = occupancyGrid.devicePosition
+        let capturedTransform = TelemetryService.shared.lastCameraTransform
+        
+        // Compute standoff target: stop short of the person
+        let dx = pos.x - toX
+        let dy = pos.y - toY
+        let dist = sqrtf(dx * dx + dy * dy)
+        let standoff = pathNavigator.followStandoff
+        
+        let targetX: Float, targetY: Float
+        if dist > standoff {
+            targetX = toX + (dx / dist) * standoff
+            targetY = toY + (dy / dist) * standoff
+        } else {
+            targetX = pos.x  // Already close enough
+            targetY = pos.y
+        }
+        
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            let strictPath = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: targetX, toY: targetY)
+            let greedyPath = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: targetX, toY: targetY)
+            
+            func pathLength(_ p: [(x: Float, y: Float)]) -> Float {
+                var total: Float = 0
+                for i in 1..<p.count {
+                    let pdx = p[i].x - p[i-1].x
+                    let pdy = p[i].y - p[i-1].y
+                    total += sqrtf(pdx * pdx + pdy * pdy)
+                }
+                return total
+            }
+            
+            let path: [(x: Float, y: Float)]
+            if strictPath.isEmpty && greedyPath.isEmpty {
+                path = []
+            } else if strictPath.isEmpty {
+                path = greedyPath
+            } else if greedyPath.isEmpty {
+                path = strictPath
+            } else {
+                let strictLen = pathLength(strictPath)
+                let greedyLen = pathLength(greedyPath)
+                path = greedyLen < strictLen * 0.75 ? greedyPath : strictPath
+            }
+            
+            DispatchQueue.main.async {
+                self.isFollowReplanning = false
+                guard !path.isEmpty else { return }
+                self.plannedPath = path
+                self.gridMapView.plannedPath = path
+                self.gridMapView.pathTargetPoint = (x: targetX, y: targetY)
+                self.gridMapView.setNeedsDisplay()
+                self.rebuildPathMesh(from: path)
+                self.pathNavigator.updateFollowPath(path)
+            }
+        }
+    }
+    
     private func setupNavigationController() {
         pathNavigator.occupancyGrid = occupancyGrid
         
@@ -473,6 +899,12 @@ class LiDARViewController: UIViewController {
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerSetNavTarget(_:)), name: .serverSetNavTarget, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerStartNavigation), name: .serverStartNavigation, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerStopNavigation), name: .serverStopNavigation, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleStartFollowing), name: .startFollowing, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleStopFollowing), name: .stopFollowing, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerAddRoutePoint(_:)), name: .serverAddRoutePoint, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerRunRoute), name: .serverRunRoute, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerPauseRoute), name: .serverPauseRoute, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleServerClearRoute), name: .serverClearRoute, object: nil)
         
         let previousOnStateChanged = pathNavigator.onStateChanged
         pathNavigator.onStateChanged = { [weak self] state in
@@ -486,6 +918,8 @@ class LiDARViewController: UIViewController {
                 case .navigating: reason = "started"
                 case .paused: reason = "obstacle_blocking"
                 case .arrived: reason = "arrived"
+                case .following: reason = "following"
+                case .followPaused: reason = "follow_paused"
                 }
                 // Use cached transform to avoid retaining an ARFrame
                 let cachedTransform = TelemetryService.shared.lastCameraTransform
@@ -498,6 +932,10 @@ class LiDARViewController: UIViewController {
 
             DispatchQueue.main.async {
                 self?.updateNavigateButtonForState(state)
+                // Handle route waypoint arrival
+                if state == .arrived, let self = self, self.isRouteActive {
+                    self.onRouteWaypointArrived()
+                }
             }
             previousOnStateChanged?(state)
         }
@@ -516,16 +954,380 @@ class LiDARViewController: UIViewController {
     @objc private func navigateButtonTapped() {
         if pathNavigator.state == .navigating || pathNavigator.state == .paused {
             // Stop navigation
-            pathNavigator.stopNavigation()
-            gridMapView.pathTargetPoint = nil
-            plannedPath.removeAll()
-            gridMapView.plannedPath = []
-            pathAnchor?.removeFromParent()
-            pathAnchor = nil
-            gridMapView.setNeedsDisplay()
+            stopRoute()
+        } else if pathNavigator.state == .following || pathNavigator.state == .followPaused {
+            // Stop following
+            stopFollowMode()
+        } else if isRoutePaused {
+            // Resume paused route
+            resumeRoute()
+        } else if !gridMapView.routeWaypoints.isEmpty {
+            // Start multi-waypoint route
+            startRoute()
         } else if !plannedPath.isEmpty, let target = gridMapView.pathTargetPoint {
             // Start navigating along the current planned path
             pathNavigator.startNavigation(to: target, path: plannedPath)
+        }
+    }
+    
+    // MARK: - Multi-Waypoint Route
+    
+    /// Handle a tap on the grid map — add or remove a waypoint
+    private func handleGridTap(x: Float, y: Float) {
+        // Don't allow editing waypoints while actively navigating a route
+        guard !isRouteActive else {
+            print("[Route] Cannot modify waypoints while route is active")
+            return
+        }
+        
+        // Check if tap is near an existing waypoint → remove it
+        let deleteThreshold: Float = 0.3  // 30cm tap radius for deletion
+        if let removeIndex = gridMapView.routeWaypoints.firstIndex(where: { wp in
+            let dx = wp.x - x
+            let dy = wp.y - y
+            return sqrt(dx * dx + dy * dy) < deleteThreshold
+        }) {
+            let removed = gridMapView.routeWaypoints.remove(at: removeIndex)
+            gridMapView.setNeedsDisplay()
+            updateNavigateButtonForRouteState()
+            print("[Route] Removed waypoint #\(removeIndex + 1) at (\(String(format: "%.2f", removed.x)), \(String(format: "%.2f", removed.y)))")
+            
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "remove_route_point", success: true,
+                message: "Waypoint #\(removeIndex + 1) removed",
+                waypointCount: gridMapView.routeWaypoints.count
+            )
+            
+            // Re-plan route preview with remaining waypoints
+            planRoutePreview()
+            return
+        }
+        
+        // Otherwise add a new waypoint
+        addRouteWaypoint(x: x, y: y)
+    }
+    
+    /// Add a waypoint to the multi-point route
+    private func addRouteWaypoint(x: Float, y: Float) {
+        // Don't allow adding waypoints while actively navigating a route
+        guard !isRouteActive else {
+            print("[Route] Cannot add waypoints while route is active")
+            return
+        }
+        
+        gridMapView.routeWaypoints.append((x: x, y: y))
+        gridMapView.setNeedsDisplay()
+        updateNavigateButtonForRouteState()
+        
+        print("[Route] Added waypoint #\(gridMapView.routeWaypoints.count) at (\(String(format: "%.2f", x)), \(String(format: "%.2f", y)))")
+        
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "add_route_point", success: true,
+            message: "Waypoint #\(gridMapView.routeWaypoints.count) added",
+            target: Vec2(x: x, y: y),
+            waypointCount: gridMapView.routeWaypoints.count
+        )
+        
+        // Plan route preview including the new waypoint
+        planRoutePreview()
+    }
+    
+    /// Plan paths between all consecutive route waypoints for preview on grid + AR
+    private func planRoutePreview() {
+        let waypoints = gridMapView.routeWaypoints
+        guard !waypoints.isEmpty else {
+            gridMapView.routePreviewPaths = []
+            gridMapView.plannedPath = []
+            gridMapView.setNeedsDisplay()
+            pathAnchor?.removeFromParent()
+            pathAnchor = nil
+            return
+        }
+        
+        let devicePos = occupancyGrid.devicePosition
+        
+        // Build list of segment pairs: device → WP1, WP1 → WP2, ...
+        var origins: [(x: Float, y: Float)] = [(x: devicePos.x, y: devicePos.y)]
+        origins.append(contentsOf: waypoints.dropLast())
+        let destinations = waypoints
+        
+        let previewId = UUID().uuidString
+        let segmentCount = destinations.count
+        let routeWPs = waypoints  // capture for telemetry
+        
+        // Plan all segments off main thread
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self = self else { return }
+            
+            var segmentPaths: [[(x: Float, y: Float)]] = []
+            var fullPath: [(x: Float, y: Float)] = []
+            
+            for i in 0..<destinations.count {
+                let from = origins[i]
+                let to = destinations[i]
+                
+                // Snap target out of obstacles
+                var targetX = to.x
+                var targetY = to.y
+                if self.occupancyGrid.getStateAtWorld(x: to.x, y: to.y) == .occupied {
+                    if let freePoint = self.occupancyGrid.nearestFreeWorldPoint(x: to.x, y: to.y) {
+                        targetX = freePoint.x
+                        targetY = freePoint.y
+                    }
+                }
+                
+                let strict = self.occupancyGrid.findPath(fromX: from.x, fromY: from.y, toX: targetX, toY: targetY)
+                let greedy = self.occupancyGrid.findPathGreedy(fromX: from.x, fromY: from.y, toX: targetX, toY: targetY)
+                
+                let segPath: [(x: Float, y: Float)]
+                if strict.isEmpty && greedy.isEmpty {
+                    // No path found — use direct line as fallback
+                    segPath = [from, to]
+                } else if strict.isEmpty {
+                    segPath = greedy
+                } else if greedy.isEmpty {
+                    segPath = strict
+                } else {
+                    func pathLen(_ p: [(x: Float, y: Float)]) -> Float {
+                        var t: Float = 0
+                        for j in 1..<p.count { let dx = p[j].x - p[j-1].x; let dy = p[j].y - p[j-1].y; t += sqrtf(dx*dx+dy*dy) }
+                        return t
+                    }
+                    segPath = pathLen(greedy) < pathLen(strict) * 0.75 ? greedy : strict
+                }
+                
+                // Determine which algorithm was chosen
+                let segAlgorithm: String
+                if strict.isEmpty && greedy.isEmpty {
+                    segAlgorithm = "direct_fallback"
+                } else if strict.isEmpty {
+                    segAlgorithm = "greedy"
+                } else if greedy.isEmpty {
+                    segAlgorithm = "astar"
+                } else {
+                    func segPathLen(_ p: [(x: Float, y: Float)]) -> Float {
+                        var t: Float = 0
+                        for j in 1..<p.count { let dx = p[j].x - p[j-1].x; let dy = p[j].y - p[j-1].y; t += sqrtf(dx*dx+dy*dy) }
+                        return t
+                    }
+                    segAlgorithm = segPathLen(greedy) < segPathLen(strict) * 0.75 ? "greedy_shorter" : "astar"
+                }
+                
+                // Emit telemetry for this segment
+                TelemetryService.shared.logRoutePreviewSegment(
+                    previewId: previewId,
+                    segmentIndex: i,
+                    segmentCount: segmentCount,
+                    origin: from,
+                    target: (x: targetX, y: targetY),
+                    waypoints: segPath,
+                    algorithm: segAlgorithm,
+                    routeWaypoints: routeWPs,
+                    occupancyGrid: self.occupancyGrid,
+                    cameraTransform: TelemetryService.shared.lastCameraTransform
+                )
+                
+                segmentPaths.append(segPath)
+                // Append to full path (skip first point of subsequent segments to avoid duplication)
+                if i == 0 {
+                    fullPath.append(contentsOf: segPath)
+                } else if segPath.count > 1 {
+                    fullPath.append(contentsOf: segPath.dropFirst())
+                }
+            }
+            
+            // Densify full path for AR mesh
+            var densePath: [(x: Float, y: Float)] = []
+            let spacing: Float = 0.05
+            for i in 0..<fullPath.count {
+                let pt = fullPath[i]
+                densePath.append(pt)
+                if i < fullPath.count - 1 {
+                    let next = fullPath[i + 1]
+                    let dx = next.x - pt.x
+                    let dy = next.y - pt.y
+                    let dist = sqrt(dx * dx + dy * dy)
+                    let steps = Int(dist / spacing)
+                    guard steps > 1 else { continue }
+                    for s in 1..<steps {
+                        let t = Float(s) / Float(steps)
+                        densePath.append((x: pt.x + dx * t, y: pt.y + dy * t))
+                    }
+                }
+            }
+            
+            let floorY = self.meshProcessor.floorHeight
+            let points3D = densePath.map { pt in
+                simd_float3(pt.x, floorY + 0.02, pt.y)
+            }
+            let pathMesh = self.createPathMesh(from: points3D, width: 0.05)
+            
+            DispatchQueue.main.async { [weak self] in
+                guard let self = self else { return }
+                self.gridMapView.routePreviewPaths = segmentPaths
+                self.gridMapView.plannedPath = fullPath
+                self.gridMapView.setNeedsDisplay()
+                
+                // Update AR path mesh
+                self.pathAnchor?.removeFromParent()
+                self.pathAnchor = nil
+                
+                if let mesh = pathMesh {
+                    var material = UnlitMaterial()
+                    material.color = .init(tint: UIColor(red: 0.0, green: 0.9, blue: 0.3, alpha: 0.9))
+                    let entity = ModelEntity(mesh: mesh, materials: [material])
+                    let anchor = AnchorEntity(world: .zero)
+                    anchor.addChild(entity)
+                    self.arView.scene.addAnchor(anchor)
+                    self.pathAnchor = anchor
+                }
+                
+                print("[Route] Preview planned: \(segmentPaths.count) segments, \(fullPath.count) total waypoints")
+            }
+        }
+    }
+    
+    
+    /// Start navigating the multi-point route from the beginning
+    private func startRoute() {
+        let waypoints = gridMapView.routeWaypoints
+        guard !waypoints.isEmpty else {
+            print("[Route] No waypoints to navigate")
+            return
+        }
+        
+        currentRouteWaypointIndex = 0
+        isRouteActive = true
+        isRoutePaused = false
+        gridMapView.activeRouteWaypointIndex = 0
+        gridMapView.setNeedsDisplay()
+        
+        print("[Route] Starting route with \(waypoints.count) waypoints")
+        navigateToCurrentRouteWaypoint()
+    }
+    
+    /// Pause the current route (stops the robot but remembers position in route)
+    private func pauseRoute() {
+        guard isRouteActive else { return }
+        isRouteActive = false
+        isRoutePaused = true
+        pathNavigator.stopNavigation()
+        
+        // Keep visual state but stop driving
+        gridMapView.setNeedsDisplay()
+        updateNavigateButtonForRouteState()
+        
+        print("[Route] Route paused at waypoint #\(currentRouteWaypointIndex + 1)")
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "pause_route", success: true,
+            message: "Route paused at waypoint #\(currentRouteWaypointIndex + 1)"
+        )
+    }
+    
+    /// Resume a paused route from where it left off
+    private func resumeRoute() {
+        guard isRoutePaused, !gridMapView.routeWaypoints.isEmpty else { return }
+        isRouteActive = true
+        isRoutePaused = false
+        
+        print("[Route] Resuming route from waypoint #\(currentRouteWaypointIndex + 1)")
+        navigateToCurrentRouteWaypoint()
+        
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "run_route", success: true,
+            message: "Route resumed from waypoint #\(currentRouteWaypointIndex + 1)",
+            waypointCount: gridMapView.routeWaypoints.count
+        )
+    }
+    
+    /// Stop and clear the route entirely
+    private func stopRoute() {
+        pathNavigator.stopNavigation()
+        isRouteActive = false
+        isRoutePaused = false
+        currentRouteWaypointIndex = 0
+        gridMapView.pathTargetPoint = nil
+        plannedPath.removeAll()
+        gridMapView.plannedPath = []
+        gridMapView.routePreviewPaths = []
+        pathAnchor?.removeFromParent()
+        pathAnchor = nil
+        gridMapView.setNeedsDisplay()
+        updateNavigateButtonForRouteState()
+    }
+    
+    /// Clear all route waypoints
+    private func clearRoute() {
+        stopRoute()
+        gridMapView.clearRouteWaypoints()
+        updateNavigateButtonForRouteState()
+        
+        print("[Route] Route cleared")
+        TelemetryService.shared.logNavCommandAck(
+            cmd: "clear_route", success: true,
+            message: "Route cleared"
+        )
+    }
+    
+    /// Navigate to the current waypoint in the route
+    private func navigateToCurrentRouteWaypoint() {
+        let waypoints = gridMapView.routeWaypoints
+        guard currentRouteWaypointIndex < waypoints.count else {
+            // All waypoints reached!
+            isRouteActive = false
+            isRoutePaused = false
+            print("[Route] ✅ All \(waypoints.count) waypoints reached!")
+            updateNavigateButtonForRouteState()
+            return
+        }
+        
+        let wp = waypoints[currentRouteWaypointIndex]
+        gridMapView.activeRouteWaypointIndex = currentRouteWaypointIndex
+        gridMapView.setNeedsDisplay()
+        
+        print("[Route] Navigating to waypoint #\(currentRouteWaypointIndex + 1)/\(waypoints.count) at (\(String(format: "%.2f", wp.x)), \(String(format: "%.2f", wp.y)))")
+        
+        // Plan path to this waypoint
+        planPath(toX: wp.x, toY: wp.y, reason: "route_waypoint")
+    }
+    
+    /// Called when the robot arrives at a waypoint — advance to next
+    private func onRouteWaypointArrived() {
+        currentRouteWaypointIndex += 1
+        gridMapView.activeRouteWaypointIndex = currentRouteWaypointIndex
+        gridMapView.setNeedsDisplay()
+        
+        if currentRouteWaypointIndex < gridMapView.routeWaypoints.count {
+            // Brief pause then navigate to next waypoint
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self, self.isRouteActive else { return }
+                self.navigateToCurrentRouteWaypoint()
+            }
+        } else {
+            // Route complete
+            isRouteActive = false
+            isRoutePaused = false
+            print("[Route] ✅ Route complete!")
+            updateNavigateButtonForRouteState()
+        }
+    }
+    
+    /// Update the navigate button state for route mode
+    private func updateNavigateButtonForRouteState() {
+        if isRouteActive {
+            navigateButton.setTitle("Stop Route", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
+            navigateButton.isHidden = false
+        } else if isRoutePaused {
+            navigateButton.setTitle("Resume Route", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.2, green: 0.7, blue: 1.0, alpha: 0.9)
+            navigateButton.isHidden = false
+        } else if !gridMapView.routeWaypoints.isEmpty {
+            navigateButton.setTitle("Run Route (\(gridMapView.routeWaypoints.count))", for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+            navigateButton.isHidden = false
+        } else {
+            navigateButton.isHidden = true
         }
     }
     
@@ -576,13 +1378,7 @@ class LiDARViewController: UIViewController {
     
     @objc private func handleServerStopNavigation() {
         let wasNavigating = pathNavigator.state == .navigating || pathNavigator.state == .paused
-        pathNavigator.stopNavigation()
-        gridMapView.pathTargetPoint = nil
-        plannedPath.removeAll()
-        gridMapView.plannedPath = []
-        pathAnchor?.removeFromParent()
-        pathAnchor = nil
-        gridMapView.setNeedsDisplay()
+        stopRoute()
         
         TelemetryService.shared.logNavCommandAck(
             cmd: "stop_navigation", success: true,
@@ -590,7 +1386,75 @@ class LiDARViewController: UIViewController {
         )
     }
     
+    @objc private func handleServerAddRoutePoint(_ notification: Notification) {
+        guard let info = notification.userInfo,
+              let x = info["x"] as? Float,
+              let y = info["y"] as? Float else {
+            TelemetryService.shared.logNavCommandAck(cmd: "add_route_point", success: false, message: "Invalid parameters")
+            return
+        }
+        addRouteWaypoint(x: x, y: y)
+    }
+    
+    @objc private func handleServerRunRoute() {
+        let waypoints = gridMapView.routeWaypoints
+        guard !waypoints.isEmpty else {
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "run_route", success: false,
+                message: "No route waypoints — send add_route_point first"
+            )
+            return
+        }
+        
+        if isRoutePaused {
+            resumeRoute()
+        } else {
+            startRoute()
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "run_route", success: true,
+                message: "Route started with \(waypoints.count) waypoints",
+                waypointCount: waypoints.count
+            )
+        }
+    }
+    
+    @objc private func handleServerPauseRoute() {
+        guard isRouteActive else {
+            TelemetryService.shared.logNavCommandAck(
+                cmd: "pause_route", success: false,
+                message: "No active route to pause"
+            )
+            return
+        }
+        pauseRoute()
+    }
+    
+    @objc private func handleServerClearRoute() {
+        clearRoute()
+    }
+    
     private func updateNavigateButtonForState(_ state: NavigationState) {
+        // If a route is active, use route-specific button states
+        if isRouteActive || isRoutePaused || !gridMapView.routeWaypoints.isEmpty {
+            updateNavigateButtonForRouteState()
+            // Override with nav-specific states if actively navigating within a route
+            if isRouteActive {
+                switch state {
+                case .navigating:
+                    navigateButton.setTitle("Stop Route (\(currentRouteWaypointIndex + 1)/\(gridMapView.routeWaypoints.count))", for: .normal)
+                    navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
+                    navigateButton.isHidden = false
+                case .paused:
+                    navigateButton.setTitle("Stop Route (paused)", for: .normal)
+                    navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.6, blue: 0.1, alpha: 0.9)
+                    navigateButton.isHidden = false
+                default:
+                    break
+                }
+            }
+            return
+        }
+        
         switch state {
         case .idle:
             if gridMapView.pathTargetPoint != nil && !plannedPath.isEmpty {
@@ -623,6 +1487,14 @@ class LiDARViewController: UIViewController {
                 self?.pathAnchor = nil
                 self?.gridMapView.setNeedsDisplay()
             }
+            
+        case .following:
+            navigateButton.isHidden = true
+            updateFollowButtonAppearance(isFollowing: true)
+            
+        case .followPaused:
+            navigateButton.isHidden = true
+            updateFollowButtonAppearance(isFollowing: true)
         }
     }
     
@@ -697,12 +1569,24 @@ class LiDARViewController: UIViewController {
             pathNavigator.stopNavigation()
         }
         
+        // If the target is inside an obstacle (occupied cell), snap it to the
+        // nearest free point. Leave unknown-territory targets as-is so the
+        // greedy pathfinder can route through unmapped areas.
+        var targetX = toX
+        var targetY = toY
+        if occupancyGrid.getStateAtWorld(x: toX, y: toY) == .occupied {
+            if let freePoint = occupancyGrid.nearestFreeWorldPoint(x: toX, y: toY) {
+                targetX = freePoint.x
+                targetY = freePoint.y
+            }
+        }
+        
         let devicePos = occupancyGrid.devicePosition
         let startX = devicePos.x
         let startY = devicePos.y
         
         // Set target point immediately for visual feedback
-        gridMapView.pathTargetPoint = (x: toX, y: toY)
+        gridMapView.pathTargetPoint = (x: targetX, y: targetY)
         gridMapView.plannedPath = []
         gridMapView.setNeedsDisplay()
         
@@ -724,8 +1608,8 @@ class LiDARViewController: UIViewController {
             }
             
             // Run both pathfinders: strict (free-only) and greedy (allows unknown)
-            let strictPath = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: toX, toY: toY)
-            let greedyPath = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: toX, toY: toY)
+            let strictPath = self.occupancyGrid.findPath(fromX: startX, fromY: startY, toX: targetX, toY: targetY)
+            let greedyPath = self.occupancyGrid.findPathGreedy(fromX: startX, fromY: startY, toX: targetX, toY: targetY)
             
             // Pick the best path:
             //  - If only one succeeded, use it
@@ -760,7 +1644,7 @@ class LiDARViewController: UIViewController {
             // Log route to telemetry (use cached transform to avoid retaining ARFrame)
             if !path.isEmpty {
                 TelemetryService.shared.logRoutePlanned(
-                    target: (x: toX, y: toY),
+                    target: (x: targetX, y: targetY),
                     origin: (x: startX, y: startY),
                     waypoints: path,
                     algorithm: algorithm,
@@ -851,6 +1735,12 @@ class LiDARViewController: UIViewController {
                             target: Vec2(x: toX, y: toY),
                             waypointCount: path.count
                         )
+                    }
+                    
+                    // Auto-start navigation if this is a route waypoint
+                    if reason == "route_waypoint" && self.isRouteActive {
+                        let target = (x: toX, y: toY)
+                        self.pathNavigator.startNavigation(to: target, path: path)
                     }
                 }
             }
@@ -1029,6 +1919,334 @@ class LiDARViewController: UIViewController {
             obstacleDetector.floorHeightEstimated = meshProcessor.floorInitialized
             // Update depth-based proximity detection (catches dynamic objects like hands)
             obstacleDetector.updateDepth(frame: frame)
+            // Always-on person detection with ReID (~10-15 Hz, every 2 frames)
+            if frameCount % 2 == 0 && !personDetectionInFlight && personTracker.state == .idle {
+                personDetectionInFlight = true
+                let pixelBuffer = frame.capturedImage
+                let capturedFrame = frame
+                let tracker = self.personTracker
+                let knownEmbeddings = self.knownPersonEmbeddings
+                let threshold = self.alwaysOnReidThreshold
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let request = VNDetectHumanRectanglesRequest()
+                    request.revision = VNDetectHumanRectanglesRequestRevision2
+                    let handPoseRequest = VNDetectHumanHandPoseRequest()
+                    handPoseRequest.maximumHandCount = 6
+                    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+                    try? handler.perform([request, handPoseRequest])
+                    let observations = (request.results as? [VNHumanObservation]) ?? []
+                    let handResults = handPoseRequest.results ?? []
+                    
+                    // Extract hand joint data for overlay (before gesture classification)
+                    let handJoints: [HandJointData] = handResults.compactMap {
+                        HandJointOverlayView.extractJoints(from: $0)
+                    }
+                    
+                    // Generate embeddings and match against known people
+                    var boxes: [PersonBoxInfo] = []
+                    var updatedEmbeddings = knownEmbeddings
+                    var matchedKnownIDs = Set<UUID>()
+                    
+                    for obs in observations {
+                        let embedding = tracker.generateEmbedding(pixelBuffer: pixelBuffer, boundingBox: obs.boundingBox)
+                        
+                        // Try to match against known embeddings
+                        var bestMatch: (id: UUID, sim: Float)?
+                        if let embed = embedding {
+                            for (knownID, knownEmbed) in knownEmbeddings where !matchedKnownIDs.contains(knownID) {
+                                let sim = tracker.cosineSimilarity(embed, knownEmbed)
+                                if sim > threshold && (bestMatch == nil || sim > bestMatch!.sim) {
+                                    bestMatch = (knownID, sim)
+                                }
+                            }
+                        }
+                        
+                        let personID: UUID
+                        if let match = bestMatch {
+                            personID = match.id
+                            matchedKnownIDs.insert(match.id)
+                            // Update embedding with latest
+                            if let embed = embedding {
+                                updatedEmbeddings[personID] = embed
+                            }
+                        } else {
+                            // New person
+                            personID = UUID()
+                            if let embed = embedding {
+                                updatedEmbeddings[personID] = embed
+                            }
+                        }
+                        
+                        boxes.append(PersonBoxInfo(
+                            id: personID,
+                            boundingBox: obs.boundingBox,
+                            isActive: false,
+                            isGesturing: false,
+                            label: String(personID.uuidString.prefix(4)),
+                            worldPosition: tracker.projectToWorld(boundingBox: obs.boundingBox, frame: capturedFrame)
+                        ))
+                    }
+                    
+                    // Detect gestures and match to people
+                    var peaceHands: [(wrist: CGPoint, hand: VNHumanHandPoseObservation)] = []
+                    var fistHands: [CGPoint] = []
+                    var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
+                    
+                    for hand in handResults {
+                        if let wrist = tracker.detectPeaceSign(hand: hand) {
+                            peaceHands.append((wrist, hand))
+                        } else if let wrist = tracker.detectClosedHand(hand: hand) {
+                            fistHands.append(wrist)
+                        }
+                        if let info = tracker.detectIndexPointer(hand: hand) {
+                            pointerHands.append(info)
+                        }
+                    }
+                    
+                    // Mark peace-sign gesturing people (hand must be raised — upper 40% of bbox)
+                    var gesturedIDs = Set<UUID>()
+                    for (wrist, _) in peaceHands {
+                        for i in boxes.indices {
+                            let expandedBBox = boxes[i].boundingBox.insetBy(dx: -0.08, dy: -0.08)
+                            guard expandedBBox.contains(wrist) else { continue }
+                            let bbox = boxes[i].boundingBox
+                            let upperThreshold = bbox.origin.y + bbox.size.height * 0.2
+                            guard wrist.y >= upperThreshold else { continue }
+                            gesturedIDs.insert(boxes[i].id)
+                            boxes[i] = PersonBoxInfo(
+                                id: boxes[i].id,
+                                boundingBox: boxes[i].boundingBox,
+                                isActive: false,
+                                isGesturing: true,
+                                label: boxes[i].label,
+                                worldPosition: boxes[i].worldPosition
+                            )
+                            break
+                        }
+                    }
+                    
+                    // Collect fist person IDs (hand must be raised — upper 40% of bbox)
+                    var fistIDs = Set<UUID>()
+                    for wrist in fistHands {
+                        for box in boxes {
+                            let expandedBBox = box.boundingBox.insetBy(dx: -0.08, dy: -0.08)
+                            guard expandedBBox.contains(wrist) else { continue }
+                            let upperThreshold = box.boundingBox.origin.y + box.boundingBox.size.height * 0.2
+                            guard wrist.y >= upperThreshold else { continue }
+                            fistIDs.insert(box.id)
+                            break
+                        }
+                    }
+                    
+                    // Prune embeddings for people not seen (keep for a few cycles via main thread)
+                    let seenIDs = Set(boxes.map { $0.id })
+                    
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        self.alwaysOnPersonBoxes = boxes
+                        self.knownPersonEmbeddings = updatedEmbeddings.filter { seenIDs.contains($0.key) || knownEmbeddings.keys.contains($0.key) }
+                        self.personDetectionInFlight = false
+                        
+                        // Update hand joint overlay
+                        self.handJointOverlay.hands = handJoints
+                        self.handJointOverlay.setNeedsDisplay()
+                        
+                        let now = Date()
+                        let timeout = self.alwaysOnGestureTimeout
+                        
+                        // --- Activation gesture state machine: peace → fist → peace ---
+                        for personID in gesturedIDs {
+                            let phase = self.alwaysOnActivatePhase[personID] ?? .idle
+                            let phaseTime = self.alwaysOnActivateTimestamp[personID] ?? .distantPast
+                            let elapsed = now.timeIntervalSince(phaseTime)
+                            
+                            switch phase {
+                            case .idle:
+                                self.alwaysOnActivatePhase[personID] = .peaceOpen1
+                                self.alwaysOnActivateTimestamp[personID] = now
+                            case .peaceOpen1:
+                                break // still holding peace — wait for fist
+                            case .peaceClosed1:
+                                if elapsed < timeout {
+                                    // Second peace sign detected — activate!
+                                    self.alwaysOnActivatePhase.removeAll()
+                                    self.alwaysOnActivateTimestamp.removeAll()
+                                    if let embed = self.knownPersonEmbeddings[personID],
+                                       let box = boxes.first(where: { $0.id == personID }) {
+                                        self.startFollowModeForPerson(id: personID, embedding: embed, boundingBox: box.boundingBox, worldPosition: box.worldPosition)
+                                    }
+                                    return
+                                } else {
+                                    // Timeout — restart
+                                    self.alwaysOnActivatePhase[personID] = .peaceOpen1
+                                    self.alwaysOnActivateTimestamp[personID] = now
+                                }
+                            case .peaceOpen2:
+                                break
+                            }
+                        }
+                        
+                        // Transition peaceOpen1 → peaceClosed1 for fist detections
+                        for personID in fistIDs {
+                            let phase = self.alwaysOnActivatePhase[personID] ?? .idle
+                            let phaseTime = self.alwaysOnActivateTimestamp[personID] ?? .distantPast
+                            let elapsed = now.timeIntervalSince(phaseTime)
+                            
+                            if phase == .peaceOpen1 && elapsed < timeout {
+                                self.alwaysOnActivatePhase[personID] = .peaceClosed1
+                                self.alwaysOnActivateTimestamp[personID] = now
+                            }
+                        }
+                        
+                        // Prune stale activate phases
+                        for (pid, ts) in self.alwaysOnActivateTimestamp {
+                            if now.timeIntervalSince(ts) > timeout {
+                                self.alwaysOnActivatePhase.removeValue(forKey: pid)
+                                self.alwaysOnActivateTimestamp.removeValue(forKey: pid)
+                            }
+                        }
+                        
+                        // --- Cancel gesture state machine: finger wag (one full sweep) ---
+                        if let (_, tipX) = pointerHands.first {
+                            let elapsed = now.timeIntervalSince(self.alwaysOnCancelTimestamp)
+                            if elapsed > timeout {
+                                self.alwaysOnCancelPhase = .idle
+                                self.alwaysOnCancelLastWristX = nil
+                            }
+                            
+                            if let lastX = self.alwaysOnCancelLastWristX {
+                                let delta = tipX - lastX
+                                let minDelta = self.alwaysOnWagMinDelta
+                                
+                                switch self.alwaysOnCancelPhase {
+                                case .idle:
+                                    if abs(delta) > minDelta {
+                                        self.alwaysOnCancelPhase = delta > 0 ? .movedRight1 : .movedLeft1
+                                        self.alwaysOnCancelTimestamp = now
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedRight1:
+                                    if delta < -minDelta {
+                                        self.alwaysOnCancelPhase = .idle
+                                        self.alwaysOnCancelLastWristX = nil
+                                        self.stopFollowMode()
+                                    } else if delta > minDelta {
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedLeft1:
+                                    if delta > minDelta {
+                                        self.alwaysOnCancelPhase = .idle
+                                        self.alwaysOnCancelLastWristX = nil
+                                        self.stopFollowMode()
+                                    } else if delta < -minDelta {
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedRight2, .movedLeft2:
+                                    break
+                                }
+                            } else {
+                                self.alwaysOnCancelLastWristX = tipX
+                                self.alwaysOnCancelTimestamp = now
+                            }
+                        }
+                    }
+                }
+            }
+            // Cancel gesture detection during follow mode (~10-15 Hz, hand-only, lightweight)
+            if frameCount % 2 == 0 && personTracker.state != .idle {
+                let pixelBuffer = frame.capturedImage
+                let tracker = self.personTracker
+                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+                    let handPoseRequest = VNDetectHumanHandPoseRequest()
+                    handPoseRequest.maximumHandCount = 2
+                    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
+                    try? handler.perform([handPoseRequest])
+                    let handResults = handPoseRequest.results ?? []
+                    
+                    // Extract hand joint data for overlay
+                    let handJoints: [HandJointData] = handResults.compactMap {
+                        HandJointOverlayView.extractJoints(from: $0)
+                    }
+                    
+                    var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
+                    for hand in handResults {
+                        if let info = tracker.detectIndexPointer(hand: hand) {
+                            pointerHands.append(info)
+                        }
+                    }
+                    
+                    guard !pointerHands.isEmpty || !handJoints.isEmpty else { return }
+                    
+                    DispatchQueue.main.async {
+                        guard let self = self else { return }
+                        
+                        // Update hand joint overlay during follow mode
+                        self.handJointOverlay.hands = handJoints
+                        self.handJointOverlay.setNeedsDisplay()
+                        
+                        guard !pointerHands.isEmpty else { return }
+                        let now = Date()
+                        let timeout = self.alwaysOnGestureTimeout
+                        
+                        if let (_, tipX) = pointerHands.first {
+                            let elapsed = now.timeIntervalSince(self.alwaysOnCancelTimestamp)
+                            if elapsed > timeout {
+                                self.alwaysOnCancelPhase = .idle
+                                self.alwaysOnCancelLastWristX = nil
+                            }
+                            
+                            if let lastX = self.alwaysOnCancelLastWristX {
+                                let delta = tipX - lastX
+                                let minDelta = self.alwaysOnWagMinDelta
+                                
+                                switch self.alwaysOnCancelPhase {
+                                case .idle:
+                                    if abs(delta) > minDelta {
+                                        self.alwaysOnCancelPhase = delta > 0 ? .movedRight1 : .movedLeft1
+                                        self.alwaysOnCancelTimestamp = now
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedRight1:
+                                    if delta < -minDelta {
+                                        self.alwaysOnCancelPhase = .idle
+                                        self.alwaysOnCancelLastWristX = nil
+                                        self.stopFollowMode()
+                                    } else if delta > minDelta {
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedLeft1:
+                                    if delta > minDelta {
+                                        self.alwaysOnCancelPhase = .idle
+                                        self.alwaysOnCancelLastWristX = nil
+                                        self.stopFollowMode()
+                                    } else if delta < -minDelta {
+                                        self.alwaysOnCancelLastWristX = tipX
+                                    }
+                                case .movedRight2, .movedLeft2:
+                                    break
+                                }
+                            } else {
+                                self.alwaysOnCancelLastWristX = tipX
+                                self.alwaysOnCancelTimestamp = now
+                            }
+                        }
+                    }
+                }
+            }
+            // Update person tracker for follow mode (every frame)
+            if personTracker.state != .idle {
+                personTracker.update(frame: frame)
+                // Emit person tracking telemetry at ~2 Hz (every 10 frames at ~20fps)
+                if frameCount % 10 == 0 {
+                    let event = personTracker.state == .scanning ? "scan_update" : "tracking_update"
+                    TelemetryService.shared.logPersonTracking(
+                        event: event,
+                        message: "\(personTracker.detectedPeople.count) people, state=\(personTracker.state.rawValue)",
+                        occupancyGrid: self.occupancyGrid,
+                        cameraTransform: cameraTransform
+                    )
+                }
+            }
             // Collect 3D obstacle points for white dot overlay every 2 frames
             if frameCount % 2 == 0 {
                 obstaclePoints3D = obstacleDetector.collectObstaclePoints3D(frame: frame)
@@ -1065,6 +2283,56 @@ class LiDARViewController: UIViewController {
             }
             obstaclePointOverlay.projectedPoints = projected
             obstaclePointOverlay.setNeedsDisplay()
+
+            // Update person bounding box overlay
+            if personTracker.state != .idle {
+                // Use PersonTracker's rich data (stable IDs, gestures, active person)
+                let activeID = personTracker.activePersonID
+                let boxes: [PersonBoxInfo] = personTracker.detectedPeople.map { p in
+                    PersonBoxInfo(
+                        id: p.id,
+                        boundingBox: p.boundingBox,
+                        isActive: p.id == activeID,
+                        isGesturing: p.isGesturing,
+                        label: String(p.id.uuidString.prefix(4)),
+                        worldPosition: p.worldPosition
+                    )
+                }
+                // If tracking a single person, include the tracked bbox too
+                if let activeID = activeID,
+                   let trackedBox = personTracker.trackedBoundingBox,
+                   !boxes.contains(where: { $0.id == activeID }) {
+                    var allBoxes = boxes
+                    allBoxes.append(PersonBoxInfo(
+                        id: activeID,
+                        boundingBox: trackedBox,
+                        isActive: true,
+                        isGesturing: false,
+                        label: String(activeID.uuidString.prefix(4)),
+                        worldPosition: personTracker.trackedWorldPosition
+                    ))
+                    personBoundingBoxOverlay.people = allBoxes
+                } else {
+                    personBoundingBoxOverlay.people = boxes
+                }
+                personBoundingBoxOverlay.setNeedsDisplay()
+                // Feed positions to 2D grid
+                gridMapView.personPositions = personBoundingBoxOverlay.people
+                gridMapView.setNeedsDisplay()
+            } else if !alwaysOnPersonBoxes.isEmpty {
+                // Idle mode — use ReID-matched results (stable IDs & colors)
+                personBoundingBoxOverlay.people = alwaysOnPersonBoxes
+                personBoundingBoxOverlay.setNeedsDisplay()
+                gridMapView.personPositions = alwaysOnPersonBoxes
+                gridMapView.setNeedsDisplay()
+            } else if !personBoundingBoxOverlay.people.isEmpty {
+                personBoundingBoxOverlay.people = []
+                personBoundingBoxOverlay.setNeedsDisplay()
+                handJointOverlay.hands = []
+                handJointOverlay.setNeedsDisplay()
+                gridMapView.personPositions = []
+                gridMapView.setNeedsDisplay()
+            }
         }
         
         // Update labels every 3 frames (~10Hz at 30fps)
@@ -1097,47 +2365,40 @@ class LiDARViewController: UIViewController {
         if !isReplanning, pathNavigator.needsReplan, let target = pathNavigator.targetPoint {
             isReplanning = true
             let pos = occupancyGrid.devicePosition
+            // Snap target to nearest free point only if the map has updated
+            // and the original target is now inside an obstacle (occupied cell).
+            // Leave unknown-territory targets as-is for greedy pathfinder.
+            var adjustedTarget = target
+            if occupancyGrid.getStateAtWorld(x: target.x, y: target.y) == .occupied {
+                if let freePoint = occupancyGrid.nearestFreeWorldPoint(x: target.x, y: target.y) {
+                    adjustedTarget = freePoint
+                }
+            }
             // Capture camera transform now — do NOT access currentFrame from background thread
             let capturedTransform = cameraTransform
             DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                 guard let self = self else { return }
                 let replanStart = CFAbsoluteTimeGetCurrent()
                 
-                // Helper: total Euclidean length of a path in meters
-                func pathLength(_ p: [(x: Float, y: Float)]) -> Float {
-                    var total: Float = 0
-                    for i in 1..<p.count {
-                        let dx = p[i].x - p[i-1].x
-                        let dy = p[i].y - p[i-1].y
-                        total += sqrtf(dx * dx + dy * dy)
-                    }
-                    return total
-                }
-                
-                // Run both pathfinders and pick the better one
-                let strictPath = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
-                let greedyPath = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: target.x, toY: target.y)
+                // Run both pathfinders and pick the better one.
+                // During re-planning (robot already moving), strongly prefer
+                // the strict (free-cells-only) path to stay on known floor.
+                // Only use greedy if strict finds nothing.
+                let strictPath = self.occupancyGrid.findPath(fromX: pos.x, fromY: pos.y, toX: adjustedTarget.x, toY: adjustedTarget.y)
                 
                 let path: [(x: Float, y: Float)]
                 let algorithm: String
-                if strictPath.isEmpty && greedyPath.isEmpty {
-                    path = []
-                    algorithm = "none"
-                } else if strictPath.isEmpty {
-                    path = greedyPath
-                    algorithm = "greedy"
-                } else if greedyPath.isEmpty {
+                if !strictPath.isEmpty {
                     path = strictPath
                     algorithm = "astar"
                 } else {
-                    let strictLen = pathLength(strictPath)
-                    let greedyLen = pathLength(greedyPath)
-                    if greedyLen < strictLen * 0.75 {
+                    let greedyPath = self.occupancyGrid.findPathGreedy(fromX: pos.x, fromY: pos.y, toX: adjustedTarget.x, toY: adjustedTarget.y)
+                    if !greedyPath.isEmpty {
                         path = greedyPath
-                        algorithm = "greedy_shorter"
+                        algorithm = "greedy_fallback"
                     } else {
-                        path = strictPath
-                        algorithm = "astar"
+                        path = []
+                        algorithm = "none"
                     }
                 }
                 let replanDurationMs = Float((CFAbsoluteTimeGetCurrent() - replanStart) * 1000)
@@ -1145,7 +2406,7 @@ class LiDARViewController: UIViewController {
                 if !path.isEmpty {
                     // Log replan to telemetry
                     TelemetryService.shared.logRoutePlanned(
-                        target: (x: target.x, y: target.y),
+                        target: (x: adjustedTarget.x, y: adjustedTarget.y),
                         origin: (x: pos.x, y: pos.y),
                         waypoints: path,
                         algorithm: algorithm,
@@ -1158,7 +2419,13 @@ class LiDARViewController: UIViewController {
                 
                 DispatchQueue.main.async {
                     self.isReplanning = false
-                    guard !path.isEmpty else { return }
+                    guard !path.isEmpty else {
+                        // Replan failed (no path found) — clear the awaiting
+                        // flag so obstacle checks resume and the robot can
+                        // try escape maneuvers instead of waiting forever.
+                        self.pathNavigator.clearAwaitingReplan()
+                        return
+                    }
                     self.plannedPath = path
                     self.gridMapView.plannedPath = path
                     self.gridMapView.setNeedsDisplay()
@@ -1166,6 +2433,13 @@ class LiDARViewController: UIViewController {
                     self.pathNavigator.updatePath(path)
                 }
             }
+        }
+        
+        // Follow-mode re-planning: continuously update path as person moves
+        if !isFollowReplanning, pathNavigator.isFollowMode, pathNavigator.needsFollowReplan,
+           let personPos = personTracker.trackedWorldPosition,
+           personTracker.state == .tracking {
+            planFollowPath(toX: personPos.x, toY: personPos.y)
         }
     }
     
@@ -1190,6 +2464,10 @@ extension LiDARViewController: ARSessionDelegate {
         
         for anchor in anchors {
             guard let meshAnchor = anchor as? ARMeshAnchor else { continue }
+            
+            // Skip anchors that existed before the last grid reset —
+            // their world-space data is stale.
+            guard !preResetAnchorIds.contains(anchor.identifier) else { continue }
             
             // Check if geometry changed
             let geometry = meshAnchor.geometry
@@ -1216,6 +2494,11 @@ extension LiDARViewController: ARSessionDelegate {
     func session(_ session: ARSession, didRemove anchors: [ARAnchor]) {
         for anchor in anchors {
             processedMeshVersions.removeValue(forKey: anchor.identifier)
+            preResetAnchorIds.remove(anchor.identifier)
+            // Clear grid cells that belonged to this anchor
+            if anchor is ARMeshAnchor {
+                occupancyGrid.removeAnchorData(anchor.identifier)
+            }
         }
     }
     

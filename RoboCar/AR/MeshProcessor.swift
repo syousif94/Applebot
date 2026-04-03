@@ -15,6 +15,7 @@ struct ExtractedMeshData {
     let transform: simd_float4x4
     let generation: Int  // Generation counter to detect stale data after reset
     let updateId: UInt64 // ID to ensure newer meshes overwrite older ones
+    let anchorId: UUID   // Anchor identity for per-anchor cell tracking
 }
 
 /// Processes ARMeshAnchor data and updates the occupancy grid
@@ -137,7 +138,7 @@ class MeshProcessor {
             classifications.append(vertexClassifications[i])
         }
         
-        return ExtractedMeshData(vertices: vertices, classifications: classifications, transform: anchor.transform, generation: currentGeneration(), updateId: updateId)
+        return ExtractedMeshData(vertices: vertices, classifications: classifications, transform: anchor.transform, generation: currentGeneration(), updateId: updateId, anchorId: anchor.identifier)
     }
     
     // MARK: - Processing (can be called on background thread)
@@ -197,13 +198,13 @@ class MeshProcessor {
             }
         }
         
-        // Batch update the grid - floor first, then obstacles on top
-        if !floorPoints.isEmpty {
-            grid.markFreeBatchWithClassification(floorPoints, updateId: meshData.updateId)
-        }
-        if !obstaclePoints.isEmpty {
-            grid.markOccupiedBatchWithClassification(obstaclePoints, updateId: meshData.updateId)
-        }
+        // Atomically clear old cells for this anchor and write new data
+        grid.replaceAnchorData(
+            anchorId: meshData.anchorId,
+            obstaclePoints: obstaclePoints,
+            floorPoints: floorPoints,
+            updateId: meshData.updateId
+        )
     }
     
     /// Process a mesh anchor and update the occupancy grid (legacy - retains anchor)

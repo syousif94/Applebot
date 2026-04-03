@@ -47,15 +47,19 @@ class ObstacleDetector {
     
     /// Protective radius in meters — any obstacle within this distance triggers a full stop.
     /// Must exceed the car's half-width (17.5cm for a 35cm car) to stop before contact.
-    var stopRadius: Float = 0.25  // 25cm
+    var stopRadius: Float = 0.15  // 15cm
     
     /// Detection radius for the LiDAR depth map (meters) — wider than stopRadius
     /// to catch dynamic obstacles early and allow evasive steering
     var depthDetectionRadius: Float = 0.40  // 40cm
     
-    /// "Slow zone" outer radius — obstacles between stopRadius and this distance
+    /// Distance ahead along the travel corridor that triggers a stop (meters).
+    /// Only obstacles within a car-width corridor at this distance trigger avoidance.
+    var corridorStopDistance: Float = 0.20  // 20cm
+    
+    /// "Slow zone" outer radius — obstacles between corridorStopDistance and this distance
     /// cause the car to reduce speed rather than full-stop.
-    var slowZoneRadius: Float = 0.40  // 40cm
+    var slowZoneRadius: Float = 0.30  // 30cm
     
     /// Whether obstacle avoidance is enabled
     var isEnabled: Bool = true
@@ -71,6 +75,15 @@ class ObstacleDetector {
     
     /// Maximum height above floor for a valid depth obstacle (meters)
     var ceilingFilterHeight: Float = 1.8  // ignore ceiling and above
+    
+    // MARK: - Person Exclusion
+    
+    /// World position of the tracked person to exclude from obstacle detection.
+    /// Set by LiDARViewController when follow mode is active.
+    var excludedPersonPosition: simd_float2? = nil
+    
+    /// Radius around the excluded person to ignore obstacles (meters).
+    var excludedPersonRadius: Float = 0.5
     
     // MARK: - State
     
@@ -266,15 +279,29 @@ class ObstacleDetector {
             let geometry = meshAnchor.geometry
             let vertexSource = geometry.vertices
             let vertexCount = vertexSource.count
-            let vBuffer = vertexSource.buffer.contents()
             let vStride = vertexSource.stride
             let vOffset = vertexSource.offset
             
             let faces = geometry.faces
             let faceCount = faces.count
-            let fBuffer = faces.buffer.contents()
             let bytesPerIndex = faces.bytesPerIndex
             let indicesPerFace = faces.indexCountPerPrimitive  // 3 for triangles
+            
+            // Validate buffer sizes before accessing raw pointers — ARKit's Metal-backed
+            // buffers can be recycled mid-frame under heavy load, causing EXC_BAD_ACCESS.
+            let vBufferLength = vertexSource.buffer.length
+            let fBufferLength = faces.buffer.length
+            let requiredVertexBytes = vOffset + vStride * max(vertexCount - 1, 0) + MemoryLayout<simd_float3>.size
+            let requiredFaceBytes = bytesPerIndex * indicesPerFace * faceCount
+            guard vertexCount > 0,
+                  faceCount > 0,
+                  vBufferLength >= requiredVertexBytes,
+                  fBufferLength >= requiredFaceBytes else {
+                continue
+            }
+            
+            let vBuffer = vertexSource.buffer.contents()
+            let fBuffer = faces.buffer.contents()
             
             let rot = rotationMatrix(transform)
             
@@ -285,14 +312,19 @@ class ObstacleDetector {
             for fi in 0..<faceCount {
                 // Read vertex indices for this face
                 var idx = [Int](repeating: 0, count: indicesPerFace)
+                var indicesValid = true
                 for j in 0..<indicesPerFace {
-                    let ptr = fBuffer.advanced(by: (fi * indicesPerFace + j) * bytesPerIndex)
+                    let byteOffset = (fi * indicesPerFace + j) * bytesPerIndex
+                    guard byteOffset + bytesPerIndex <= fBufferLength else { indicesValid = false; break }
+                    let ptr = fBuffer.advanced(by: byteOffset)
                     if bytesPerIndex == 4 {
-                        idx[j] = Int(ptr.assumingMemoryBound(to: Int32.self).pointee)
+                        idx[j] = Int(ptr.assumingMemoryBound(to: UInt32.self).pointee)
                     } else {
-                        idx[j] = Int(ptr.assumingMemoryBound(to: Int16.self).pointee)
+                        idx[j] = Int(ptr.assumingMemoryBound(to: UInt16.self).pointee)
                     }
+                    guard idx[j] >= 0 && idx[j] < vertexCount else { indicesValid = false; break }
                 }
+                guard indicesValid else { continue }
                 
                 // Read local vertices
                 func localVertex(_ i: Int) -> simd_float3 {
@@ -429,7 +461,20 @@ class ObstacleDetector {
         
         // Also check depth-based detection for dynamic obstacles
         let hasGridObstacles = !realObstacles.isEmpty
-        let hasDepthObstacle = depthObstacleDistance != nil && depthObstacleDistance! < stopRadius
+        let hasDepthObstacle: Bool
+        if let depthDist = depthObstacleDistance, depthDist < stopRadius {
+            // If in follow mode, check if the depth obstacle is the excluded person
+            if let excludedPos = excludedPersonPosition, let depthWorldPos = depthObstacleWorldPosition {
+                let dx = depthWorldPos.x - excludedPos.x
+                let dy = depthWorldPos.y - excludedPos.y
+                let distToExcluded = sqrtf(dx * dx + dy * dy)
+                hasDepthObstacle = distToExcluded > excludedPersonRadius
+            } else {
+                hasDepthObstacle = true
+            }
+        } else {
+            hasDepthObstacle = false
+        }
         
         guard hasGridObstacles || hasDepthObstacle else {
             if obstacleDetected {
@@ -599,7 +644,7 @@ class ObstacleDetector {
     
     /// Half-width of the car in meters. Obstacles within this lateral distance
     /// of the travel line are considered "in the path".
-    var carHalfWidth: Float = 0.15  // 15cm each side → 30cm total
+    var carHalfWidth: Float = 0.10  // 10cm each side → 20cm total
     
     /// Checks if any detected obstacle lies within a rectangular corridor
     /// defined by a world-space heading from the device position.
@@ -668,10 +713,12 @@ class ObstacleDetector {
         
         // 3. Scan the occupancy grid directly along the corridor.
         //    Walk forward in grid-cell steps sampling cells across the car width.
+        //    Start scanning 2 cells ahead to skip noisy cells at the robot's
+        //    own footprint (avoids false positives from walls right beside us).
         let cellSize = grid.cellSize
         let stepSize = cellSize  // step forward one cell at a time
         let lateralSteps = Int(carHalfWidth / cellSize) + 1
-        var d: Float = cellSize  // start one cell ahead (skip cell we're standing on)
+        var d: Float = cellSize * 2  // start 2 cells ahead — skip cells at our own position
         while d <= maxDist {
             for latStep in -lateralSteps...lateralSteps {
                 let sampleX = pos.x + fwdX * d + rightX * (Float(latStep) * cellSize)
@@ -694,13 +741,17 @@ class ObstacleDetector {
     }
     
     /// Finds the world-space heading closest to `preferred` that has a clear
-    /// path corridor (no obstacles within car width). Alternates scanning
-    /// right and left from the preferred heading.
-    /// Returns nil if all directions are blocked.
-    func findClearHeading(preferred: Float, searchStep: Float = 15.0 * .pi / 180.0) -> Float? {
+    /// path corridor (no obstacles within car width).
+    /// `currentHeading` is the device's current heading — used to determine
+    /// which spin direction avoids sweeping through obstacles.
+    /// Returns `(heading, spinSign)` where spinSign is +1 (right/CW) or -1 (left/CCW),
+    /// or nil if all directions are blocked.
+    func findClearHeading(preferred: Float, currentHeading: Float? = nil, searchStep: Float = 15.0 * .pi / 180.0) -> (heading: Float, spinSign: Float)? {
         // First check if the preferred heading itself is clear
         if !hasObstacleInPath(heading: preferred) {
-            return preferred
+            // Determine spin direction: prefer spinning away from the obstacle
+            let spinSign = bestSpinDirection(from: currentHeading ?? preferred, to: preferred)
+            return (preferred, spinSign)
         }
         
         // Search alternating right and left in increasing offsets
@@ -712,20 +763,51 @@ class ObstacleDetector {
             var rightHeading = preferred + offset
             if rightHeading >  .pi { rightHeading -= 2 * .pi }
             if rightHeading < -.pi { rightHeading += 2 * .pi }
-            if !hasObstacleInPath(heading: rightHeading) {
-                return rightHeading
-            }
+            let rightClear = !hasObstacleInPath(heading: rightHeading)
             
             // Try left (-offset)
             var leftHeading = preferred - offset
             if leftHeading >  .pi { leftHeading -= 2 * .pi }
             if leftHeading < -.pi { leftHeading += 2 * .pi }
-            if !hasObstacleInPath(heading: leftHeading) {
-                return leftHeading
+            let leftClear = !hasObstacleInPath(heading: leftHeading)
+            
+            if rightClear && leftClear {
+                // Both clear — pick the one that spins away from obstacles
+                let sign = bestSpinDirection(from: currentHeading ?? preferred, to: preferred)
+                if sign > 0 {
+                    return (rightHeading, 1.0)
+                } else {
+                    return (leftHeading, -1.0)
+                }
+            } else if rightClear {
+                return (rightHeading, 1.0)
+            } else if leftClear {
+                return (leftHeading, -1.0)
             }
         }
         
         return nil  // completely surrounded
+    }
+    
+    /// Returns +1 to spin right (CW) or -1 to spin left (CCW), choosing the
+    /// direction that sweeps AWAY from the nearest obstacle.
+    func bestSpinDirection(from currentHeading: Float, to targetHeading: Float) -> Float {
+        guard let blockedDir = blockedWorldDirection else {
+            // No obstacle info — use shortest angular path
+            var diff = targetHeading - currentHeading
+            while diff >  .pi { diff -= 2 * .pi }
+            while diff < -.pi { diff += 2 * .pi }
+            return diff >= 0 ? 1.0 : -1.0
+        }
+        
+        // Obstacle heading relative to current
+        let obstacleHeading = atan2f(blockedDir.x, blockedDir.y)
+        var obstacleRelative = obstacleHeading - currentHeading
+        while obstacleRelative >  .pi { obstacleRelative -= 2 * .pi }
+        while obstacleRelative < -.pi { obstacleRelative += 2 * .pi }
+        
+        // Spin away from the obstacle: if obstacle is to our right, spin left
+        return obstacleRelative >= 0 ? -1.0 : 1.0
     }
     
     // MARK: - Motor Filtering
