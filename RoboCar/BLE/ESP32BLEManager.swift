@@ -39,7 +39,7 @@ class ESP32BLEManager: NSObject {
     
     // MARK: - UUIDs
     
-    static let serviceUUID    = CBUUID(string: "E3910010-4567-4321-ABCD-ABCDEF012345")
+    static let serviceUUID    = CBUUID(string: "E3910030-4567-4321-ABCD-ABCDEF012345")
     static let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
     static let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
     static let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")

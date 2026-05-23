@@ -157,7 +157,7 @@ class PathNavigator {
     private var wasSpinning: Bool = false
     
     /// Maximum time to spin in place before triggering an escape (seconds)
-    private let maxSpinDuration: TimeInterval = 3.0
+    private let maxSpinDuration: TimeInterval = 5.0
     
     /// Pulse-spin state machine: alternates between a short motor burst and
     /// a coast/stop gap so the heading can settle before re-checking.
@@ -262,6 +262,32 @@ class PathNavigator {
     /// Last position we planned a follow path to
     private var lastFollowPlanPosition: (x: Float, y: Float)?
     
+    // MARK: - Bearing Drift Correction
+    
+    /// Heading from the previous tick, used to detect sudden bearing changes
+    private var prevTickHeading: Float?
+    
+    /// Whether enhanced bearing correction is active (after knockoff detected)
+    private var isBearingCorrecting: Bool = false
+    
+    /// When the bearing correction mode started
+    private var bearingCorrectionStart: Date?
+    
+    /// How long the enhanced correction mode lasts (seconds)
+    private let bearingCorrectionDuration: TimeInterval = 2.0
+    
+    /// A heading change larger than this per tick indicates external force (radians).
+    /// At 10 Hz, even aggressive spinning produces ~10°/tick. 15° per tick exceeds
+    /// that and almost certainly means the robot was bumped.
+    private let bearingKnockoffThreshold: Float = .pi / 12.0  // 15°
+    
+    /// Last known position of the followed person (persists after track is lost)
+    private(set) var lastKnownPersonPosition: (x: Float, y: Float)?
+    
+    /// Whether we're actively turning toward the person's last known position
+    /// after losing them (follow mode only)
+    private(set) var isTurningToLastKnown: Bool = false
+    
     /// Callbacks
     var onStateChanged: ((NavigationState) -> Void)?
     var onPathUpdated: ((_ path: [(x: Float, y: Float)]) -> Void)?
@@ -305,6 +331,10 @@ class PathNavigator {
         spinPhase = .burst
         spinPhaseStart = nil
         lastResumeTime = Date()  // grace period for the initial path
+        prevTickHeading = nil
+        isBearingCorrecting = false
+        bearingCorrectionStart = nil
+        isTurningToLastKnown = false
         state = .navigating
         
         log("🧭 Navigation started — \(path.count) waypoints to (\(String(format: "%.2f", target.x)), \(String(format: "%.2f", target.y)))")
@@ -349,6 +379,11 @@ class PathNavigator {
         isFollowMode = false
         followPersonPosition = nil
         lastFollowPlanPosition = nil
+        prevTickHeading = nil
+        isBearingCorrecting = false
+        bearingCorrectionStart = nil
+        lastKnownPersonPosition = nil
+        isTurningToLastKnown = false
         
         if state != .idle {
             ESP32BLEManager.shared.stopAll()
@@ -376,6 +411,13 @@ class PathNavigator {
     /// Update the followed person's world position. Called continuously by LiDARViewController.
     func updateFollowTarget(x: Float, y: Float) {
         followPersonPosition = (x, y)
+        lastKnownPersonPosition = (x, y)
+        
+        // Person is visible again — cancel turn-to-last-known mode
+        if isTurningToLastKnown {
+            isTurningToLastKnown = false
+            log("👤 Person reacquired — resuming normal follow")
+        }
         
         // Also update targetPoint so the existing tick() navigation logic works
         // Compute a standoff point: the point `standoff` meters away from the person,
@@ -407,6 +449,38 @@ class PathNavigator {
         let dx = personPos.x - lastPlan.x
         let dy = personPos.y - lastPlan.y
         return sqrtf(dx * dx + dy * dy) >= followReplanThreshold
+    }
+    
+    // MARK: - Lost Person Recovery
+    
+    /// Called when the followed person is lost (tracker → .lost state).
+    /// Instead of stopping, the robot turns toward the person's last known
+    /// position to attempt visual reacquisition.
+    func handleFollowTargetLost() {
+        guard isFollowMode else { return }
+        guard let lastPos = lastKnownPersonPosition ?? followPersonPosition else {
+            log("⚠️ Person lost — no known position to turn toward")
+            return
+        }
+        
+        lastKnownPersonPosition = lastPos
+        isTurningToLastKnown = true
+        
+        // Update the target directly to the last known position (no standoff offset)
+        // so the robot faces exactly where the person was last seen.
+        targetPoint = lastPos
+        
+        // If idling near the person (followPaused), switch to following
+        // so the tick loop drives heading correction toward the last known position.
+        if state == .followPaused {
+            state = .following
+            onStateChanged?(.following)
+        }
+        
+        // Request a replan toward the last known position
+        lastReplanTime = .distantPast
+        
+        log("👤 Person lost — turning toward last known position (\(String(format: "%.2f", lastPos.x)), \(String(format: "%.2f", lastPos.y)))")
     }
     
     /// Update path for follow mode (called after a re-plan by LiDARViewController).
@@ -496,6 +570,33 @@ class PathNavigator {
         prevTickPos = (pos.x, pos.y)
         prevTickTime = now
         
+        // --- Bearing drift detection ---
+        // Detect sudden heading changes that suggest the robot was bumped
+        // by rough pavement or external force. Enable enhanced correction.
+        if let prevHeading = prevTickHeading,
+           !isReversing, !isSpinEscaping, !isForwardEscaping, !isSpinningToTarget {
+            var headingDelta = pos.heading - prevHeading
+            while headingDelta >  .pi { headingDelta -= 2 * .pi }
+            while headingDelta < -.pi { headingDelta += 2 * .pi }
+            
+            if fabsf(headingDelta) > bearingKnockoffThreshold {
+                if !isBearingCorrecting {
+                    isBearingCorrecting = true
+                    bearingCorrectionStart = Date()
+                    log("⚡ Bearing knocked off by \(String(format: "%.0f°", headingDelta * 180 / .pi)) — correcting")
+                }
+            }
+        }
+        prevTickHeading = pos.heading
+        
+        // Clear bearing correction mode after timeout
+        if isBearingCorrecting, let start = bearingCorrectionStart,
+           Date().timeIntervalSince(start) > bearingCorrectionDuration {
+            isBearingCorrecting = false
+            bearingCorrectionStart = nil
+            log("✅ Bearing correction complete")
+        }
+        
         guard let target = targetPoint else {
             stopNavigation()
             return
@@ -514,13 +615,33 @@ class PathNavigator {
                 let distToPerson = sqrtf(dxPerson * dxPerson + dyPerson * dyPerson)
                 
                 if distToPerson <= followStandoff {
-                    ESP32BLEManager.shared.stopAll()
-                    if state != .followPaused {
-                        state = .followPaused
-                        onStateChanged?(.followPaused)
-                        log("⏸️ Within standoff distance — idling")
+                    // If turning toward last known position (person lost), don't
+                    // idle — keep heading correction active so the robot faces the
+                    // last known direction for visual reacquisition.
+                    if isTurningToLastKnown {
+                        let headingToTarget = atan2f(dxPerson, dyPerson)
+                        var headingErr = headingToTarget - pos.heading
+                        while headingErr >  .pi { headingErr -= 2 * .pi }
+                        while headingErr < -.pi { headingErr += 2 * .pi }
+                        if fabsf(headingErr) < .pi / 18.0 {  // ~10° — facing the right way
+                            ESP32BLEManager.shared.stopAll()
+                            if state != .followPaused {
+                                state = .followPaused
+                                onStateChanged?(.followPaused)
+                                log("⏸️ Facing last known position — waiting for reacquisition")
+                            }
+                            return
+                        }
+                        // Fall through to let heading correction handle turning
+                    } else {
+                        ESP32BLEManager.shared.stopAll()
+                        if state != .followPaused {
+                            state = .followPaused
+                            onStateChanged?(.followPaused)
+                            log("⏸️ Within standoff distance — idling")
+                        }
+                        return
                     }
-                    return
                 } else if state == .followPaused {
                     state = .following
                     onStateChanged?(.following)
@@ -643,8 +764,10 @@ class PathNavigator {
         // so the spin always gets priority over obstacle avoidance.
         // Apply hysteresis: use the exit threshold if already spinning.
         // ---------------------------------------------------------------
-        let spinEnterThreshold: Float = .pi / 9.0   // 20° — start spinning
-        let spinExitThreshold:  Float = .pi / 18.0   // 10° — stop spinning
+        // When bearing correction is active (robot was knocked off course),
+        // use tighter thresholds so the robot spins sooner and corrects faster.
+        let spinEnterThreshold: Float = isBearingCorrecting ? .pi / 18.0 : .pi / 9.0   // 10° vs 20°
+        let spinExitThreshold:  Float = isBearingCorrecting ? .pi / 36.0 : .pi / 18.0  // 5° vs 10°
         let activeSpinThreshold = wasSpinning ? spinExitThreshold : spinEnterThreshold
         var headingErrorForCheck = targetHeading - pos.heading
         while headingErrorForCheck >  .pi { headingErrorForCheck -= 2 * .pi }
@@ -846,9 +969,10 @@ class PathNavigator {
                     wasSpinning = isSpinning
                     return
                 } else {
-                    // Apply spin power
-                    let minSpin: Float = 0.38
-                    let maxSpin: Float = 0.50
+                    // Apply spin power — use higher power during bearing correction
+                    // for a faster, more assertive recovery from knockoff.
+                    let minSpin: Float = isBearingCorrecting ? 0.55 : 0.50
+                    let maxSpin: Float = isBearingCorrecting ? 0.75 : 0.65
                     let errorFraction = min(absError / .pi, 1.0)
                     let spinPower = minSpin + (maxSpin - minSpin) * errorFraction
                     leftPower  =  turnSign * spinPower
@@ -874,7 +998,8 @@ class PathNavigator {
             // Reduce cruise speed proportionally when heading error is large to
             // avoid carrying too much speed into a turn.
             // Apply corridor slow factor when approaching obstacles ahead.
-            let turnGain: Float = 1.2
+            // Use higher turn gain during bearing correction for faster recovery.
+            let turnGain: Float = isBearingCorrecting ? 2.0 : 1.2
             let turn = max(-1.0, min(1.0, headingError * turnGain))
             let slowdownFactor: Float = 1.0 - 0.5 * (absError / sharpTurnThreshold)
             let basePower: Float = max(0.40, cruiseSpeed * max(0.5, slowdownFactor) * corridorSlowFactor)
@@ -1150,7 +1275,7 @@ class PathNavigator {
         spinEscapeStartTime = Date()
         spinEscapeSign = direction
         
-        let spinPower: Float = 0.45
+        let spinPower: Float = 0.55
         let left  = Int8(clamping: Int( direction * spinPower * 100))
         let right = Int8(clamping: Int(-direction * spinPower * 100))
         ESP32BLEManager.shared.setAllMotors(a: left, b: right, c: left, d: right)
@@ -1234,7 +1359,7 @@ class PathNavigator {
         
         // Spin in the predetermined direction (away from obstacle)
         let turnSign: Float = spinToTargetSign
-        let spinPower: Float = 0.45
+        let spinPower: Float = 0.55
         
         func clampPower(_ p: Float) -> Int8 {
             let clamped = max(-1.0, min(1.0, p))

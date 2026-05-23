@@ -26,7 +26,7 @@ class LiDARViewController: UIViewController {
     private var personBoundingBoxOverlay: PersonBoundingBoxOverlay!
     private var handJointOverlay: HandJointOverlayView!
     private var navigateButton: UIButton!
-    
+    private var clearWaypointsButton: UIButton!
     // MARK: - Voice Assistant
     
     private let voiceAssistant = VoiceAssistantManager.shared
@@ -533,11 +533,33 @@ class LiDARViewController: UIViewController {
         
         view.addSubview(navigateButton)
         
+        // Clear waypoints button
+        clearWaypointsButton = UIButton(type: .system)
+        clearWaypointsButton.translatesAutoresizingMaskIntoConstraints = false
+        clearWaypointsButton.setTitle("Clear", for: .normal)
+        clearWaypointsButton.setTitleColor(.white, for: .normal)
+        clearWaypointsButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
+        clearWaypointsButton.backgroundColor = UIColor(white: 0.3, alpha: 0.9)
+        clearWaypointsButton.layer.cornerRadius = 18
+        clearWaypointsButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        clearWaypointsButton.addTarget(self, action: #selector(clearWaypointsButtonTapped), for: .touchUpInside)
+        clearWaypointsButton.isHidden = true
+        
+        view.addSubview(clearWaypointsButton)
+        
         NSLayoutConstraint.activate([
             navigateButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             navigateButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
             navigateButton.heightAnchor.constraint(equalToConstant: 36),
+            
+            clearWaypointsButton.leadingAnchor.constraint(equalTo: navigateButton.trailingAnchor, constant: 8),
+            clearWaypointsButton.centerYAnchor.constraint(equalTo: navigateButton.centerYAnchor),
+            clearWaypointsButton.heightAnchor.constraint(equalToConstant: 36),
         ])
+    }
+    
+    @objc private func clearWaypointsButtonTapped() {
+        clearRoute()
     }
     
     private func setupFollowButton() {
@@ -660,9 +682,10 @@ class LiDARViewController: UIViewController {
                     self.voiceStatusLabel.textColor = .cyan
                     self.voiceStatusLabel.alpha = 1
                 case .lost:
-                    // Person lost — pause motors and announce
-                    ESP32BLEManager.shared.stopAll()
-                    self.voiceStatusLabel.text = "Lost tracked person"
+                    // Person lost — turn toward their last known position
+                    // instead of stopping, to attempt visual reacquisition.
+                    self.pathNavigator.handleFollowTargetLost()
+                    self.voiceStatusLabel.text = "Turning to last known position"
                     self.voiceStatusLabel.textColor = .orange
                     self.voiceStatusLabel.alpha = 1
                 case .tracking:
@@ -753,8 +776,10 @@ class LiDARViewController: UIViewController {
                     self.voiceStatusLabel.textColor = .cyan
                     self.voiceStatusLabel.alpha = 1
                 case .lost:
-                    ESP32BLEManager.shared.stopAll()
-                    self.voiceStatusLabel.text = "Lost tracked person"
+                    // Person lost — turn toward their last known position
+                    // instead of stopping, to attempt visual reacquisition.
+                    self.pathNavigator.handleFollowTargetLost()
+                    self.voiceStatusLabel.text = "Turning to last known position"
                     self.voiceStatusLabel.textColor = .orange
                     self.voiceStatusLabel.alpha = 1
                 case .tracking:
@@ -1318,16 +1343,20 @@ class LiDARViewController: UIViewController {
             navigateButton.setTitle("Stop Route", for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
             navigateButton.isHidden = false
+            clearWaypointsButton.isHidden = true
         } else if isRoutePaused {
             navigateButton.setTitle("Resume Route", for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.2, green: 0.7, blue: 1.0, alpha: 0.9)
             navigateButton.isHidden = false
+            clearWaypointsButton.isHidden = false
         } else if !gridMapView.routeWaypoints.isEmpty {
             navigateButton.setTitle("Run Route (\(gridMapView.routeWaypoints.count))", for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
             navigateButton.isHidden = false
+            clearWaypointsButton.isHidden = false
         } else {
             navigateButton.isHidden = true
+            clearWaypointsButton.isHidden = true
         }
     }
     
@@ -2254,7 +2283,7 @@ class LiDARViewController: UIViewController {
             // Extract mesh anchor geometry for telemetry at ~1 Hz
             if frameCount % 30 == 0 {
                 let gen = meshProcessor.currentGeneration()
-                meshAnchorSnapshots = meshAnchors.map { MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen) }
+                meshAnchorSnapshots = meshAnchors.compactMap { MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen) }
             }
             // frame is released here when autoreleasepool drains
             return true

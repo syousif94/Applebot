@@ -249,18 +249,38 @@ class MeshProcessor {
 
     /// Extract a telemetry-ready snapshot from an ARMeshAnchor.
     /// Call on the main thread while the anchor is still valid.
-    static func extractAnchorSnapshot(from anchor: ARMeshAnchor, generation: Int) -> MeshAnchorSnapshot {
+    /// Returns nil if the geometry buffers have been invalidated.
+    static func extractAnchorSnapshot(from anchor: ARMeshAnchor, generation: Int) -> MeshAnchorSnapshot? {
         let geometry = anchor.geometry
         let vertexSource = geometry.vertices
         let vertexCount = vertexSource.count
         let faceCount = geometry.faces.count
 
+        // Guard against empty or invalidated geometry
+        guard vertexCount > 0, faceCount > 0 else { return nil }
+
+        // Validate vertex buffer bounds before accessing raw memory.
+        // Use 3 * Float (12 bytes) not MemoryLayout<simd_float3>.size (16 — SIMD3 is padded).
+        let vStride = vertexSource.stride
+        let vOffset = vertexSource.offset
+        let vBufLength = vertexSource.buffer.length
+        let floatSize = 3 * MemoryLayout<Float>.size  // 12 bytes per vertex
+        let requiredVertexBytes = vOffset + vStride * max(vertexCount - 1, 0) + floatSize
+        guard vBufLength >= requiredVertexBytes else { return nil }
+
+        // Validate face/index buffer bounds
+        let facesElement = geometry.faces
+        let indicesPerPrimitive = facesElement.indexCountPerPrimitive
+        let bytesPerIndex = facesElement.bytesPerIndex
+        let fBufLength = facesElement.buffer.length
+        let totalIndices = faceCount * indicesPerPrimitive
+        let requiredFaceBytes = totalIndices * bytesPerIndex
+        guard fBufLength >= requiredFaceBytes else { return nil }
+
         // Vertices: flatten [x,y,z, x,y,z, ...] as Float array
         var floats: [Float] = []
         floats.reserveCapacity(vertexCount * 3)
         let vBuf = vertexSource.buffer.contents()
-        let vStride = vertexSource.stride
-        let vOffset = vertexSource.offset
         for i in 0..<vertexCount {
             let ptr = vBuf.advanced(by: vOffset + vStride * i)
             let v = ptr.assumingMemoryBound(to: simd_float3.self).pointee
@@ -271,13 +291,10 @@ class MeshProcessor {
         let verticesB64 = floatArrayToBase64(floats)
 
         // Indices: UInt32 triangle indices
-        let facesElement = geometry.faces
-        let indicesPerPrimitive = facesElement.indexCountPerPrimitive
-        let bytesPerIndex = facesElement.bytesPerIndex
         let fBuf = facesElement.buffer.contents()
         var indices: [UInt32] = []
-        indices.reserveCapacity(faceCount * indicesPerPrimitive)
-        for i in 0..<(faceCount * indicesPerPrimitive) {
+        indices.reserveCapacity(totalIndices)
+        for i in 0..<totalIndices {
             let ptr = fBuf.advanced(by: i * bytesPerIndex)
             if bytesPerIndex == 4 {
                 indices.append(UInt32(bitPattern: ptr.assumingMemoryBound(to: Int32.self).pointee))
@@ -294,8 +311,14 @@ class MeshProcessor {
             let cBuf = classSource.buffer.contents()
             let cStride = classSource.stride
             let cOffset = classSource.offset
-            for i in 0..<faceCount {
-                classValues.append(cBuf.advanced(by: cOffset + cStride * i).assumingMemoryBound(to: UInt8.self).pointee)
+            let cBufLength = classSource.buffer.length
+            let requiredClassBytes = cOffset + cStride * (faceCount - 1) + 1
+            if cBufLength >= requiredClassBytes {
+                for i in 0..<faceCount {
+                    classValues.append(cBuf.advanced(by: cOffset + cStride * i).assumingMemoryBound(to: UInt8.self).pointee)
+                }
+            } else {
+                classValues = Array(repeating: 0, count: faceCount)
             }
         } else {
             classValues = Array(repeating: 0, count: faceCount)
