@@ -148,23 +148,28 @@ struct StopMotorsTool: Tool {
     }
 }
 
-/// Tool that sets the steering servo angle
+/// Tool that moves an ST3215 servo
 struct SetServoTool: Tool {
     let name = "setServo"
-    let description = "Set the steering servo to a specific angle. 90 is center, 0 is full left, 180 is full right."
+    let description = "Move an ST3215 servo to a position. Use servo ID 1 unless the user names a different ID."
     
     @Generable
     struct Arguments {
+        @Guide(description: "Servo ID from 1 to 253.", .range(1...253))
+        var id: Int
+
         @Guide(description: "Servo angle from 0 to 180 degrees. 90 is center.", .range(0...180))
         var angle: Int
     }
     
     func call(arguments: Arguments) async throws -> String {
         let angle = UInt8(min(180, max(0, arguments.angle)))
+        let id = UInt8(min(253, max(1, arguments.id)))
+        let position = UInt16((Double(angle) / 180.0 * 4095.0).rounded())
         await MainActor.run {
-            ESP32BLEManager.shared.setServoAngle(angle)
+            ESP32BLEManager.shared.moveServo(id: id, position: position, speed: 1000)
         }
-        return "Servo set to \(angle) degrees."
+        return "Servo \(id) set to \(angle) degrees."
     }
 }
 

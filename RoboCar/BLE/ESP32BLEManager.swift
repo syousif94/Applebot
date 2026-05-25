@@ -34,17 +34,31 @@ enum ESP32ConnectionState {
     }
 }
 
+/// Last-read ST3215 servo telemetry frame.
+struct ServoState {
+    let id: UInt8
+    let error: UInt8
+    let position: UInt16
+    let load: UInt16
+    let voltage: UInt8
+    let temperature: UInt8
+
+    var isReadFailure: Bool { error == 0xFF }
+}
+
 /// Manages the BLE connection to the ESP32 Motor controller
 class ESP32BLEManager: NSObject {
     
     // MARK: - UUIDs
     
-    static let serviceUUID    = CBUUID(string: "E3910030-4567-4321-ABCD-ABCDEF012345")
-    static let servoAngleUUID = CBUUID(string: "E3910002-4567-4321-ABCD-ABCDEF012345")
+    static let serviceUUID    = CBUUID(string: "E3910040-4567-4321-ABCD-ABCDEF012345")
     static let motorsUUID     = CBUUID(string: "E3910003-4567-4321-ABCD-ABCDEF012345")
     static let wifiConfigUUID = CBUUID(string: "E3910004-4567-4321-ABCD-ABCDEF012345")
     static let motorCountUUID = CBUUID(string: "E3910005-4567-4321-ABCD-ABCDEF012345")
     static let batteryUUID    = CBUUID(string: "E3910006-4567-4321-ABCD-ABCDEF012345")
+    static let stListUUID     = CBUUID(string: "E3910011-4567-4321-ABCD-ABCDEF012345")
+    static let stCmdUUID      = CBUUID(string: "E3910012-4567-4321-ABCD-ABCDEF012345")
+    static let stStateUUID    = CBUUID(string: "E3910013-4567-4321-ABCD-ABCDEF012345")
     
     /// Expected device advertisement name
     static let deviceName = "ESP32 Motor"
@@ -64,6 +78,12 @@ class ESP32BLEManager: NSObject {
     
     /// Callback when battery data updates (percentage 0-100, voltage in volts)
     var onBatteryUpdated: ((UInt8, Double) -> Void)?
+
+    /// Callback when ST3215 servo IDs are discovered
+    var onServoListUpdated: (([UInt8]) -> Void)?
+
+    /// Callback when ST3215 servo state is refreshed
+    var onServoStateUpdated: ((ServoState) -> Void)?
     
     /// Latest battery percentage (0–100)
     private(set) var batteryPercentage: UInt8 = 0
@@ -79,11 +99,15 @@ class ESP32BLEManager: NSObject {
     private var centralManager: CBCentralManager!
     private var peripheral: CBPeripheral?
     
-    private var servoChar: CBCharacteristic?
     private var motorsChar: CBCharacteristic?
     private var wifiConfigChar: CBCharacteristic?
     private var motorCountChar: CBCharacteristic?
     private var batteryChar: CBCharacteristic?
+    private var stListChar: CBCharacteristic?
+    private var stCmdChar: CBCharacteristic?
+    private var stStateChar: CBCharacteristic?
+    private var shouldReadServoListAfterCommand = false
+    private var pendingServoStateReadIDs: [UInt8] = []
     
     /// Number of active motors reported by the ESP32 (2 or 4, default 4)
     private(set) var motorCount: Int = 4
@@ -199,13 +223,6 @@ class ESP32BLEManager: NSObject {
     
     // MARK: - Motor control
     
-    /// Set servo angle (0–180)
-    func setServoAngle(_ angle: UInt8) {
-        guard let char = servoChar, let p = peripheral else { return }
-        let clamped = min(angle, 180)
-        p.writeValue(Data([clamped]), for: char, type: .withResponse)
-    }
-    
     /// Set motor powers (sends 2 or 4 bytes depending on motorCount)
     /// Uses latest-value-wins: if a write is in flight, the new value
     /// replaces any pending value and is sent once the current write completes.
@@ -314,6 +331,67 @@ class ESP32BLEManager: NSObject {
     func stopAll() {
         setAllMotors(a: 0, b: 0, c: 0, d: 0)
     }
+
+    // MARK: - ST3215 servo control
+
+    func rescanServos(from: UInt8 = 1, to: UInt8 = 20) {
+        shouldReadServoListAfterCommand = true
+        writeServoCommand([0x06, from, to, 0, 0, 0])
+    }
+
+    func moveServo(id: UInt8, position: UInt16, speed: UInt16) {
+        let clampedPosition = min(position, 4095)
+        let clampedSpeed = min(speed, 4095)
+        writeServoCommand([
+            0x01,
+            id,
+            UInt8(clampedPosition & 0xFF),
+            UInt8(clampedPosition >> 8),
+            UInt8(clampedSpeed & 0xFF),
+            UInt8(clampedSpeed >> 8),
+        ])
+    }
+
+    func moveDiscoveredServos(position: UInt16, speed: UInt16, acceleration: UInt8 = 50) {
+        let clampedPosition = min(position, 4095)
+        let clampedSpeed = min(speed, 4095)
+        writeServoCommand([
+            0x07,
+            UInt8(clampedPosition & 0xFF),
+            UInt8(clampedPosition >> 8),
+            UInt8(clampedSpeed & 0xFF),
+            UInt8(clampedSpeed >> 8),
+            acceleration,
+        ])
+    }
+
+    func setServoTorque(id: UInt8, enabled: Bool) {
+        writeServoCommand([0x02, id, enabled ? 1 : 0, 0, 0, 0])
+    }
+
+    func changeServoID(currentID: UInt8, newID: UInt8) {
+        writeServoCommand([0x03, currentID, newID, 0, 0, 0])
+    }
+
+    func refreshServoState(id: UInt8) {
+        pendingServoStateReadIDs.append(id)
+        writeServoCommand([0x05, id, 0, 0, 0, 0])
+    }
+
+    func readServoList() {
+        guard let p = peripheral, let char = stListChar else { return }
+        p.readValue(for: char)
+    }
+
+    private func readServoState() {
+        guard let p = peripheral, let char = stStateChar else { return }
+        p.readValue(for: char)
+    }
+
+    private func writeServoCommand(_ bytes: [UInt8]) {
+        guard bytes.count == 6, let p = peripheral, let char = stCmdChar else { return }
+        p.writeValue(Data(bytes), for: char, type: .withResponse)
+    }
     
     // MARK: - WiFi config
     
@@ -388,11 +466,15 @@ class ESP32BLEManager: NSObject {
     }
     
     private func clearCharacteristics() {
-        servoChar = nil
         motorsChar = nil
         wifiConfigChar = nil
         motorCountChar = nil
         batteryChar = nil
+        stListChar = nil
+        stCmdChar = nil
+        stStateChar = nil
+        shouldReadServoListAfterCommand = false
+        pendingServoStateReadIDs.removeAll()
         motorCount = 4
         isMotorWriteInFlight = false
         pendingMotorData = nil
@@ -491,7 +573,6 @@ extension ESP32BLEManager: CBPeripheralDelegate {
         print("[BLE] Discovered characteristics: \(service.characteristics?.map { $0.uuid.uuidString } ?? [])")
         for char in service.characteristics ?? [] {
             switch char.uuid {
-            case Self.servoAngleUUID:  servoChar = char
             case Self.motorsUUID:     motorsChar = char
             case Self.wifiConfigUUID: wifiConfigChar = char
             case Self.motorCountUUID:
@@ -502,6 +583,13 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 batteryChar = char
                 // Read initial battery value
                 peripheral.readValue(for: char)
+            case Self.stListUUID:
+                stListChar = char
+                peripheral.readValue(for: char)
+            case Self.stCmdUUID:
+                stCmdChar = char
+            case Self.stStateUUID:
+                stStateChar = char
             default: break
             }
             // Enable notifications
@@ -509,7 +597,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 peripheral.setNotifyValue(true, for: char)
             }
         }
-        print("[BLE] Ready — servo: \(servoChar != nil), motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil), motorCount: \(motorCountChar != nil), battery: \(batteryChar != nil)")
+        print("[BLE] Ready — motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil), motorCount: \(motorCountChar != nil), battery: \(batteryChar != nil), stList: \(stListChar != nil), stCmd: \(stCmdChar != nil), stState: \(stStateChar != nil)")
         if batteryChar != nil {
             startBatteryPolling()
         }
@@ -534,10 +622,6 @@ extension ESP32BLEManager: CBPeripheralDelegate {
         case Self.motorsUUID:
             let powers = data.prefix(motorCount).map { Int8(bitPattern: $0) }
             print("[BLE] Motors notification: \(powers)")
-        case Self.servoAngleUUID:
-            if let byte = data.first {
-                print("[BLE] Servo angle notification: \(byte)")
-            }
         case Self.batteryUUID:
             if data.count >= 3 {
                 let pct = data[0]
@@ -548,6 +632,24 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 print("[BLE] Battery: \(pct)% \(volts)V")
                 onBatteryUpdated?(pct, volts)
             }
+        case Self.stListUUID:
+            let ids = data.prefix(16).filter { $0 != 0 }
+            print("[BLE] ST3215 IDs: \(Array(ids))")
+            onServoListUpdated?(Array(ids))
+        case Self.stStateUUID:
+            guard data.count >= 8 else { return }
+            let position = UInt16(data[2]) | (UInt16(data[3]) << 8)
+            let load = UInt16(data[4]) | (UInt16(data[5]) << 8)
+            let state = ServoState(
+                id: data[0],
+                error: data[1],
+                position: position,
+                load: load,
+                voltage: data[6],
+                temperature: data[7]
+            )
+            print("[BLE] ST3215 state: id=\(state.id) error=\(state.error) pos=\(state.position) load=\(state.load) voltage=\(state.voltage) temp=\(state.temperature)")
+            onServoStateUpdated?(state)
         default:
             break
         }
@@ -568,6 +670,23 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             } else {
                 print("[BLE] WiFi write success — credentials saved to ESP32")
                 onWifiWriteResult?(true)
+            }
+        } else if characteristic.uuid == Self.stCmdUUID {
+            if let error = error {
+                print("[BLE] ST command write error: \(error.localizedDescription)")
+                if !pendingServoStateReadIDs.isEmpty {
+                    pendingServoStateReadIDs.removeFirst()
+                }
+                shouldReadServoListAfterCommand = false
+                return
+            }
+            if shouldReadServoListAfterCommand {
+                shouldReadServoListAfterCommand = false
+                readServoList()
+            }
+            if !pendingServoStateReadIDs.isEmpty {
+                pendingServoStateReadIDs.removeFirst()
+                readServoState()
             }
         }
     }
