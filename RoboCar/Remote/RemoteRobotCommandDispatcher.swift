@@ -1,0 +1,68 @@
+//
+//  RemoteRobotCommandDispatcher.swift
+//  RoboCar
+//
+
+import Foundation
+
+enum RemoteRobotCommandDispatcher {
+    static func dispatch(_ message: RemoteMessage) {
+        DispatchQueue.main.async {
+            switch message.type {
+            case "drive":
+                if PathNavigator.shared.state != .idle {
+                    NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
+                }
+                ESP32BLEManager.shared.drive(x: message.x ?? 0, y: message.y ?? 0)
+
+            case "stopDrive":
+                ESP32BLEManager.shared.stopAll()
+
+            case "setNavTarget":
+                guard let x = message.x, let y = message.y else { return }
+                NotificationCenter.default.post(name: .serverSetNavTarget, object: nil, userInfo: ["x": x, "y": y])
+
+            case "addRoutePoint":
+                guard let x = message.x, let y = message.y else { return }
+                NotificationCenter.default.post(name: .serverAddRoutePoint, object: nil, userInfo: ["x": x, "y": y])
+
+            case "runRoute":
+                NotificationCenter.default.post(name: .serverRunRoute, object: nil)
+
+            case "pauseRoute":
+                NotificationCenter.default.post(name: .serverPauseRoute, object: nil)
+
+            case "clearRoute":
+                NotificationCenter.default.post(name: .serverClearRoute, object: nil)
+
+            case "startNavigation":
+                NotificationCenter.default.post(name: .serverStartNavigation, object: nil)
+
+            case "stopNavigation":
+                NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
+
+            case "scanServos":
+                ESP32BLEManager.shared.rescanServos(from: message.from ?? 1, to: message.to ?? 20)
+
+            case "moveServo":
+                guard let id = message.id, let position = message.position else { return }
+                ESP32BLEManager.shared.moveServo(id: id, position: position, speed: message.speed ?? 1000)
+
+            case "moveAllServos":
+                guard let position = message.position else { return }
+                ESP32BLEManager.shared.moveDiscoveredServos(position: position, speed: message.speed ?? 1000, acceleration: message.acceleration ?? 50)
+
+            case "setServoTorque":
+                guard let id = message.id, let enabled = message.enabled else { return }
+                ESP32BLEManager.shared.setServoTorque(id: id, enabled: enabled)
+
+            case "refreshServoState":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.refreshServoState(id: id)
+
+            default:
+                break
+            }
+        }
+    }
+}

@@ -150,8 +150,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
+				INFOPLIST_KEY_NSBonjourServices = "_robocar-remote._tcp";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses local network access for telemetry";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses the local network to discover nearby robot hosts and share remote control, camera preview, and map data.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoboCar uses the microphone for voice commands to control the car.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "RoboCar uses speech recognition to understand voice commands for driving the car.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -169,7 +170,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;
@@ -193,8 +194,9 @@
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
+				INFOPLIST_KEY_NSBonjourServices = "_robocar-remote._tcp";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
-				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses local network access for telemetry";
+				INFOPLIST_KEY_NSLocalNetworkUsageDescription = "RoboCar uses the local network to discover nearby robot hosts and share remote control, camera preview, and map data.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "RoboCar uses the microphone for voice commands to control the car.";
 				INFOPLIST_KEY_NSSpeechRecognitionUsageDescription = "RoboCar uses speech recognition to understand voice commands for driving the car.";
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
@@ -212,7 +214,7 @@
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SUPPORTED_PLATFORMS = "iphoneos iphonesimulator";
-				SUPPORTS_MACCATALYST = NO;
+				SUPPORTS_MACCATALYST = YES;
 				SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SUPPORTS_XR_DESIGNED_FOR_IPHONE_IPAD = NO;
 				SWIFT_APPROACHABLE_CONCURRENCY = YES;

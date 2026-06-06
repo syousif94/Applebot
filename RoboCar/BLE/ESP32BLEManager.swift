@@ -84,6 +84,8 @@ class ESP32BLEManager: NSObject {
 
     /// Callback when ST3215 servo state is refreshed
     var onServoStateUpdated: ((ServoState) -> Void)?
+    private var servoListObservers: [UUID: ([UInt8]) -> Void] = [:]
+    private var servoStateObservers: [UUID: (ServoState) -> Void] = [:]
     
     /// Latest battery percentage (0–100)
     private(set) var batteryPercentage: UInt8 = 0
@@ -176,6 +178,25 @@ class ESP32BLEManager: NSObject {
             guard let self, self.connectionState == .scanning else { return }
             self.stopScanning()
         }
+    }
+
+    @discardableResult
+    func addServoListObserver(_ observer: @escaping ([UInt8]) -> Void) -> UUID {
+        let id = UUID()
+        servoListObservers[id] = observer
+        return id
+    }
+
+    @discardableResult
+    func addServoStateObserver(_ observer: @escaping (ServoState) -> Void) -> UUID {
+        let id = UUID()
+        servoStateObservers[id] = observer
+        return id
+    }
+
+    func removeServoObserver(_ id: UUID) {
+        servoListObservers.removeValue(forKey: id)
+        servoStateObservers.removeValue(forKey: id)
     }
     
     /// Stop scanning
@@ -636,6 +657,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             let ids = data.prefix(16).filter { $0 != 0 }
             print("[BLE] ST3215 IDs: \(Array(ids))")
             onServoListUpdated?(Array(ids))
+            servoListObservers.values.forEach { $0(Array(ids)) }
         case Self.stStateUUID:
             guard data.count >= 8 else { return }
             let position = UInt16(data[2]) | (UInt16(data[3]) << 8)
@@ -650,6 +672,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             )
             print("[BLE] ST3215 state: id=\(state.id) error=\(state.error) pos=\(state.position) load=\(state.load) voltage=\(state.voltage) temp=\(state.temperature)")
             onServoStateUpdated?(state)
+            servoStateObservers.values.forEach { $0(state) }
         default:
             break
         }

@@ -9,6 +9,7 @@ import UIKit
 import ARKit
 import RealityKit
 import Vision
+import CoreImage
 
 class LiDARViewController: UIViewController {
     
@@ -117,6 +118,12 @@ class LiDARViewController: UIViewController {
     
     /// Whether the route is paused (user-initiated pause, not obstacle pause)
     private var isRoutePaused = false
+
+    private let remoteCameraContext = CIContext()
+    private var lastRemoteCameraFrameTime = Date.distantPast
+    private var isRemoteSnapshotInFlight = false
+    private var remoteServoListObserverID: UUID?
+    private var remoteServoStateObserverID: UUID?
     
     // MARK: - Lifecycle
     
@@ -139,6 +146,7 @@ class LiDARViewController: UIViewController {
         setupMeshProcessor()
         setupObstacleDetector()
         setupNavigationController()
+        setupRemoteControlHost()
         
         // Use CADisplayLink for smooth updates
         displayLink = CADisplayLink(target: self, selector: #selector(updateFrame))
@@ -165,6 +173,7 @@ class LiDARViewController: UIViewController {
         UIApplication.shared.isIdleTimerDisabled = false
         arView.session.pause()
         displayLink?.invalidate()
+        RemoteControlHostService.shared.stop()
     }
     
     override var prefersStatusBarHidden: Bool { true }
@@ -215,6 +224,16 @@ class LiDARViewController: UIViewController {
             gridMapView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             gridMapView.bottomAnchor.constraint(equalTo: view.bottomAnchor)
         ])
+    }
+
+    private func setupRemoteControlHost() {
+        RemoteControlHostService.shared.start()
+        remoteServoListObserverID = ESP32BLEManager.shared.addServoListObserver { ids in
+            RemoteControlHostService.shared.broadcastServoIDs(ids)
+        }
+        remoteServoStateObserverID = ESP32BLEManager.shared.addServoStateObserver { state in
+            RemoteControlHostService.shared.broadcastServoState(state)
+        }
     }
     
     private func setupStatusLabels() {
@@ -1189,6 +1208,7 @@ class LiDARViewController: UIViewController {
             
             DispatchQueue.main.async { [weak self] in
                 guard let self = self else { return }
+                self.plannedPath = fullPath
                 self.gridMapView.routePreviewPaths = segmentPaths
                 self.gridMapView.plannedPath = fullPath
                 self.gridMapView.setNeedsDisplay()
@@ -2285,6 +2305,7 @@ class LiDARViewController: UIViewController {
                 let gen = meshProcessor.currentGeneration()
                 meshAnchorSnapshots = meshAnchors.compactMap { MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen) }
             }
+            streamRemoteCameraFrameIfNeeded()
             // frame is released here when autoreleasepool drains
             return true
         }
@@ -2376,6 +2397,17 @@ class LiDARViewController: UIViewController {
             // Telemetry: emit nav frame at ~10 Hz
             TelemetryService.shared.lastCameraTransform = cameraTransform
             TelemetryService.shared.tick(occupancyGrid: occupancyGrid, cameraTransform: cameraTransform)
+            RemoteControlHostService.shared.broadcastMapState(
+                occupancyGrid: occupancyGrid,
+                routeWaypoints: gridMapView.routeWaypoints,
+                plannedPath: plannedPath,
+                routePreviewPaths: gridMapView.routePreviewPaths,
+                activeRouteWaypointIndex: gridMapView.activeRouteWaypointIndex,
+                navState: remoteNavigationState
+            )
+            if frameCount % 6 == 0 {
+                RemoteControlHostService.shared.broadcastGridUpdate(occupancyGrid: occupancyGrid)
+            }
         }
         
         // Telemetry: emit mesh anchor geometry at ~1 Hz
@@ -2469,6 +2501,46 @@ class LiDARViewController: UIViewController {
            let personPos = personTracker.trackedWorldPosition,
            personTracker.state == .tracking {
             planFollowPath(toX: personPos.x, toY: personPos.y)
+        }
+    }
+
+    private var remoteNavigationState: String {
+        switch pathNavigator.state {
+        case .idle: return isRoutePaused ? "routePaused" : "idle"
+        case .navigating: return "navigating"
+        case .paused: return "paused"
+        case .arrived: return "arrived"
+        case .following: return "following"
+        case .followPaused: return "followPaused"
+        }
+    }
+
+    private func streamRemoteCameraFrameIfNeeded() {
+        guard RemoteControlHostService.shared.clientCount > 0 else { return }
+        guard !isRemoteSnapshotInFlight else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastRemoteCameraFrameTime) >= 0.15 else { return }
+        lastRemoteCameraFrameTime = now
+        isRemoteSnapshotInFlight = true
+
+        arView.snapshot(saveToHDR: false) { [weak self] image in
+            guard let self else { return }
+            defer { self.isRemoteSnapshotInFlight = false }
+            guard let image else { return }
+
+            let targetWidth: CGFloat = 640
+            let scale = targetWidth / max(image.size.width, 1)
+            let targetSize = CGSize(width: targetWidth, height: max(1, image.size.height * scale))
+            let renderer = UIGraphicsImageRenderer(size: targetSize)
+            let resizedImage = renderer.image { _ in
+                image.draw(in: CGRect(origin: .zero, size: targetSize))
+            }
+            guard let jpegData = resizedImage.jpegData(compressionQuality: 0.62) else { return }
+            RemoteControlHostService.shared.broadcastCameraFrame(
+                jpegData: jpegData,
+                width: Int(targetSize.width),
+                height: Int(targetSize.height)
+            )
         }
     }
     

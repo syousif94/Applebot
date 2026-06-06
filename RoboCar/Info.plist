@@ -7,6 +7,12 @@
 		<key>NSAllowsArbitraryLoads</key>
 		<true/>
 	</dict>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_robocar-remote._tcp</string>
+	</array>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>RoboCar uses the local network to discover nearby robot hosts and share remote control, camera preview, and map data.</string>
 	<key>UIApplicationSceneManifest</key>
 	<dict>
 		<key>UIApplicationSupportsMultipleScenes</key>

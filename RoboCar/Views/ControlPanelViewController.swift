@@ -16,6 +16,8 @@ class ControlPanelViewController: UIViewController {
     private let contentView = UIView()
     private let grabber = UIView()
     private let titleLabel = UILabel()
+    private let switchModeButton = UIButton(type: .system)
+    private let closeButton = UIButton(type: .system)
     private let statusDot = UIView()
     private let statusLabel = UILabel()
     private let connectButton = UIButton(type: .system)
@@ -78,6 +80,15 @@ class ControlPanelViewController: UIViewController {
     private let telemetryStatusLabel = UILabel()
     
     private let ble = ESP32BLEManager.shared
+
+    override var canBecomeFirstResponder: Bool { true }
+
+    override var keyCommands: [UIKeyCommand]? {
+        [
+            UIKeyCommand(input: UIKeyCommand.inputEscape, modifierFlags: [], action: #selector(dismissPanelTapped)),
+            UIKeyCommand(input: "w", modifierFlags: .command, action: #selector(dismissPanelTapped))
+        ]
+    }
     
     // MARK: - Lifecycle
     
@@ -122,6 +133,11 @@ class ControlPanelViewController: UIViewController {
         telemetryStatusDot.layer.cornerRadius = telemetryStatusDot.bounds.width / 2
         batteryBar.layer.cornerRadius = 4
         batteryBarFill.layer.cornerRadius = 3
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
     }
     
     // MARK: - Setup
@@ -172,11 +188,85 @@ class ControlPanelViewController: UIViewController {
         titleLabel.font = .systemFont(ofSize: 18, weight: .bold)
         titleLabel.textColor = .white
         contentView.addSubview(titleLabel)
+
+        configureIconGlassButton(switchModeButton, systemImageName: "ipad.and.iphone")
+        switchModeButton.addTarget(self, action: #selector(switchToRemoteTapped), for: .touchUpInside)
+        contentView.addSubview(switchModeButton)
+
+        configureIconGlassButton(closeButton, systemImageName: "xmark.circle.fill")
+        closeButton.addTarget(self, action: #selector(dismissPanelTapped), for: .touchUpInside)
+        contentView.addSubview(closeButton)
         
         NSLayoutConstraint.activate([
             titleLabel.topAnchor.constraint(equalTo: grabber.bottomAnchor, constant: 16),
-            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20)
+            titleLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: switchModeButton.leadingAnchor, constant: -12),
+
+            switchModeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            switchModeButton.trailingAnchor.constraint(equalTo: closeButton.leadingAnchor, constant: -8),
+            switchModeButton.widthAnchor.constraint(equalToConstant: 44),
+            switchModeButton.heightAnchor.constraint(equalToConstant: 36),
+
+            closeButton.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor),
+            closeButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            closeButton.widthAnchor.constraint(equalToConstant: 44),
+            closeButton.heightAnchor.constraint(equalToConstant: 36)
         ])
+    }
+
+    @objc private func switchToRemoteTapped() {
+        requestAppRoleSwitch(.controller)
+    }
+
+    @objc private func dismissPanelTapped() {
+        view.endEditing(true)
+        dismiss(animated: true)
+    }
+
+    private func configureGlassButton(_ button: UIButton, title: String, systemImageName: String) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+
+        var configuration = UIButton.Configuration.plain()
+        configuration.title = title
+        configuration.image = UIImage(systemName: systemImageName)
+        configuration.imagePadding = 6
+        configuration.baseForegroundColor = .white
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 12, bottom: 8, trailing: 12)
+        button.configuration = configuration
+        button.titleLabel?.numberOfLines = 1
+        button.titleLabel?.lineBreakMode = .byTruncatingTail
+        button.titleLabel?.adjustsFontSizeToFitWidth = true
+        button.titleLabel?.minimumScaleFactor = 0.78
+
+        button.tintColor = .white
+        button.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        button.layer.cornerRadius = 12
+        button.layer.borderWidth = 1
+        button.layer.borderColor = UIColor.white.withAlphaComponent(0.28).cgColor
+        button.layer.shadowColor = UIColor.black.cgColor
+        button.layer.shadowOpacity = 0.25
+        button.layer.shadowRadius = 12
+        button.layer.shadowOffset = CGSize(width: 0, height: 4)
+    }
+
+    private func configureIconGlassButton(_ button: UIButton, systemImageName: String) {
+        button.translatesAutoresizingMaskIntoConstraints = false
+
+        var configuration = UIButton.Configuration.plain()
+        configuration.image = UIImage(systemName: systemImageName)
+        configuration.baseForegroundColor = .white
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 10, bottom: 8, trailing: 10)
+        button.configuration = configuration
+
+        button.tintColor = .white
+        button.backgroundColor = UIColor.white.withAlphaComponent(0.16)
+        button.layer.cornerRadius = 12
+        button.layer.borderWidth = 1
+        button.layer.borderColor = UIColor.white.withAlphaComponent(0.28).cgColor
+        button.layer.shadowColor = UIColor.black.cgColor
+        button.layer.shadowOpacity = 0.25
+        button.layer.shadowRadius = 12
+        button.layer.shadowOffset = CGSize(width: 0, height: 4)
     }
     
     private func setupConnectionRow() {
@@ -193,13 +283,7 @@ class ControlPanelViewController: UIViewController {
         contentView.addSubview(statusLabel)
         
         // Connect button
-        connectButton.translatesAutoresizingMaskIntoConstraints = false
-        connectButton.setTitle("Connect", for: .normal)
-        connectButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        connectButton.setTitleColor(.white, for: .normal)
-        connectButton.backgroundColor = UIColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 1)
-        connectButton.layer.cornerRadius = 8
-        connectButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 20, bottom: 8, right: 20)
+        configureGlassButton(connectButton, title: "Connect", systemImageName: "antenna.radiowaves.left.and.right")
         connectButton.addTarget(self, action: #selector(connectTapped), for: .touchUpInside)
         contentView.addSubview(connectButton)
         
@@ -1249,14 +1333,11 @@ class ControlPanelViewController: UIViewController {
         
         switch state {
         case .disconnected:
-            connectButton.setTitle("Connect", for: .normal)
-            connectButton.backgroundColor = UIColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 1)
+            configureGlassButton(connectButton, title: "Connect", systemImageName: "antenna.radiowaves.left.and.right")
         case .scanning, .connecting:
-            connectButton.setTitle("Cancel", for: .normal)
-            connectButton.backgroundColor = UIColor(red: 0.5, green: 0.5, blue: 0.5, alpha: 1)
+            configureGlassButton(connectButton, title: "Cancel", systemImageName: "xmark")
         case .connected:
-            connectButton.setTitle("Disconnect", for: .normal)
-            connectButton.backgroundColor = UIColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 1)
+            configureGlassButton(connectButton, title: "Disconnect", systemImageName: "antenna.radiowaves.left.and.right.slash")
         }
         
         // Enable/disable joystick visual feedback
