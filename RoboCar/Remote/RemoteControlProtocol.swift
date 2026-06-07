@@ -94,6 +94,11 @@ struct RemoteMessage: Codable {
     var speed: UInt16?
     var acceleration: UInt8?
     var enabled: Bool?
+    var signalType: String?
+    var sdp: String?
+    var candidate: String?
+    var sdpMid: String?
+    var sdpMLineIndex: Int32?
 
     init(type: String) {
         self.type = type

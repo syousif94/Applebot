@@ -6,6 +6,10 @@
 	objectVersion = 77;
 	objects = {
 
+/* Begin PBXBuildFile section */
+		532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 532AA3D42F09D00000B4C836 /* WebRTC */; };
+/* End PBXBuildFile section */
+
 /* Begin PBXFileReference section */
 		532AA3BB2F09C4CB00B4C836 /* RoboCar.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = RoboCar.app; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
@@ -36,6 +40,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -78,6 +83,7 @@
 			);
 			name = RoboCar;
 			packageProductDependencies = (
+				532AA3D42F09D00000B4C836 /* WebRTC */,
 			);
 			productName = RoboCar;
 			productReference = 532AA3BB2F09C4CB00B4C836 /* RoboCar.app */;
@@ -107,6 +113,9 @@
 			);
 			mainGroup = 532AA3B22F09C4CB00B4C836;
 			minimizedProjectReferenceProxies = 1;
+			packageReferences = (
+				532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */,
+			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 532AA3BC2F09C4CB00B4C836 /* Products */;
 			projectDirPath = "";
@@ -369,6 +378,25 @@
 			defaultConfigurationName = Release;
 		};
 /* End XCConfigurationList section */
+
+/* Begin XCRemoteSwiftPackageReference section */
+		532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/stasel/WebRTC.git";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 147.0.0;
+			};
+		};
+/* End XCRemoteSwiftPackageReference section */
+
+/* Begin XCSwiftPackageProductDependency section */
+		532AA3D42F09D00000B4C836 /* WebRTC */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */;
+			productName = WebRTC;
+		};
+/* End XCSwiftPackageProductDependency section */
 	};
 	rootObject = 532AA3B32F09C4CB00B4C836 /* Project object */;
 }

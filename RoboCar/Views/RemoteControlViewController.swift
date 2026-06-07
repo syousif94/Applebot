@@ -5,13 +5,15 @@
 
 import UIKit
 import Network
+import WebRTC
 
 final class RemoteControlViewController: UIViewController {
     private let client = RemoteControlClientService()
     private let browser = RemoteControlBrowser()
     private let remoteGrid = OccupancyGrid(cellSize: 0.05, gridRadius: 500)
 
-    private let cameraImageView = UIImageView()
+    private let cameraVideoView = RTCMTLVideoView()
+    private let videoFallbackImageView = UIImageView()
     private let mapView: GridMapView
     private let statusLabel = UILabel()
     private let runButton = UIButton(type: .system)
@@ -55,11 +57,18 @@ final class RemoteControlViewController: UIViewController {
     }
 
     private func setupUI() {
-        cameraImageView.translatesAutoresizingMaskIntoConstraints = false
-        cameraImageView.backgroundColor = UIColor(white: 0.06, alpha: 1)
-        cameraImageView.contentMode = .scaleAspectFill
-        cameraImageView.clipsToBounds = true
-        view.addSubview(cameraImageView)
+        cameraVideoView.translatesAutoresizingMaskIntoConstraints = false
+        cameraVideoView.backgroundColor = UIColor(white: 0.06, alpha: 1)
+        cameraVideoView.videoContentMode = .scaleAspectFill
+        cameraVideoView.clipsToBounds = true
+        view.addSubview(cameraVideoView)
+
+        videoFallbackImageView.translatesAutoresizingMaskIntoConstraints = false
+        videoFallbackImageView.backgroundColor = .clear
+        videoFallbackImageView.contentMode = .scaleAspectFill
+        videoFallbackImageView.clipsToBounds = true
+        videoFallbackImageView.isHidden = true
+        view.addSubview(videoFallbackImageView)
 
         mapView.translatesAutoresizingMaskIntoConstraints = false
         mapView.backgroundColor = UIColor(white: 0.1, alpha: 1)
@@ -115,27 +124,35 @@ final class RemoteControlViewController: UIViewController {
         ])
 
         compactContentConstraints = [
-            cameraImageView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
-            cameraImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            cameraImageView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            cameraImageView.heightAnchor.constraint(equalTo: view.heightAnchor, multiplier: 0.52),
+            cameraVideoView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
+            cameraVideoView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            cameraVideoView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            cameraVideoView.heightAnchor.constraint(equalTo: view.heightAnchor, multiplier: 0.52),
+            videoFallbackImageView.topAnchor.constraint(equalTo: cameraVideoView.topAnchor),
+            videoFallbackImageView.leadingAnchor.constraint(equalTo: cameraVideoView.leadingAnchor),
+            videoFallbackImageView.trailingAnchor.constraint(equalTo: cameraVideoView.trailingAnchor),
+            videoFallbackImageView.bottomAnchor.constraint(equalTo: cameraVideoView.bottomAnchor),
 
-            mapView.topAnchor.constraint(equalTo: cameraImageView.bottomAnchor),
+            mapView.topAnchor.constraint(equalTo: cameraVideoView.bottomAnchor),
             mapView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             mapView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             mapView.bottomAnchor.constraint(equalTo: runButton.topAnchor, constant: -12)
         ]
 
         wideContentConstraints = [
-            cameraImageView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
-            cameraImageView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
-            cameraImageView.bottomAnchor.constraint(equalTo: runButton.topAnchor, constant: -12),
-            cameraImageView.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.5),
+            cameraVideoView.topAnchor.constraint(equalTo: statusLabel.bottomAnchor, constant: 12),
+            cameraVideoView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            cameraVideoView.bottomAnchor.constraint(equalTo: runButton.topAnchor, constant: -12),
+            cameraVideoView.widthAnchor.constraint(equalTo: view.widthAnchor, multiplier: 0.5),
+            videoFallbackImageView.topAnchor.constraint(equalTo: cameraVideoView.topAnchor),
+            videoFallbackImageView.leadingAnchor.constraint(equalTo: cameraVideoView.leadingAnchor),
+            videoFallbackImageView.trailingAnchor.constraint(equalTo: cameraVideoView.trailingAnchor),
+            videoFallbackImageView.bottomAnchor.constraint(equalTo: cameraVideoView.bottomAnchor),
 
-            mapView.topAnchor.constraint(equalTo: cameraImageView.topAnchor),
-            mapView.leadingAnchor.constraint(equalTo: cameraImageView.trailingAnchor),
+            mapView.topAnchor.constraint(equalTo: cameraVideoView.topAnchor),
+            mapView.leadingAnchor.constraint(equalTo: cameraVideoView.trailingAnchor),
             mapView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
-            mapView.bottomAnchor.constraint(equalTo: cameraImageView.bottomAnchor)
+            mapView.bottomAnchor.constraint(equalTo: cameraVideoView.bottomAnchor)
         ]
         updateContentLayoutIfNeeded(force: true)
     }
@@ -156,6 +173,14 @@ final class RemoteControlViewController: UIViewController {
         client.onMessage = { [weak self] message in
             self?.handleRemoteMessage(message)
         }
+        client.onVideoTrack = { [weak self] track in
+            guard let self else { return }
+            track.add(self.cameraVideoView)
+        }
+        client.onVideoFrameImage = { [weak self] image in
+            self?.videoFallbackImageView.image = image
+            self?.videoFallbackImageView.isHidden = false
+        }
         browser.onStatusChanged = { [weak self] status in
             if self?.client.isConnected == false {
                 self?.statusLabel.text = status
@@ -170,8 +195,7 @@ final class RemoteControlViewController: UIViewController {
     private func handleRemoteMessage(_ message: RemoteMessage) {
         switch message.type {
         case "cameraFrame":
-            guard let camera = message.camera, let data = Data(base64Encoded: camera.jpegBase64) else { return }
-            cameraImageView.image = UIImage(data: data)
+            break
         case "mapState":
             if let pose = message.pose {
                 remoteGrid.devicePosition = DevicePosition(x: pose.x, y: pose.y, z: pose.z, heading: pose.heading)

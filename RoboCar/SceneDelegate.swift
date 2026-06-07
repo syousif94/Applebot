@@ -37,7 +37,9 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func setRoot(for role: RoboCarAppRole) {
-        RemoteControlHostService.shared.stop()
+        if currentRole == .robot || role == .controller {
+            RemoteControlHostService.shared.stop()
+        }
         TelemetryService.shared.stop(reason: "mode_switch")
         currentRole = role
         switch role {
@@ -84,6 +86,7 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     func sceneDidEnterBackground(_ scene: UIScene) {
         // Stop telemetry when app backgrounds
         TelemetryService.shared.stop(reason: "background")
+        guard currentRole == .robot else { return }
         RemoteControlHostService.shared.stop()
     }
 

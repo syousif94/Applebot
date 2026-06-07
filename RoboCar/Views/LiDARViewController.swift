@@ -2528,19 +2528,23 @@ class LiDARViewController: UIViewController {
             defer { self.isRemoteSnapshotInFlight = false }
             guard let image else { return }
 
-            let targetWidth: CGFloat = 640
-            let scale = targetWidth / max(image.size.width, 1)
-            let targetSize = CGSize(width: targetWidth, height: max(1, image.size.height * scale))
-            let renderer = UIGraphicsImageRenderer(size: targetSize)
+            let maxStreamSize = CGSize(width: 640, height: 720)
+            let scale = min(
+                maxStreamSize.width / max(image.size.width, 1),
+                maxStreamSize.height / max(image.size.height, 1),
+                1
+            )
+            let targetWidth = max(2, Int((image.size.width * scale).rounded(.down))) & ~1
+            let targetHeight = max(2, Int((image.size.height * scale).rounded(.down))) & ~1
+            let targetSize = CGSize(width: targetWidth, height: targetHeight)
+            let format = UIGraphicsImageRendererFormat.default()
+            format.scale = 1
+            format.opaque = true
+            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
             let resizedImage = renderer.image { _ in
                 image.draw(in: CGRect(origin: .zero, size: targetSize))
             }
-            guard let jpegData = resizedImage.jpegData(compressionQuality: 0.62) else { return }
-            RemoteControlHostService.shared.broadcastCameraFrame(
-                jpegData: jpegData,
-                width: Int(targetSize.width),
-                height: Int(targetSize.height)
-            )
+            RemoteControlHostService.shared.broadcastCameraFrame(image: resizedImage)
         }
     }
     
