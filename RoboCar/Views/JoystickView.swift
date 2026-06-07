@@ -165,3 +165,66 @@ class JoystickView: UIView {
         onRelease?()
     }
 }
+
+struct KeyboardDriveVector {
+    let x: Float
+    let y: Float
+
+    var isActive: Bool { x != 0 || y != 0 }
+}
+
+final class KeyboardDriveState {
+    private var activeKeys: Set<UIKeyboardHIDUsage> = []
+
+    func pressesBegan(_ presses: Set<UIPress>) -> KeyboardDriveVector? {
+        update(with: presses, isPressed: true)
+    }
+
+    func pressesEnded(_ presses: Set<UIPress>) -> KeyboardDriveVector? {
+        update(with: presses, isPressed: false)
+    }
+
+    func reset() -> KeyboardDriveVector? {
+        guard !activeKeys.isEmpty else { return nil }
+        activeKeys.removeAll()
+        return vector
+    }
+
+    private func update(with presses: Set<UIPress>, isPressed: Bool) -> KeyboardDriveVector? {
+        var handledArrowKey = false
+        for press in presses {
+            guard let keyCode = press.key?.keyCode, Self.arrowKeyCodes.contains(keyCode) else { continue }
+            handledArrowKey = true
+            if isPressed {
+                activeKeys.insert(keyCode)
+            } else {
+                activeKeys.remove(keyCode)
+            }
+        }
+        return handledArrowKey ? vector : nil
+    }
+
+    private var vector: KeyboardDriveVector {
+        let right: Float = activeKeys.contains(.keyboardRightArrow) ? 1 : 0
+        let left: Float = activeKeys.contains(.keyboardLeftArrow) ? 1 : 0
+        let up: Float = activeKeys.contains(.keyboardUpArrow) ? 1 : 0
+        let down: Float = activeKeys.contains(.keyboardDownArrow) ? 1 : 0
+        return KeyboardDriveVector(x: left - right, y: up - down)
+    }
+
+    private static let arrowKeyCodes: Set<UIKeyboardHIDUsage> = [
+        .keyboardUpArrow,
+        .keyboardDownArrow,
+        .keyboardLeftArrow,
+        .keyboardRightArrow
+    ]
+}
+
+extension UIView {
+    var hasFirstResponderTextInput: Bool {
+        if isFirstResponder, self is UITextInput {
+            return true
+        }
+        return subviews.contains { $0.hasFirstResponderTextInput }
+    }
+}

@@ -80,6 +80,7 @@ class ControlPanelViewController: UIViewController {
     private let telemetryStatusLabel = UILabel()
     
     private let ble = ESP32BLEManager.shared
+    private let keyboardDriveState = KeyboardDriveState()
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -138,6 +139,32 @@ class ControlPanelViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        stopKeyboardDriveIfNeeded()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesBegan(presses)) {
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesCancelled(presses, with: event)
     }
     
     // MARK: - Setup
@@ -458,6 +485,23 @@ class ControlPanelViewController: UIViewController {
             // Disable the sheet's internal pan-to-dismiss gesture while joystick is active
             self?.setSheetGesturesEnabled(!isTouching)
         }
+    }
+
+    private func handleKeyboardDrive(_ vector: KeyboardDriveVector?) -> Bool {
+        guard let vector else { return false }
+        if vector.isActive {
+            let powers = ble.drive(x: vector.x, y: vector.y)
+            motorLabel.text = String(format: "L: %d%%  R: %d%%",
+                                     Int(powers.left * 100), Int(powers.right * 100))
+        } else {
+            ble.stopAll()
+            motorLabel.text = "L: 0%  R: 0%"
+        }
+        return true
+    }
+
+    private func stopKeyboardDriveIfNeeded() {
+        _ = handleKeyboardDrive(keyboardDriveState.reset())
     }
     
     private func setupServoControl() {

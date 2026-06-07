@@ -2527,24 +2527,39 @@ class LiDARViewController: UIViewController {
             guard let self else { return }
             defer { self.isRemoteSnapshotInFlight = false }
             guard let image else { return }
+            RemoteControlHostService.shared.broadcastCameraFrame(image: self.makeRemoteCameraFrame(from: image))
+        }
+    }
 
-            let maxStreamSize = CGSize(width: 640, height: 720)
-            let scale = min(
-                maxStreamSize.width / max(image.size.width, 1),
-                maxStreamSize.height / max(image.size.height, 1),
-                1
-            )
-            let targetWidth = max(2, Int((image.size.width * scale).rounded(.down))) & ~1
-            let targetHeight = max(2, Int((image.size.height * scale).rounded(.down))) & ~1
-            let targetSize = CGSize(width: targetWidth, height: targetHeight)
-            let format = UIGraphicsImageRendererFormat.default()
-            format.scale = 1
-            format.opaque = true
-            let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
-            let resizedImage = renderer.image { _ in
-                image.draw(in: CGRect(origin: .zero, size: targetSize))
+    private func makeRemoteCameraFrame(from arImage: UIImage) -> UIImage {
+        let maxStreamSize = CGSize(width: 640, height: 720)
+        let scale = min(
+            maxStreamSize.width / max(arImage.size.width, 1),
+            maxStreamSize.height / max(arImage.size.height, 1),
+            1
+        )
+        let targetWidth = max(2, Int((arImage.size.width * scale).rounded(.down))) & ~1
+        let targetHeight = max(2, Int((arImage.size.height * scale).rounded(.down))) & ~1
+        let targetSize = CGSize(width: targetWidth, height: targetHeight)
+        let overlayBounds = arView.bounds
+        let overlays: [UIView] = [obstaclePointOverlay, personBoundingBoxOverlay, handJointOverlay]
+
+        let format = UIGraphicsImageRendererFormat.default()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        return renderer.image { rendererContext in
+            arImage.draw(in: CGRect(origin: .zero, size: targetSize))
+            guard overlayBounds.width > 0, overlayBounds.height > 0 else { return }
+
+            let context = rendererContext.cgContext
+            context.saveGState()
+            context.scaleBy(x: targetSize.width / overlayBounds.width, y: targetSize.height / overlayBounds.height)
+            overlays.forEach { overlay in
+                guard !overlay.isHidden, overlay.alpha > 0 else { return }
+                overlay.layer.render(in: context)
             }
-            RemoteControlHostService.shared.broadcastCameraFrame(image: resizedImage)
+            context.restoreGState()
         }
     }
     

@@ -11,6 +11,7 @@ final class RemoteControlViewController: UIViewController {
     private let client = RemoteControlClientService()
     private let browser = RemoteControlBrowser()
     private let remoteGrid = OccupancyGrid(cellSize: 0.05, gridRadius: 500)
+    private let keyboardDriveState = KeyboardDriveState()
 
     private let cameraVideoView = RTCMTLVideoView()
     private let videoFallbackImageView = UIImageView()
@@ -27,6 +28,8 @@ final class RemoteControlViewController: UIViewController {
 
     private var discoveredHosts: [RemoteControlDiscoveredHost] = []
     private weak var settingsViewController: RemoteControlSettingsViewController?
+
+    override var canBecomeFirstResponder: Bool { true }
 
     init() {
         mapView = GridMapView(occupancyGrid: remoteGrid)
@@ -47,13 +50,40 @@ final class RemoteControlViewController: UIViewController {
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        stopKeyboardDriveIfNeeded()
         client.disconnect()
         browser.stop()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        becomeFirstResponder()
     }
 
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         updateContentLayoutIfNeeded()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesBegan(presses)) {
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesCancelled(presses, with: event)
     }
 
     private func setupUI() {
@@ -270,11 +300,26 @@ final class RemoteControlViewController: UIViewController {
     #endif
         present(settings, animated: true)
     }
+
+    private func handleKeyboardDrive(_ vector: KeyboardDriveVector?) -> Bool {
+        guard let vector else { return false }
+        if vector.isActive {
+            client.sendDrive(x: vector.x, y: vector.y)
+        } else {
+            client.sendStopDrive()
+        }
+        return true
+    }
+
+    private func stopKeyboardDriveIfNeeded() {
+        _ = handleKeyboardDrive(keyboardDriveState.reset())
+    }
 }
 
 private final class RemoteControlSettingsViewController: UIViewController {
     private let client: RemoteControlClientService
     private var discoveredHosts: [RemoteControlDiscoveredHost]
+    private let keyboardDriveState = KeyboardDriveState()
     private let hostField = UITextField()
     private let connectionStatusLabel = UILabel()
     private let discoveredStack = UIStackView()
@@ -315,6 +360,32 @@ private final class RemoteControlSettingsViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+    }
+
+    override func viewWillDisappear(_ animated: Bool) {
+        super.viewWillDisappear(animated)
+        stopKeyboardDriveIfNeeded()
+    }
+
+    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesBegan(presses)) {
+            return
+        }
+        super.pressesBegan(presses, with: event)
+    }
+
+    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesEnded(presses, with: event)
+    }
+
+    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+        if !view.hasFirstResponderTextInput, handleKeyboardDrive(keyboardDriveState.pressesEnded(presses)) {
+            return
+        }
+        super.pressesCancelled(presses, with: event)
     }
 
     func updateDiscoveredHosts(_ hosts: [RemoteControlDiscoveredHost]) {
@@ -597,6 +668,22 @@ private final class RemoteControlSettingsViewController: UIViewController {
         message.id = id
         message.enabled = enabled
         client.send(message)
+    }
+
+    private func handleKeyboardDrive(_ vector: KeyboardDriveVector?) -> Bool {
+        guard let vector else { return false }
+        if vector.isActive {
+            client.sendDrive(x: vector.x, y: vector.y)
+            motorLabel.text = String(format: "x: %.2f  y: %.2f", vector.x, vector.y)
+        } else {
+            client.sendStopDrive()
+            motorLabel.text = "x: 0.00  y: 0.00"
+        }
+        return true
+    }
+
+    private func stopKeyboardDriveIfNeeded() {
+        _ = handleKeyboardDrive(keyboardDriveState.reset())
     }
 }
 
