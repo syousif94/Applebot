@@ -48,6 +48,10 @@ enum RemoteRobotCommandDispatcher {
                 guard let id = message.id, let position = message.position else { return }
                 ESP32BLEManager.shared.moveServo(id: id, position: position, speed: message.speed ?? 1000)
 
+            case "stopServo":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.stopServo(id: id)
+
             case "moveAllServos":
                 guard let position = message.position else { return }
                 ESP32BLEManager.shared.moveDiscoveredServos(position: position, speed: message.speed ?? 1000, acceleration: message.acceleration ?? 50)
@@ -55,6 +59,18 @@ enum RemoteRobotCommandDispatcher {
             case "setServoTorque":
                 guard let id = message.id, let enabled = message.enabled else { return }
                 ESP32BLEManager.shared.setServoTorque(id: id, enabled: enabled)
+
+            case "calibrateServoZero":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.calibrateServoZero(id: id)
+
+            case "driveServoWheel":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.driveServoWheel(id: id, speed: message.wheelSpeed ?? 0, acceleration: message.acceleration ?? 50)
+
+            case "setServoPositionMode":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.setServoPositionMode(id: id)
 
             case "refreshServoState":
                 guard let id = message.id else { return }

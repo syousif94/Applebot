@@ -484,12 +484,13 @@ private final class RemoteControlSettingsViewController: UIViewController {
         let scanButton = makeButton("Scan", systemImageName: "dot.radiowaves.left.and.right", action: #selector(scanServosTapped))
         let moveButton = makeButton("Move", systemImageName: "arrow.up.and.down.and.arrow.left.and.right", action: #selector(moveServoTapped))
         let moveAllButton = makeButton("Move All", systemImageName: "arrow.up.and.down.square", action: #selector(moveAllTapped))
+        let stopButton = makeButton("Stop", systemImageName: "stop.fill", action: #selector(stopServoTapped))
         let torqueOnButton = makeButton("Torque On", systemImageName: "bolt.fill", action: #selector(torqueOnTapped))
         let torqueOffButton = makeButton("Torque Off", systemImageName: "bolt.slash.fill", action: #selector(torqueOffTapped))
 
         let scanRow = UIStackView(arrangedSubviews: [servoFromField, servoToField, scanButton])
         let moveRow = UIStackView(arrangedSubviews: [servoIDField, servoPositionField, servoSpeedField])
-        let buttonRow = UIStackView(arrangedSubviews: [moveButton, moveAllButton])
+        let buttonRow = UIStackView(arrangedSubviews: [moveButton, moveAllButton, stopButton])
         let torqueRow = UIStackView(arrangedSubviews: [torqueOnButton, torqueOffButton])
         [scanRow, moveRow, buttonRow, torqueRow].forEach { row in
             row.translatesAutoresizingMaskIntoConstraints = false
@@ -651,6 +652,13 @@ private final class RemoteControlSettingsViewController: UIViewController {
         var message = RemoteMessage(type: "moveAllServos")
         message.position = UInt16(servoPositionField.text ?? "") ?? 2048
         message.speed = UInt16(servoSpeedField.text ?? "") ?? 1000
+        client.send(message)
+    }
+
+    @objc private func stopServoTapped() {
+        guard let id = UInt8(servoIDField.text ?? "") else { return }
+        var message = RemoteMessage(type: "stopServo")
+        message.id = id
         client.send(message)
     }
 

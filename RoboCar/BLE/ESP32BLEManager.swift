@@ -110,6 +110,13 @@ class ESP32BLEManager: NSObject {
     private var stStateChar: CBCharacteristic?
     private var shouldReadServoListAfterCommand = false
     private var pendingServoStateReadIDs: [UInt8] = []
+    private var latestServoIDs: [UInt8] = []
+    private var servoMotionTargets: [UInt8: UInt16] = [:]
+    private var servoTorqueOffPollIDs = Set<UInt8>()
+    private var servoWheelPollIDs = Set<UInt8>()
+    private var servoPollTimer: Timer?
+    private let servoPollInterval: TimeInterval = 0.35
+    private let servoSettledTolerance: UInt16 = 12
     
     /// Number of active motors reported by the ESP32 (2 or 4, default 4)
     private(set) var motorCount: Int = 4
@@ -363,6 +370,7 @@ class ESP32BLEManager: NSObject {
     func moveServo(id: UInt8, position: UInt16, speed: UInt16) {
         let clampedPosition = min(position, 4095)
         let clampedSpeed = min(speed, 4095)
+        trackServoMotion(id: id, target: clampedPosition)
         writeServoCommand([
             0x01,
             id,
@@ -376,6 +384,7 @@ class ESP32BLEManager: NSObject {
     func moveDiscoveredServos(position: UInt16, speed: UInt16, acceleration: UInt8 = 50) {
         let clampedPosition = min(position, 4095)
         let clampedSpeed = min(speed, 4095)
+        latestServoIDs.forEach { trackServoMotion(id: $0, target: clampedPosition) }
         writeServoCommand([
             0x07,
             UInt8(clampedPosition & 0xFF),
@@ -387,11 +396,51 @@ class ESP32BLEManager: NSObject {
     }
 
     func setServoTorque(id: UInt8, enabled: Bool) {
+        if enabled {
+            servoTorqueOffPollIDs.remove(id)
+        } else {
+            servoTorqueOffPollIDs.insert(id)
+            servoMotionTargets.removeValue(forKey: id)
+        }
+        updateServoPollTimer()
         writeServoCommand([0x02, id, enabled ? 1 : 0, 0, 0, 0])
+    }
+
+    func stopServo(id: UInt8) {
+        setServoTorque(id: id, enabled: false)
     }
 
     func changeServoID(currentID: UInt8, newID: UInt8) {
         writeServoCommand([0x03, currentID, newID, 0, 0, 0])
+    }
+
+    func calibrateServoZero(id: UInt8) {
+        writeServoCommand([0x08, id, 0, 0, 0, 0])
+    }
+
+    func driveServoWheel(id: UInt8, speed: Int16, acceleration: UInt8 = 50) {
+        let clampedSpeed = max(Int16(-4095), min(Int16(4095), speed))
+        if clampedSpeed == 0 {
+            servoWheelPollIDs.remove(id)
+        } else {
+            servoWheelPollIDs.insert(id)
+        }
+        updateServoPollTimer()
+        let rawSpeed = UInt16(bitPattern: clampedSpeed)
+        writeServoCommand([
+            0x09,
+            id,
+            UInt8(rawSpeed & 0xFF),
+            UInt8(rawSpeed >> 8),
+            acceleration,
+            0,
+        ])
+    }
+
+    func setServoPositionMode(id: UInt8) {
+        servoWheelPollIDs.remove(id)
+        updateServoPollTimer()
+        writeServoCommand([0x0A, id, 0, 0, 0, 0])
     }
 
     func refreshServoState(id: UInt8) {
@@ -412,6 +461,55 @@ class ESP32BLEManager: NSObject {
     private func writeServoCommand(_ bytes: [UInt8]) {
         guard bytes.count == 6, let p = peripheral, let char = stCmdChar else { return }
         p.writeValue(Data(bytes), for: char, type: .withResponse)
+    }
+
+    private func trackServoMotion(id: UInt8, target: UInt16) {
+        servoMotionTargets[id] = target
+        updateServoPollTimer()
+    }
+
+    private func updateServoMotion(from state: ServoState) {
+        if !state.isReadFailure, let target = servoMotionTargets[state.id] {
+            let delta = abs(Int(state.position) - Int(target))
+            if delta <= Int(servoSettledTolerance) {
+                servoMotionTargets.removeValue(forKey: state.id)
+            }
+        }
+        updateServoPollTimer()
+    }
+
+    private func updateServoPollTimer() {
+        let ids = servoIDsNeedingPolling()
+        if ids.isEmpty {
+            stopServoPolling()
+        } else {
+            startServoPolling()
+        }
+    }
+
+    private func servoIDsNeedingPolling() -> [UInt8] {
+        Array(Set(servoMotionTargets.keys).union(servoTorqueOffPollIDs).union(servoWheelPollIDs)).sorted()
+    }
+
+    private func startServoPolling() {
+        guard servoPollTimer == nil else { return }
+        pollTrackedServoStates()
+        servoPollTimer = Timer.scheduledTimer(withTimeInterval: servoPollInterval, repeats: true) { [weak self] _ in
+            self?.pollTrackedServoStates()
+        }
+    }
+
+    private func stopServoPolling() {
+        servoPollTimer?.invalidate()
+        servoPollTimer = nil
+    }
+
+    private func pollTrackedServoStates() {
+        servoIDsNeedingPolling().enumerated().forEach { index, id in
+            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.08)) { [weak self] in
+                self?.refreshServoState(id: id)
+            }
+        }
     }
     
     // MARK: - WiFi config
@@ -496,12 +594,17 @@ class ESP32BLEManager: NSObject {
         stStateChar = nil
         shouldReadServoListAfterCommand = false
         pendingServoStateReadIDs.removeAll()
+        latestServoIDs.removeAll()
+        servoMotionTargets.removeAll()
+        servoTorqueOffPollIDs.removeAll()
+        servoWheelPollIDs.removeAll()
         motorCount = 4
         isMotorWriteInFlight = false
         pendingMotorData = nil
         lastMotorData = nil
         stopHeartbeat()
         stopBatteryPolling()
+        stopServoPolling()
     }
 }
 
@@ -655,6 +758,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             }
         case Self.stListUUID:
             let ids = data.prefix(16).filter { $0 != 0 }
+            latestServoIDs = Array(ids)
             print("[BLE] ST3215 IDs: \(Array(ids))")
             onServoListUpdated?(Array(ids))
             servoListObservers.values.forEach { $0(Array(ids)) }
@@ -671,6 +775,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 temperature: data[7]
             )
             print("[BLE] ST3215 state: id=\(state.id) error=\(state.error) pos=\(state.position) load=\(state.load) voltage=\(state.voltage) temp=\(state.temperature)")
+            updateServoMotion(from: state)
             onServoStateUpdated?(state)
             servoStateObservers.values.forEach { $0(state) }
         default:

@@ -92,6 +92,7 @@ struct RemoteMessage: Codable {
     var to: UInt8?
     var position: UInt16?
     var speed: UInt16?
+    var wheelSpeed: Int16?
     var acceleration: UInt8?
     var enabled: Bool?
     var signalType: String?

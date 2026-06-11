@@ -91,10 +91,18 @@ class LiDARViewController: UIViewController {
     private var alwaysOnPersonBoxes: [PersonBoxInfo] = []
     /// Known person embeddings keyed by stable UUID
     private var knownPersonEmbeddings: [UUID: [Float]] = [:]
+    /// Last always-on person bounding box keyed by stable UUID
+    private var knownPersonBoundingBoxes: [UUID: CGRect] = [:]
+    /// Last time each always-on person was seen
+    private var knownPersonLastSeen: [UUID: Date] = [:]
     /// Whether a background detection request is in flight
     private var personDetectionInFlight = false
     /// ReID match threshold for always-on scanner
     private let alwaysOnReidThreshold: Float = 0.55
+    /// IoU threshold for keeping an always-on ID stable across adjacent frames
+    private let alwaysOnIouThreshold: CGFloat = 0.18
+    /// How long to retain always-on ID memory while a person is briefly missed
+    private let alwaysOnPersonMemoryTimeout: TimeInterval = 4.0
     /// Per-person activation gesture phase for always-on scanner (peace→fist→peace)
     private var alwaysOnActivatePhase: [UUID: PersonTracker.ActivateGesturePhase] = [:]
     /// Timestamps for activation gesture phase transitions
@@ -834,6 +842,11 @@ class LiDARViewController: UIViewController {
             occupancyGrid: occupancyGrid,
             cameraTransform: TelemetryService.shared.lastCameraTransform
         )
+        personTracker.onCancelGesture = nil
+        personTracker.onPeopleUpdated = nil
+        personTracker.onPersonActivated = nil
+        personTracker.onPositionUpdated = nil
+        personTracker.onStateChanged = nil
         personTracker.stopTracking()
         pathNavigator.stopNavigation()
         obstacleDetector.excludedPersonPosition = nil
@@ -1975,7 +1988,11 @@ class LiDARViewController: UIViewController {
                 let capturedFrame = frame
                 let tracker = self.personTracker
                 let knownEmbeddings = self.knownPersonEmbeddings
+                let knownBoxes = self.knownPersonBoundingBoxes
+                let knownLastSeen = self.knownPersonLastSeen
                 let threshold = self.alwaysOnReidThreshold
+                let iouThreshold = self.alwaysOnIouThreshold
+                let memoryTimeout = self.alwaysOnPersonMemoryTimeout
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let request = VNDetectHumanRectanglesRequest()
                     request.revision = VNDetectHumanRectanglesRequestRevision2
@@ -1994,15 +2011,31 @@ class LiDARViewController: UIViewController {
                     // Generate embeddings and match against known people
                     var boxes: [PersonBoxInfo] = []
                     var updatedEmbeddings = knownEmbeddings
+                    var updatedKnownBoxes = knownBoxes
+                    var updatedLastSeen = knownLastSeen
                     var matchedKnownIDs = Set<UUID>()
+                    let now = Date()
+                    let retainedIDs = Set(knownLastSeen.compactMap { id, lastSeen in
+                        now.timeIntervalSince(lastSeen) <= memoryTimeout ? id : nil
+                    })
                     
                     for obs in observations {
+                        let bbox = obs.boundingBox
                         let embedding = tracker.generateEmbedding(pixelBuffer: pixelBuffer, boundingBox: obs.boundingBox)
                         
-                        // Try to match against known embeddings
+                        // Prefer temporal overlap before ReID. Streaming can perturb crops enough
+                        // that adjacent-frame IoU is the more stable identity signal.
                         var bestMatch: (id: UUID, sim: Float)?
+                        var bestIouMatch: (id: UUID, iou: CGFloat)?
+                        for (knownID, knownBox) in knownBoxes where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
+                            let iou = self?.computeIoU(bbox, knownBox) ?? 0
+                            if iou > iouThreshold && (bestIouMatch == nil || iou > bestIouMatch!.iou) {
+                                bestIouMatch = (knownID, iou)
+                            }
+                        }
+
                         if let embed = embedding {
-                            for (knownID, knownEmbed) in knownEmbeddings where !matchedKnownIDs.contains(knownID) {
+                            for (knownID, knownEmbed) in knownEmbeddings where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
                                 let sim = tracker.cosineSimilarity(embed, knownEmbed)
                                 if sim > threshold && (bestMatch == nil || sim > bestMatch!.sim) {
                                     bestMatch = (knownID, sim)
@@ -2011,7 +2044,13 @@ class LiDARViewController: UIViewController {
                         }
                         
                         let personID: UUID
-                        if let match = bestMatch {
+                        if let match = bestIouMatch {
+                            personID = match.id
+                            matchedKnownIDs.insert(match.id)
+                            if let embed = embedding {
+                                updatedEmbeddings[personID] = embed
+                            }
+                        } else if let match = bestMatch {
                             personID = match.id
                             matchedKnownIDs.insert(match.id)
                             // Update embedding with latest
@@ -2025,14 +2064,16 @@ class LiDARViewController: UIViewController {
                                 updatedEmbeddings[personID] = embed
                             }
                         }
+                        updatedKnownBoxes[personID] = bbox
+                        updatedLastSeen[personID] = now
                         
                         boxes.append(PersonBoxInfo(
                             id: personID,
-                            boundingBox: obs.boundingBox,
+                            boundingBox: bbox,
                             isActive: false,
                             isGesturing: false,
                             label: String(personID.uuidString.prefix(4)),
-                            worldPosition: tracker.projectToWorld(boundingBox: obs.boundingBox, frame: capturedFrame)
+                            worldPosition: tracker.projectToWorld(boundingBox: bbox, frame: capturedFrame)
                         ))
                     }
                     
@@ -2042,12 +2083,12 @@ class LiDARViewController: UIViewController {
                     var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
                     
                     for hand in handResults {
-                        if let wrist = tracker.detectPeaceSign(hand: hand) {
+                        if let wrist = tracker.detectPeaceSign(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true }) {
                             peaceHands.append((wrist, hand))
-                        } else if let wrist = tracker.detectClosedHand(hand: hand) {
+                        } else if let wrist = tracker.detectClosedHand(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true }) {
                             fistHands.append(wrist)
                         }
-                        if let info = tracker.detectIndexPointer(hand: hand) {
+                        if let info = tracker.detectIndexPointer(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(info.wrist, inside: box.boundingBox) == true }) {
                             pointerHands.append(info)
                         }
                     }
@@ -2056,11 +2097,7 @@ class LiDARViewController: UIViewController {
                     var gesturedIDs = Set<UUID>()
                     for (wrist, _) in peaceHands {
                         for i in boxes.indices {
-                            let expandedBBox = boxes[i].boundingBox.insetBy(dx: -0.08, dy: -0.08)
-                            guard expandedBBox.contains(wrist) else { continue }
-                            let bbox = boxes[i].boundingBox
-                            let upperThreshold = bbox.origin.y + bbox.size.height * 0.2
-                            guard wrist.y >= upperThreshold else { continue }
+                            guard self?.isRaisedHandPoint(wrist, inside: boxes[i].boundingBox) == true else { continue }
                             gesturedIDs.insert(boxes[i].id)
                             boxes[i] = PersonBoxInfo(
                                 id: boxes[i].id,
@@ -2078,10 +2115,7 @@ class LiDARViewController: UIViewController {
                     var fistIDs = Set<UUID>()
                     for wrist in fistHands {
                         for box in boxes {
-                            let expandedBBox = box.boundingBox.insetBy(dx: -0.08, dy: -0.08)
-                            guard expandedBBox.contains(wrist) else { continue }
-                            let upperThreshold = box.boundingBox.origin.y + box.boundingBox.size.height * 0.2
-                            guard wrist.y >= upperThreshold else { continue }
+                            guard self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true else { continue }
                             fistIDs.insert(box.id)
                             break
                         }
@@ -2089,11 +2123,16 @@ class LiDARViewController: UIViewController {
                     
                     // Prune embeddings for people not seen (keep for a few cycles via main thread)
                     let seenIDs = Set(boxes.map { $0.id })
+                    updatedEmbeddings = updatedEmbeddings.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
+                    updatedKnownBoxes = updatedKnownBoxes.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
+                    updatedLastSeen = updatedLastSeen.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     
                     DispatchQueue.main.async {
                         guard let self = self else { return }
                         self.alwaysOnPersonBoxes = boxes
-                        self.knownPersonEmbeddings = updatedEmbeddings.filter { seenIDs.contains($0.key) || knownEmbeddings.keys.contains($0.key) }
+                        self.knownPersonEmbeddings = updatedEmbeddings
+                        self.knownPersonBoundingBoxes = updatedKnownBoxes
+                        self.knownPersonLastSeen = updatedLastSeen
                         self.personDetectionInFlight = false
                         
                         // Update hand joint overlay
@@ -2205,6 +2244,7 @@ class LiDARViewController: UIViewController {
             if frameCount % 2 == 0 && personTracker.state != .idle {
                 let pixelBuffer = frame.capturedImage
                 let tracker = self.personTracker
+                let trackedPersonBox = self.personTracker.trackedBoundingBox
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let handPoseRequest = VNDetectHumanHandPoseRequest()
                     handPoseRequest.maximumHandCount = 2
@@ -2219,7 +2259,9 @@ class LiDARViewController: UIViewController {
                     
                     var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
                     for hand in handResults {
-                        if let info = tracker.detectIndexPointer(hand: hand) {
+                        if let info = tracker.detectIndexPointer(hand: hand),
+                           let trackedPersonBox,
+                           self?.isRaisedHandPoint(info.wrist, inside: trackedPersonBox) == true {
                             pointerHands.append(info)
                         }
                     }
@@ -2296,6 +2338,7 @@ class LiDARViewController: UIViewController {
                     )
                 }
             }
+
             // Collect 3D obstacle points for white dot overlay every 2 frames
             if frameCount % 2 == 0 {
                 obstaclePoints3D = obstacleDetector.collectObstaclePoints3D(frame: frame)
@@ -2502,6 +2545,22 @@ class LiDARViewController: UIViewController {
            personTracker.state == .tracking {
             planFollowPath(toX: personPos.x, toY: personPos.y)
         }
+    }
+
+    private func computeIoU(_ a: CGRect, _ b: CGRect) -> CGFloat {
+        let intersection = a.intersection(b)
+        guard !intersection.isNull else { return 0 }
+        let intersectionArea = intersection.width * intersection.height
+        let unionArea = (a.width * a.height) + (b.width * b.height) - intersectionArea
+        guard unionArea > 0 else { return 0 }
+        return intersectionArea / unionArea
+    }
+
+    private func isRaisedHandPoint(_ point: CGPoint, inside personBox: CGRect) -> Bool {
+        let expandedBox = personBox.insetBy(dx: -0.08, dy: -0.04)
+        guard expandedBox.contains(point) else { return false }
+        let upperBodyThreshold = personBox.origin.y + personBox.height * 0.45
+        return point.y >= upperBodyThreshold
     }
 
     private var remoteNavigationState: String {

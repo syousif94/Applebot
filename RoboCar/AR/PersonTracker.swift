@@ -476,12 +476,12 @@ class PersonTracker {
         var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
         
         for hand in hands {
-            if let wrist = detectPeaceSign(hand: hand) {
+            if let wrist = detectPeaceSign(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(wrist, inside: $0.boundingBox) }) {
                 peaceHands.append((wrist, hand))
-            } else if let wrist = detectClosedHand(hand: hand) {
+            } else if let wrist = detectClosedHand(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(wrist, inside: $0.boundingBox) }) {
                 fistHands.append(wrist)
             }
-            if let info = detectIndexPointer(hand: hand) {
+            if let info = detectIndexPointer(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(info.wrist, inside: $0.boundingBox) }) {
                 pointerHands.append(info)
             }
         }
@@ -491,12 +491,7 @@ class PersonTracker {
         
         for (wrist, _) in peaceHands {
             for i in detectedPeople.indices {
-                let expandedBBox = detectedPeople[i].boundingBox.insetBy(dx: -0.08, dy: -0.08)
-                guard expandedBBox.contains(wrist) else { continue }
-                // Require hand is raised — wrist must be in the upper 40% of the person bbox
-                let bbox = detectedPeople[i].boundingBox
-                let upperThreshold = bbox.origin.y + bbox.size.height * 0.2
-                guard wrist.y >= upperThreshold else { continue }
+                guard isRaisedHandPoint(wrist, inside: detectedPeople[i].boundingBox) else { continue }
                 let pid = detectedPeople[i].id
                 gesturedPersonIDs.insert(pid)
                 
@@ -542,12 +537,7 @@ class PersonTracker {
         // Check for fist (closed hand) to transition peaceOpen1 → peaceClosed1
         for wrist in fistHands {
             for i in detectedPeople.indices {
-                let expandedBBox = detectedPeople[i].boundingBox.insetBy(dx: -0.08, dy: -0.08)
-                guard expandedBBox.contains(wrist) else { continue }
-                // Require hand is raised — upper 40% of person bbox
-                let bbox = detectedPeople[i].boundingBox
-                let upperThreshold = bbox.origin.y + bbox.size.height * 0.2
-                guard wrist.y >= upperThreshold else { continue }
+                guard isRaisedHandPoint(wrist, inside: detectedPeople[i].boundingBox) else { continue }
                 let pid = detectedPeople[i].id
                 let phase = activatePhase[pid] ?? .idle
                 let phaseTime = activatePhaseTimestamp[pid] ?? .distantPast
@@ -1005,6 +995,13 @@ class PersonTracker {
         let unionArea = a.area + b.area - intersectionArea
         guard unionArea > 0 else { return 0 }
         return intersectionArea / unionArea
+    }
+
+    private func isRaisedHandPoint(_ point: CGPoint, inside personBox: CGRect) -> Bool {
+        let expandedBox = personBox.insetBy(dx: -0.08, dy: -0.04)
+        guard expandedBox.contains(point) else { return false }
+        let upperBodyThreshold = personBox.origin.y + personBox.height * 0.45
+        return point.y >= upperBodyThreshold
     }
     
     // MARK: - Depth Projection
