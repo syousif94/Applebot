@@ -2477,6 +2477,7 @@ class LiDARViewController: UIViewController {
         // Telemetry: emit mesh anchor geometry at ~1 Hz
         if let snapshots = meshAnchorSnapshots {
             TelemetryService.shared.emitMeshAnchors(snapshots, occupancyGrid: occupancyGrid, cameraTransform: cameraTransform)
+            RemoteControlHostService.shared.broadcastMeshAnchors(snapshots)
         }
         
         // Redraw grid every 6 frames (~5Hz at 30fps)

@@ -1,16 +1,16 @@
 //
 //  MeshVoxelView.swift
 //  RoboCar
-//
 
 import UIKit
 import SceneKit
+import simd
 
 final class MeshVoxelView: UIView {
 
     var occupancyGrid: OccupancyGrid?
-    var viewRadiusMeters: Float = 5.0
 
+    private var meshAnchors: [MeshAnchorSnapshot] = []
     private let scnView = SCNView()
     private let scene = SCNScene()
     private let geometryRoot = SCNNode()
@@ -18,12 +18,14 @@ final class MeshVoxelView: UIView {
     private let cameraNode = SCNNode()
 
     private var cameraAzimuth: Float = 0
-    private var cameraElevation: Float = 0.55
+    private var cameraElevation: Float = 0.85
     private var cameraDistance: Float = 8.0
     private var panStart: CGPoint = .zero
+    private var deviceHeight: Float = 0.3   // ARKit Y of the device; updated from devicePosition.z
 
     private var isBuilding = false
     private var needsRebuild = false
+    private var hasAutoOrientedCamera = false
 
     override init(frame: CGRect) {
         super.init(frame: frame)
@@ -149,8 +151,9 @@ final class MeshVoxelView: UIView {
             panStart = g.location(in: self)
         case .changed:
             let loc = g.location(in: self)
+            // Positive delta_x → orbit right; positive delta_y (finger moves down) → lower elevation
             cameraAzimuth -= Float(loc.x - panStart.x) * 0.013
-            cameraElevation = max(0.1, min(.pi / 2 - 0.05, cameraElevation + Float(loc.y - panStart.y) * 0.013))
+            cameraElevation = max(0.1, min(.pi / 2 - 0.05, cameraElevation - Float(loc.y - panStart.y) * 0.013))
             panStart = loc
             let pos = occupancyGrid?.devicePosition ?? .zero
             updateCamera(cx: pos.x, cz: pos.y)
@@ -166,184 +169,196 @@ final class MeshVoxelView: UIView {
         updateCamera(cx: pos.x, cz: pos.y)
     }
 
+    // cx/cz are the ARKit X and Z of the scene pivot (device position).
+    // Camera orbits around (cx, deviceHeight, cz) at the current azimuth/elevation.
     private func updateCamera(cx: Float, cz: Float) {
         let d = cameraDistance
         let camX = cx + d * cos(cameraElevation) * sin(cameraAzimuth)
         let camZ = cz + d * cos(cameraElevation) * cos(cameraAzimuth)
-        let camY = d * sin(cameraElevation)
+        let camY = deviceHeight + d * sin(cameraElevation)
         cameraNode.position = SCNVector3(camX, camY, camZ)
-        cameraNode.look(at: SCNVector3(cx, 0.3, cz))
+        cameraNode.look(at: SCNVector3(cx, deviceHeight, cz))
     }
 
-    // MARK: - Geometry Refresh
+    // MARK: - Public Interface
 
+    /// Update device cone and camera without rebuilding mesh geometry.
     func refresh() {
+        guard let pos = occupancyGrid?.devicePosition else { return }
+        deviceHeight = pos.z
+        deviceNode.position = SCNVector3(pos.x, pos.z, pos.y)
+        deviceNode.eulerAngles = SCNVector3(-.pi / 2, pos.heading, 0)
+        updateCamera(cx: pos.x, cz: pos.y)
+    }
+
+    /// Replace stored mesh anchors and trigger an async geometry rebuild.
+    func updateMeshAnchors(_ anchors: [MeshAnchorSnapshot]) {
+        meshAnchors = anchors
+        if !hasAutoOrientedCamera && !anchors.isEmpty {
+            hasAutoOrientedCamera = true
+            autoOrientCamera(anchors: anchors)
+        }
+        rebuildMesh()
+    }
+
+    /// Orient the camera so the mesh appears in front of the device rather than behind it.
+    /// Uses the mean anchor translation as a quick proxy for the mesh centroid.
+    private func autoOrientCamera(anchors: [MeshAnchorSnapshot]) {
+        let pos = occupancyGrid?.devicePosition ?? .zero
+        var sumX: Float = 0, sumZ: Float = 0, cnt = 0
+        for anchor in anchors where anchor.transform.count == 16 {
+            sumX += anchor.transform[12]   // column-3 x = ARKit world X
+            sumZ += anchor.transform[14]   // column-3 z = ARKit world Z
+            cnt += 1
+        }
+        guard cnt > 0 else { return }
+        let centX = sumX / Float(cnt)
+        let centZ = sumZ / Float(cnt)   // SceneKit Z = ARKit Z
+
+        // Vector from device to mesh centroid in the XZ plane
+        let dx = centX - pos.x
+        let dz = centZ - pos.y    // pos.y holds ARKit Z
+        let len = sqrt(dx*dx + dz*dz)
+        guard len > 0.1 else { return }
+
+        // Place camera on the opposite side: camera → device → centroid are collinear,
+        // so sin(az) = -dx/len, cos(az) = -dz/len  →  az = atan2(-dx, -dz)
+        cameraAzimuth = atan2(-dx, -dz)
+        updateCamera(cx: pos.x, cz: pos.y)
+    }
+
+    // MARK: - Mesh Building
+
+    private func rebuildMesh() {
         guard !isBuilding else {
             needsRebuild = true
             return
         }
-        guard let grid = occupancyGrid else { return }
         isBuilding = true
         needsRebuild = false
 
-        let pos = grid.devicePosition
-        let radius = viewRadiusMeters
+        let anchors = meshAnchors
+        let pos = occupancyGrid?.devicePosition ?? .zero
 
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let region = grid.getRegion(centerX: pos.x, centerY: pos.y, radiusMeters: radius)
-            let items = self.buildGeometry(region: region)
+            let nodes = anchors.compactMap { self.makeAnchorNode($0) }
             DispatchQueue.main.async {
-                self.applyGeometry(items, devicePos: pos)
+                self.geometryRoot.childNodes.forEach { $0.removeFromParentNode() }
+                nodes.forEach { self.geometryRoot.addChildNode($0) }
+                self.deviceHeight = pos.z
+                self.deviceNode.position = SCNVector3(pos.x, pos.z, pos.y)
+                self.deviceNode.eulerAngles = SCNVector3(-.pi / 2, pos.heading, 0)
+                self.updateCamera(cx: pos.x, cz: pos.y)
                 self.isBuilding = false
-                if self.needsRebuild { self.refresh() }
+                if self.needsRebuild { self.rebuildMesh() }
             }
         }
     }
 
-    // MARK: - Geometry Building
+    private func makeAnchorNode(_ anchor: MeshAnchorSnapshot) -> SCNNode? {
+        guard let vData = Data(base64Encoded: anchor.verticesB64),
+              let iData = Data(base64Encoded: anchor.indicesB64),
+              let cData = Data(base64Encoded: anchor.classificationsB64),
+              anchor.transform.count == 16,
+              anchor.triangleCount > 0 else { return nil }
 
-    private typealias GeomData = (color: UIColor, positions: [Float], normals: [Float], indices: [UInt32], vertexCount: Int)
+        let vertexCount = anchor.vertexCount
+        let triangleCount = anchor.triangleCount
 
-    private func buildGeometry(region: (cells: [[CellState]], heights: [[Float]], classifications: [[MeshClassification]], originX: Float, originY: Float, cellSize: Float, minHeight: Float, maxHeight: Float)) -> [GeomData] {
-        let cs = region.cellSize
-        let ox = region.originX
-        let oz = region.originY
-        let sizeX = region.cells.count
-        guard sizeX > 0, region.cells[0].count > 0 else { return [] }
-        let sizeY = region.cells[0].count
+        guard vData.count == vertexCount * 12,
+              iData.count == triangleCount * 12 else { return nil }
 
-        // Normalize heights relative to floor
-        let floorLevel: Float = region.minHeight < 1e10 ? region.minHeight : 0
+        let localVerts: [Float] = vData.withUnsafeBytes { ptr in
+            Array(ptr.bindMemory(to: Float.self))
+        }
+        let indices: [UInt32] = iData.withUnsafeBytes { ptr in
+            Array(ptr.bindMemory(to: UInt32.self))
+        }
+        let classBytes = Array(cData)
 
-        var floorBuf = GeomBuf()
-        var classBufs: [MeshClassification: GeomBuf] = [:]
+        // Reconstruct column-major 4x4 transform
+        let t = anchor.transform
+        let mat = simd_float4x4(columns: (
+            simd_float4(t[0],  t[1],  t[2],  t[3]),
+            simd_float4(t[4],  t[5],  t[6],  t[7]),
+            simd_float4(t[8],  t[9],  t[10], t[11]),
+            simd_float4(t[12], t[13], t[14], t[15])
+        ))
 
-        for ix in 0..<sizeX {
-            for iy in 0..<sizeY {
-                let state = region.cells[ix][iy]
-                guard state != .unknown else { continue }
-                let wx = ox + Float(ix) * cs
-                let wz = oz + Float(iy) * cs
-                let cls = region.classifications[ix][iy]
-
-                switch state {
-                case .free:
-                    floorBuf.addQuad(x: wx, z: wz, w: cs * 0.96, d: cs * 0.96)
-
-                case .occupied:
-                    let rawH = region.heights[ix][iy]
-                    let visualH = max(0.06, rawH - floorLevel)
-                    if classBufs[cls] == nil { classBufs[cls] = GeomBuf() }
-                    classBufs[cls]!.addBox(x: wx, y: visualH / 2, z: wz, w: cs * 0.88, h: visualH, d: cs * 0.88)
-
-                case .unknown:
-                    break
-                }
-            }
+        // Transform vertices to ARKit world space (which maps directly to SceneKit space)
+        var worldVerts = [Float](repeating: 0, count: vertexCount * 3)
+        for i in 0..<vertexCount {
+            let lv = simd_float4(localVerts[i*3], localVerts[i*3+1], localVerts[i*3+2], 1)
+            let wv = mat * lv
+            worldVerts[i*3]   = wv.x
+            worldVerts[i*3+1] = wv.y
+            worldVerts[i*3+2] = wv.z
         }
 
-        var result: [GeomData] = []
-
-        if !floorBuf.positions.isEmpty {
-            let c = MeshClassification.floor.color
-            result.append((UIColor(red: c.r, green: c.g, blue: c.b, alpha: 0.8),
-                           floorBuf.positions, floorBuf.normals, floorBuf.indices, floorBuf.vertexCount))
+        // Accumulate face normals per vertex for smooth shading
+        var accNormals = [simd_float3](repeating: .zero, count: vertexCount)
+        for f in 0..<triangleCount {
+            let i0 = Int(indices[f*3]), i1 = Int(indices[f*3+1]), i2 = Int(indices[f*3+2])
+            guard i0 < vertexCount, i1 < vertexCount, i2 < vertexCount else { continue }
+            let v0 = simd_float3(worldVerts[i0*3], worldVerts[i0*3+1], worldVerts[i0*3+2])
+            let v1 = simd_float3(worldVerts[i1*3], worldVerts[i1*3+1], worldVerts[i1*3+2])
+            let v2 = simd_float3(worldVerts[i2*3], worldVerts[i2*3+1], worldVerts[i2*3+2])
+            let faceNorm = simd_normalize(simd_cross(v1 - v0, v2 - v0))
+            guard !faceNorm.x.isNaN else { continue }
+            accNormals[i0] += faceNorm
+            accNormals[i1] += faceNorm
+            accNormals[i2] += faceNorm
+        }
+        var normalFloats = [Float](repeating: 0, count: vertexCount * 3)
+        for i in 0..<vertexCount {
+            let len = simd_length(accNormals[i])
+            let n = len > 0.0001 ? accNormals[i] / len : simd_float3(0, 1, 0)
+            normalFloats[i*3]   = n.x
+            normalFloats[i*3+1] = n.y
+            normalFloats[i*3+2] = n.z
         }
 
-        for (cls, buf) in classBufs {
-            guard !buf.positions.isEmpty else { continue }
-            let c = cls.color
-            result.append((UIColor(red: c.r, green: c.g, blue: c.b, alpha: 1),
-                           buf.positions, buf.normals, buf.indices, buf.vertexCount))
+        // Group triangles by classification (skip ceiling = 3)
+        var classGroups: [UInt8: [UInt32]] = [:]
+        for f in 0..<triangleCount {
+            let cls: UInt8 = f < classBytes.count ? classBytes[f] : 0
+            guard cls != 3 else { continue }
+            if classGroups[cls] == nil { classGroups[cls] = [] }
+            classGroups[cls]!.append(contentsOf: [indices[f*3], indices[f*3+1], indices[f*3+2]])
         }
+        guard !classGroups.isEmpty else { return nil }
 
-        return result
-    }
-
-    private func applyGeometry(_ items: [GeomData], devicePos: DevicePosition) {
-        geometryRoot.childNodes.forEach { $0.removeFromParentNode() }
-        for item in items {
-            if let node = makeNode(item) { geometryRoot.addChildNode(node) }
-        }
-        deviceNode.position = SCNVector3(devicePos.x, 0.15, devicePos.y)
-        deviceNode.eulerAngles = SCNVector3(-.pi / 2, -devicePos.heading, 0)
-        updateCamera(cx: devicePos.x, cz: devicePos.y)
-    }
-
-    private func makeNode(_ item: GeomData) -> SCNNode? {
-        guard !item.positions.isEmpty else { return nil }
-
-        let posData = item.positions.withUnsafeBufferPointer { Data(buffer: $0) }
-        let normData = item.normals.withUnsafeBufferPointer { Data(buffer: $0) }
-        let idxData = item.indices.withUnsafeBufferPointer { Data(buffer: $0) }
+        let posData  = worldVerts.withUnsafeBufferPointer { Data(buffer: $0) }
+        let normData = normalFloats.withUnsafeBufferPointer { Data(buffer: $0) }
 
         let posSource = SCNGeometrySource(data: posData, semantic: .vertex,
-            vectorCount: item.vertexCount, usesFloatComponents: true,
+            vectorCount: vertexCount, usesFloatComponents: true,
             componentsPerVector: 3, bytesPerComponent: 4, dataOffset: 0, dataStride: 12)
         let normSource = SCNGeometrySource(data: normData, semantic: .normal,
-            vectorCount: item.vertexCount, usesFloatComponents: true,
+            vectorCount: vertexCount, usesFloatComponents: true,
             componentsPerVector: 3, bytesPerComponent: 4, dataOffset: 0, dataStride: 12)
-        let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
-            primitiveCount: item.indices.count / 3, bytesPerIndex: 4)
 
-        let geo = SCNGeometry(sources: [posSource, normSource], elements: [element])
-        let mat = SCNMaterial()
-        mat.diffuse.contents = item.color
-        mat.lightingModel = .lambert
-        mat.isDoubleSided = false
-        geo.materials = [mat]
+        var elements:  [SCNGeometryElement] = []
+        var materials: [SCNMaterial] = []
 
+        for (cls, triIndices) in classGroups.sorted(by: { $0.key < $1.key }) {
+            let idxData = triIndices.withUnsafeBufferPointer { Data(buffer: $0) }
+            let element = SCNGeometryElement(data: idxData, primitiveType: .triangles,
+                primitiveCount: triIndices.count / 3, bytesPerIndex: 4)
+            elements.append(element)
+
+            let classification = MeshClassification(rawValue: cls) ?? .none
+            let mat = SCNMaterial()
+            let c = classification.color
+            mat.diffuse.contents = UIColor(red: c.r, green: c.g, blue: c.b, alpha: 0.9)
+            mat.lightingModel = .lambert
+            mat.isDoubleSided = true
+            materials.append(mat)
+        }
+
+        let geo = SCNGeometry(sources: [posSource, normSource], elements: elements)
+        geo.materials = materials
         return SCNNode(geometry: geo)
-    }
-}
-
-// MARK: - Geometry Buffer
-
-private struct GeomBuf {
-    var positions: [Float] = []
-    var normals: [Float] = []
-    var indices: [UInt32] = []
-    var vertexCount: Int = 0
-
-    mutating func addQuad(x: Float, z: Float, w: Float, d: Float) {
-        let b = UInt32(vertexCount)
-        let hw = w / 2, hd = d / 2
-        positions += [x-hw, 0, z-hd,  x+hw, 0, z-hd,  x+hw, 0, z+hd,  x-hw, 0, z+hd]
-        normals   += [0, 1, 0,  0, 1, 0,  0, 1, 0,  0, 1, 0]
-        indices   += [b, b+1, b+2,  b, b+2, b+3]
-        vertexCount += 4
-    }
-
-    mutating func addBox(x: Float, y: Float, z: Float, w: Float, h: Float, d: Float) {
-        let hw = w/2, hh = h/2, hd = d/2
-        let b = UInt32(vertexCount)
-
-        // Top
-        positions += [x-hw, y+hh, z-hd,  x+hw, y+hh, z-hd,  x+hw, y+hh, z+hd,  x-hw, y+hh, z+hd]
-        normals   += [0,1,0,  0,1,0,  0,1,0,  0,1,0]
-        indices   += [b, b+1, b+2,  b, b+2, b+3]
-
-        // Front (+Z)
-        positions += [x-hw, y-hh, z+hd,  x+hw, y-hh, z+hd,  x+hw, y+hh, z+hd,  x-hw, y+hh, z+hd]
-        normals   += [0,0,1,  0,0,1,  0,0,1,  0,0,1]
-        indices   += [b+4, b+5, b+6,  b+4, b+6, b+7]
-
-        // Back (-Z)
-        positions += [x+hw, y-hh, z-hd,  x-hw, y-hh, z-hd,  x-hw, y+hh, z-hd,  x+hw, y+hh, z-hd]
-        normals   += [0,0,-1,  0,0,-1,  0,0,-1,  0,0,-1]
-        indices   += [b+8, b+9, b+10,  b+8, b+10, b+11]
-
-        // Right (+X)
-        positions += [x+hw, y-hh, z+hd,  x+hw, y-hh, z-hd,  x+hw, y+hh, z-hd,  x+hw, y+hh, z+hd]
-        normals   += [1,0,0,  1,0,0,  1,0,0,  1,0,0]
-        indices   += [b+12, b+13, b+14,  b+12, b+14, b+15]
-
-        // Left (-X)
-        positions += [x-hw, y-hh, z-hd,  x-hw, y-hh, z+hd,  x-hw, y+hh, z+hd,  x-hw, y+hh, z-hd]
-        normals   += [-1,0,0,  -1,0,0,  -1,0,0,  -1,0,0]
-        indices   += [b+16, b+17, b+18,  b+16, b+18, b+19]
-
-        vertexCount += 20
     }
 }

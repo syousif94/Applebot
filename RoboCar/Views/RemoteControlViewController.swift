@@ -386,6 +386,10 @@ final class RemoteControlViewController: UIViewController {
             mapView.plannedPath = []
             mapView.setNeedsDisplay()
             meshVoxelView.refresh()
+        case "meshAnchors":
+            if let anchors = message.meshAnchors, !anchors.isEmpty {
+                meshVoxelView.updateMeshAnchors(anchors)
+            }
         case "servoList", "servoState", "status":
             break
         default:

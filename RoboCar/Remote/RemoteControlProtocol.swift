@@ -102,6 +102,7 @@ struct RemoteMessage: Codable {
     var sdpMLineIndex: Int32?
     var nlCommand: String?
     var isLocalConnection: Bool?
+    var meshAnchors: [MeshAnchorSnapshot]?
 
     init(type: String) {
         self.type = type

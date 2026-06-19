@@ -24,6 +24,7 @@ final class RemoteControlHostService {
     private var latestStatusMessage: RemoteMessage?
     private var latestMapStateMessage: RemoteMessage?
     private var latestGridUpdateMessage: RemoteMessage?
+    private var latestMeshMessage: RemoteMessage?
     private var latestServoIDsMessage: RemoteMessage?
     private var latestServoStateMessage: RemoteMessage?
     private var seq: UInt64 = 0
@@ -160,7 +161,16 @@ final class RemoteControlHostService {
         broadcast(message)
     }
 
+    func broadcastMeshAnchors(_ snapshots: [MeshAnchorSnapshot]) {
+        guard !snapshots.isEmpty else { return }
+        var message = RemoteMessage(type: "meshAnchors")
+        message.meshAnchors = snapshots
+        latestMeshMessage = message
+        broadcast(message)
+    }
+
     func broadcastGridReset() {
+        latestMeshMessage = nil
         broadcast(RemoteMessage(type: "gridReset"))
     }
 
@@ -314,6 +324,7 @@ final class RemoteControlHostService {
                 self.latestStatusMessage,
                 self.latestMapStateMessage,
                 self.latestGridUpdateMessage,
+                self.latestMeshMessage,
                 self.latestServoIDsMessage,
                 self.latestServoStateMessage
             ].compactMap { $0 }.forEach { self.broadcast($0) }
