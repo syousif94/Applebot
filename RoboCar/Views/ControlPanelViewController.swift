@@ -83,6 +83,8 @@ class ControlPanelViewController: UIViewController {
     private let telemetryButton = UIButton(type: .custom)
     private let telemetryStatusDot = UIView()
     private let telemetryStatusLabel = UILabel()
+
+
     
     private let ble = ESP32BLEManager.shared
     private let keyboardDriveState = KeyboardDriveState()
@@ -1069,7 +1071,7 @@ class ControlPanelViewController: UIViewController {
         
         updateTelemetryUI(connected: false, url: TelemetryService.shared.serverURL)
     }
-    
+
     @objc private func telemetryButtonTapped() {
         dismissKeyboard()
         

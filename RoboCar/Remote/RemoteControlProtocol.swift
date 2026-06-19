@@ -100,6 +100,8 @@ struct RemoteMessage: Codable {
     var candidate: String?
     var sdpMid: String?
     var sdpMLineIndex: Int32?
+    var nlCommand: String?
+    var isLocalConnection: Bool?
 
     init(type: String) {
         self.type = type

@@ -21,7 +21,7 @@
 (allow file-read-metadata)
 
 ; File writes (user-specified directories)
-(allow file-write* (subpath "/Users/syousif/Developer/RoboCar"))
+(allow file-write* (subpath "/Users/syousif/Developer/Robo/RoboCar"))
 
 ; Temp directories
 (allow file-write* (subpath "/private/var/folders/t_/0_qvx_kn141_w7lhplgh78bm0000gn/T"))

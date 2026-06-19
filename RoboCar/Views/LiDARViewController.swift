@@ -155,6 +155,7 @@ class LiDARViewController: UIViewController {
         setupObstacleDetector()
         setupNavigationController()
         setupRemoteControlHost()
+        setupNLNavigator()
         
         // Use CADisplayLink for smooth updates
         displayLink = CADisplayLink(target: self, selector: #selector(updateFrame))
@@ -243,7 +244,22 @@ class LiDARViewController: UIViewController {
             RemoteControlHostService.shared.broadcastServoState(state)
         }
     }
-    
+
+    private func setupNLNavigator() {
+        NLNavigator.shared.occupancyGrid = occupancyGrid
+        NLNavigator.shared.arSession = arView.session
+        NLNavigator.shared.onStatusChanged = { [weak self] status in
+            guard let self else { return }
+            if let status {
+                self.voiceStatusLabel.text = status
+                self.voiceStatusLabel.textColor = UIColor(red: 0.5, green: 0.85, blue: 1.0, alpha: 1)
+                UIView.animate(withDuration: 0.2) { self.voiceStatusLabel.alpha = 1 }
+            } else {
+                UIView.animate(withDuration: 0.3) { self.voiceStatusLabel.alpha = 0 }
+            }
+        }
+    }
+
     private func setupStatusLabels() {
         // Status label (top left)
         statusLabel = UILabel()
@@ -504,7 +520,10 @@ class LiDARViewController: UIViewController {
         
         // Reset the grid view's initial heading
         gridMapView.resetInitialHeading()
-        
+
+        // Notify remote controller to reset its map
+        RemoteControlHostService.shared.broadcastGridReset()
+
         // Force redraw
         gridMapView.setNeedsDisplay()
     }
@@ -2434,7 +2453,9 @@ class LiDARViewController: UIViewController {
             positionLabel.text = String(format: "X: %.2f\nY: %.2f\nZ: %.2f\nθ: %.0f°",
                                         pos.x, pos.y, pos.z, pos.heading * 180 / .pi)
             
-            statusLabel.text = "📡 Meshes: \(meshCount)\n🔲 Occupied: \(occupancyGrid.occupiedCount)\n⬜ Free: \(occupancyGrid.freeCount)"
+            let host = RemoteControlHostService.shared
+            let connLine = host.clientCount > 0 ? "\n📶 \(host.isLocalConnection ? "local" : "remote")" : ""
+            statusLabel.text = "📡 Meshes: \(meshCount)\n🔲 Occupied: \(occupancyGrid.occupiedCount)\n⬜ Free: \(occupancyGrid.freeCount)\(connLine)"
             statusLabel.textColor = .green
             
             // Telemetry: emit nav frame at ~10 Hz
@@ -2578,7 +2599,8 @@ class LiDARViewController: UIViewController {
         guard RemoteControlHostService.shared.clientCount > 0 else { return }
         guard !isRemoteSnapshotInFlight else { return }
         let now = Date()
-        guard now.timeIntervalSince(lastRemoteCameraFrameTime) >= 0.15 else { return }
+        let minInterval: TimeInterval = RemoteControlHostService.shared.isLocalConnection ? 0.05 : 0.15
+        guard now.timeIntervalSince(lastRemoteCameraFrameTime) >= minInterval else { return }
         lastRemoteCameraFrameTime = now
         isRemoteSnapshotInFlight = true
 
@@ -2591,14 +2613,20 @@ class LiDARViewController: UIViewController {
     }
 
     private func makeRemoteCameraFrame(from arImage: UIImage) -> UIImage {
-        let maxStreamSize = CGSize(width: 640, height: 720)
+        let maxStreamSize = RemoteControlHostService.shared.isLocalConnection
+            ? CGSize(width: 1280, height: 1440)
+            : CGSize(width: 640, height: 720)
+        // Use pixel dimensions so the cap is meaningful on Retina displays.
+        // ARView snapshots are Metal-rendered, so cgImage may be nil; size*scale is always correct.
+        let pixelWidth = arImage.size.width * arImage.scale
+        let pixelHeight = arImage.size.height * arImage.scale
         let scale = min(
-            maxStreamSize.width / max(arImage.size.width, 1),
-            maxStreamSize.height / max(arImage.size.height, 1),
+            maxStreamSize.width / max(pixelWidth, 1),
+            maxStreamSize.height / max(pixelHeight, 1),
             1
         )
-        let targetWidth = max(2, Int((arImage.size.width * scale).rounded(.down))) & ~1
-        let targetHeight = max(2, Int((arImage.size.height * scale).rounded(.down))) & ~1
+        let targetWidth = max(2, Int((pixelWidth * scale).rounded(.down))) & ~1
+        let targetHeight = max(2, Int((pixelHeight * scale).rounded(.down))) & ~1
         let targetSize = CGSize(width: targetWidth, height: targetHeight)
         let overlayBounds = arView.bounds
         let overlays: [UIView] = [obstaclePointOverlay, personBoundingBoxOverlay, handJointOverlay]

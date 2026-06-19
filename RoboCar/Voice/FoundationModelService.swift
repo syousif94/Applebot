@@ -314,13 +314,14 @@ class FoundationModelService {
             createSession()
             return try await sendCommand(command)
         }
-        
+
         do {
-            let response = try await session.respond(to: command)
+            let response = try await session.respond {
+                command
+            }
             return response.content
         } catch {
             print("[Model] Error: \(error)")
-            // Recreate session on error and rethrow
             createSession()
             throw error
         }

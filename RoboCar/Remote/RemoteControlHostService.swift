@@ -28,6 +28,7 @@ final class RemoteControlHostService {
     private var latestServoStateMessage: RemoteMessage?
     private var seq: UInt64 = 0
     private var staleDriveTimer: DispatchSourceTimer?
+    private var motorStopTimer: DispatchSourceTimer?
     private var lastDriveCommandDate: Date?
     private let driveTimeout: TimeInterval = 0.75
     private var attemptedVideoFrameCount: UInt64 = 0
@@ -36,6 +37,8 @@ final class RemoteControlHostService {
 
     var isRunning: Bool { listener != nil }
     var clientCount: Int { signalingConnection == nil ? 0 : 1 }
+    private var isLocalConnectionDetected = false
+    var isLocalConnection: Bool { isLocalConnectionDetected }
 
     func start(port: UInt16 = RemoteControlProtocol.defaultPort) {
         guard listener == nil else { return }
@@ -72,6 +75,8 @@ final class RemoteControlHostService {
             self.webRTCSession = nil
             self.staleDriveTimer?.cancel()
             self.staleDriveTimer = nil
+            self.motorStopTimer?.cancel()
+            self.motorStopTimer = nil
             self.lastDriveCommandDate = nil
             DispatchQueue.main.async { ESP32BLEManager.shared.stopAll() }
             self.publishStatus("Remote host stopped")
@@ -82,6 +87,7 @@ final class RemoteControlHostService {
         var message = RemoteMessage(type: "status")
         message.bleConnected = ESP32BLEManager.shared.connectionState == .connected
         message.message = "\(clientCount) remote client(s)"
+        message.isLocalConnection = isLocalConnection
         latestStatusMessage = message
         broadcast(message)
     }
@@ -154,6 +160,10 @@ final class RemoteControlHostService {
         broadcast(message)
     }
 
+    func broadcastGridReset() {
+        broadcast(RemoteMessage(type: "gridReset"))
+    }
+
     private func handleListenerState(_ state: NWListener.State) {
         switch state {
         case .ready:
@@ -169,9 +179,12 @@ final class RemoteControlHostService {
     }
 
     private func accept(_ connection: NWConnection) {
+        motorStopTimer?.cancel()
+        motorStopTimer = nil
         signalingConnection?.cancel()
         signalingConnection = connection
         receiveBuffer = ""
+        let oldSession = webRTCSession
         let session = RemoteControlWebRTCSession(role: .host)
         session.onSignal = { [weak self] message in
             self?.sendSignal(message)
@@ -184,6 +197,7 @@ final class RemoteControlHostService {
             self?.publishStatus("WebRTC sent view frame #\(count) (\(width)x\(height))")
         }
         webRTCSession = session
+        oldSession?.stop()
         connection.stateUpdateHandler = { [weak self, weak connection] state in
             guard let self, let connection else { return }
             switch state {
@@ -209,9 +223,23 @@ final class RemoteControlHostService {
         receiveBuffer = ""
         webRTCSession?.stop()
         webRTCSession = nil
-        DispatchQueue.main.async { ESP32BLEManager.shared.stopAll() }
+        DispatchQueue.main.async { [weak self] in self?.isLocalConnectionDetected = false }
+        scheduleMotorStop()
         publishStatus("Remote client disconnected")
         broadcastStatus()
+    }
+
+    private func scheduleMotorStop() {
+        motorStopTimer?.cancel()
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 2.0)
+        timer.setEventHandler { [weak self] in
+            guard let self, self.signalingConnection == nil else { return }
+            self.motorStopTimer = nil
+            DispatchQueue.main.async { ESP32BLEManager.shared.stopAll() }
+        }
+        motorStopTimer = timer
+        timer.resume()
     }
 
     private func receive(on connection: NWConnection) {
@@ -237,6 +265,16 @@ final class RemoteControlHostService {
             if message.type == "webrtcSignal" {
                 print("[RemoteWebRTC] host: received signal \(message.signalType ?? "unknown")")
                 webRTCSession?.handleSignal(message)
+                continue
+            }
+            if message.type == "connectionInfo" {
+                let isLocal = message.isLocalConnection ?? false
+                webRTCSession?.configureForLocalConnection(isLocal)
+                DispatchQueue.main.async { [weak self] in
+                    self?.isLocalConnectionDetected = isLocal
+                }
+                publishStatus("WebRTC connection: \(isLocal ? "local" : "remote")")
+                broadcastStatus()
                 continue
             }
             if message.type == "drive" {

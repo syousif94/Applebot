@@ -126,6 +126,22 @@ final class RemoteControlWebRTCSession: NSObject {
         }
     }
 
+    func configureForLocalConnection(_ isLocal: Bool) {
+        queue.async { [weak self] in
+            guard let self else { return }
+            let maxBps = isLocal ? 10_000_000 : 1_000_000
+            let fps: Int32 = isLocal ? 20 : 10
+            self.viewStreamer?.targetFps = fps
+            guard let sender = self.peerConnection?.senders.first(where: { $0.track?.kind == "video" }) else { return }
+            let params = sender.parameters
+            for encoding in params.encodings {
+                encoding.maxBitrateBps = NSNumber(value: maxBps)
+            }
+            sender.parameters = params
+            self.log("configured for \(isLocal ? "local" : "remote"): \(maxBps / 1000)kbps max, \(fps)fps")
+        }
+    }
+
     func sendVideoFrame(_ image: UIImage) {
         queue.async { [weak self] in
             guard let self, let streamer = self.viewStreamer else {
@@ -340,6 +356,7 @@ extension RemoteControlWebRTCSession: RTCPeerConnectionDelegate {
 
 private final class RemoteRenderedViewStreamer {
     var onFrameSent: ((Int, Int, UInt64) -> Void)?
+    var targetFps: Int32 = 10
 
     private let videoSource: RTCVideoSource
     private let capturer: RTCVideoCapturer
@@ -356,7 +373,7 @@ private final class RemoteRenderedViewStreamer {
         guard let pixelBuffer = makePixelBuffer(for: image) else { return }
         let width = CVPixelBufferGetWidth(pixelBuffer)
         let height = CVPixelBufferGetHeight(pixelBuffer)
-        videoSource.adaptOutputFormat(toWidth: Int32(width), height: Int32(height), fps: 10)
+        videoSource.adaptOutputFormat(toWidth: Int32(width), height: Int32(height), fps: targetFps)
 
         let buffer = RTCCVPixelBuffer(pixelBuffer: pixelBuffer)
         let timestampNs = Int64(Date().timeIntervalSince1970 * 1_000_000_000)
@@ -492,6 +509,8 @@ private extension RTCIceCandidate {
         return "unknown"
     }
 }
+
+
 
 private extension RTCIceConnectionState {
     var description: String {

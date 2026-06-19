@@ -6,6 +6,8 @@
 import UIKit
 import Network
 import WebRTC
+import Speech
+import AVFoundation
 
 final class RemoteControlViewController: UIViewController {
     private let client = RemoteControlClientService()
@@ -16,11 +18,28 @@ final class RemoteControlViewController: UIViewController {
     private let cameraVideoView = RTCMTLVideoView()
     private let videoFallbackImageView = UIImageView()
     private let mapView: GridMapView
+    private let meshVoxelView = MeshVoxelView()
+    private let mapToggleButton = UIButton(type: .system)
+    private var showingMesh = false
     private let statusLabel = UILabel()
     private let runButton = UIButton(type: .system)
     private let pauseButton = UIButton(type: .system)
     private let clearButton = UIButton(type: .system)
     private let settingsButton = UIButton(type: .system)
+
+    // NL command bar
+    private let nlCommandBar = UIView()
+    private let nlCommandField = UITextField()
+    private let nlCommandMicButton = UIButton(type: .system)
+    private let nlCommandSendButton = UIButton(type: .system)
+    private let nlCommandStopButton = UIButton(type: .system)
+
+    // Speech recognition
+    private var sfRecognizer: SFSpeechRecognizer?
+    private var sfRequest: SFSpeechAudioBufferRecognitionRequest?
+    private var sfTask: SFSpeechRecognitionTask?
+    private var audioEngine: AVAudioEngine?
+    private var isRecording = false
 
     private var compactContentConstraints: [NSLayoutConstraint] = []
     private var wideContentConstraints: [NSLayoutConstraint] = []
@@ -28,6 +47,12 @@ final class RemoteControlViewController: UIViewController {
 
     private var discoveredHosts: [RemoteControlDiscoveredHost] = []
     private weak var settingsViewController: RemoteControlSettingsViewController?
+
+    private var isTailscaleConnection = false
+    private var pendingReconnect: DispatchWorkItem?
+
+    private let connectionBadgeLabel = UILabel()
+    private var connectionBadgeHiddenConstraint: NSLayoutConstraint!
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -46,11 +71,16 @@ final class RemoteControlViewController: UIViewController {
         setupUI()
         setupNetworking()
         browser.start()
+        startAutoConnect()
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        pendingReconnect?.cancel()
+        pendingReconnect = nil
         stopKeyboardDriveIfNeeded()
+        stopSpeechRecognition()
+        client.sendStopNLCommand()
         client.disconnect()
         browser.stop()
     }
@@ -110,12 +140,33 @@ final class RemoteControlViewController: UIViewController {
         }
         view.addSubview(mapView)
 
+        meshVoxelView.translatesAutoresizingMaskIntoConstraints = false
+        meshVoxelView.occupancyGrid = remoteGrid
+        meshVoxelView.isHidden = true
+        view.addSubview(meshVoxelView)
+
+        configureIconGlassButton(mapToggleButton, systemImageName: "square.3.layers.3d")
+        mapToggleButton.addTarget(self, action: #selector(mapViewToggleTapped), for: .touchUpInside)
+        view.addSubview(mapToggleButton)
+
         statusLabel.translatesAutoresizingMaskIntoConstraints = false
         statusLabel.textColor = .white
         statusLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
         statusLabel.numberOfLines = 2
         statusLabel.text = "Discovering RoboCar..."
         view.addSubview(statusLabel)
+
+        connectionBadgeLabel.translatesAutoresizingMaskIntoConstraints = false
+        connectionBadgeLabel.font = .systemFont(ofSize: 11, weight: .bold)
+        connectionBadgeLabel.textColor = .white
+        connectionBadgeLabel.textAlignment = .center
+        connectionBadgeLabel.layer.cornerRadius = 6
+        connectionBadgeLabel.clipsToBounds = true
+        connectionBadgeLabel.setContentHuggingPriority(.required, for: .horizontal)
+        connectionBadgeLabel.setContentCompressionResistancePriority(.required, for: .horizontal)
+        view.addSubview(connectionBadgeLabel)
+        connectionBadgeHiddenConstraint = connectionBadgeLabel.widthAnchor.constraint(equalToConstant: 0)
+        connectionBadgeHiddenConstraint.isActive = true
 
         configureGlassButton(runButton, title: "Run", systemImageName: "play.fill")
         configureGlassButton(pauseButton, title: "Pause", systemImageName: "pause.fill")
@@ -127,10 +178,16 @@ final class RemoteControlViewController: UIViewController {
         settingsButton.addTarget(self, action: #selector(settingsTapped), for: .touchUpInside)
         [runButton, pauseButton, clearButton, settingsButton].forEach(view.addSubview)
 
+        setupNLCommandBar()
+
         NSLayoutConstraint.activate([
             statusLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 12),
             statusLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            statusLabel.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -12),
+            statusLabel.trailingAnchor.constraint(equalTo: connectionBadgeLabel.leadingAnchor, constant: -4),
+
+            connectionBadgeLabel.trailingAnchor.constraint(equalTo: settingsButton.leadingAnchor, constant: -8),
+            connectionBadgeLabel.centerYAnchor.constraint(equalTo: settingsButton.centerYAnchor),
+            connectionBadgeLabel.heightAnchor.constraint(equalToConstant: 22),
 
             settingsButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 10),
             settingsButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
@@ -138,7 +195,7 @@ final class RemoteControlViewController: UIViewController {
             settingsButton.heightAnchor.constraint(equalToConstant: 36),
 
             runButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 16),
-            runButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -10),
+            runButton.bottomAnchor.constraint(equalTo: nlCommandBar.topAnchor, constant: -8),
             runButton.heightAnchor.constraint(equalToConstant: 40),
 
             pauseButton.leadingAnchor.constraint(equalTo: runButton.trailingAnchor, constant: 10),
@@ -184,6 +241,17 @@ final class RemoteControlViewController: UIViewController {
             mapView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             mapView.bottomAnchor.constraint(equalTo: cameraVideoView.bottomAnchor)
         ]
+        NSLayoutConstraint.activate([
+            meshVoxelView.topAnchor.constraint(equalTo: mapView.topAnchor),
+            meshVoxelView.leadingAnchor.constraint(equalTo: mapView.leadingAnchor),
+            meshVoxelView.trailingAnchor.constraint(equalTo: mapView.trailingAnchor),
+            meshVoxelView.bottomAnchor.constraint(equalTo: mapView.bottomAnchor),
+
+            mapToggleButton.topAnchor.constraint(equalTo: mapView.topAnchor, constant: 8),
+            mapToggleButton.leadingAnchor.constraint(equalTo: mapView.leadingAnchor, constant: 8),
+            mapToggleButton.widthAnchor.constraint(equalToConstant: 44),
+            mapToggleButton.heightAnchor.constraint(equalToConstant: 36),
+        ])
         updateContentLayoutIfNeeded(force: true)
     }
 
@@ -211,6 +279,19 @@ final class RemoteControlViewController: UIViewController {
             self?.videoFallbackImageView.image = image
             self?.videoFallbackImageView.isHidden = false
         }
+        client.onConnected = { [weak self] in
+            guard let self else { return }
+            self.pendingReconnect?.cancel()
+            self.updateConnectionBadge()
+            var info = RemoteMessage(type: "connectionInfo")
+            info.isLocalConnection = !self.isTailscaleConnection
+            self.client.send(info)
+        }
+        client.onDisconnected = { [weak self] in
+            self?.isTailscaleConnection = false
+            self?.updateConnectionBadge()
+            self?.scheduleReconnect()
+        }
         browser.onStatusChanged = { [weak self] status in
             if self?.client.isConnected == false {
                 self?.statusLabel.text = status
@@ -219,6 +300,64 @@ final class RemoteControlViewController: UIViewController {
         browser.onHostsChanged = { [weak self] hosts in
             self?.discoveredHosts = hosts
             self?.settingsViewController?.updateDiscoveredHosts(hosts)
+            self?.onBonjourHostsChanged(hosts)
+        }
+    }
+
+    private func startAutoConnect() {
+        if let ip = UserDefaults.standard.string(forKey: "remoteControlHost"), !ip.isEmpty {
+            isTailscaleConnection = true
+            client.connect(host: ip)
+        }
+        // Bonjour will connect via onBonjourHostsChanged if no Tailscale IP is saved
+    }
+
+    private func onBonjourHostsChanged(_ hosts: [RemoteControlDiscoveredHost]) {
+        guard let host = hosts.first else { return }
+        if isTailscaleConnection, client.isConnected {
+            // Upgrade from Tailscale to local LAN — robot is now visible on local network
+            isTailscaleConnection = false
+            client.connect(to: host.endpoint)
+        } else if !client.isConnected {
+            isTailscaleConnection = false
+            client.connect(to: host.endpoint)
+        }
+    }
+
+    private func scheduleReconnect() {
+        pendingReconnect?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, !self.client.isConnected else { return }
+            self.autoReconnect()
+        }
+        pendingReconnect = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
+    }
+
+    private func autoReconnect() {
+        if let host = discoveredHosts.first {
+            isTailscaleConnection = false
+            client.connect(to: host.endpoint)
+        } else if let ip = UserDefaults.standard.string(forKey: "remoteControlHost"), !ip.isEmpty {
+            isTailscaleConnection = true
+            client.connect(host: ip)
+        }
+    }
+
+    private func updateConnectionBadge() {
+        if client.isConnected {
+            connectionBadgeHiddenConstraint.isActive = false
+            connectionBadgeLabel.isHidden = false
+            if isTailscaleConnection {
+                connectionBadgeLabel.text = "  VPN  "
+                connectionBadgeLabel.backgroundColor = UIColor(red: 0.35, green: 0.45, blue: 0.95, alpha: 1)
+            } else {
+                connectionBadgeLabel.text = "  LOCAL  "
+                connectionBadgeLabel.backgroundColor = UIColor(red: 0.2, green: 0.72, blue: 0.4, alpha: 1)
+            }
+        } else {
+            connectionBadgeLabel.isHidden = true
+            connectionBadgeHiddenConstraint.isActive = true
         }
     }
 
@@ -237,10 +376,16 @@ final class RemoteControlViewController: UIViewController {
             } ?? mapView.routePreviewPaths
             mapView.activeRouteWaypointIndex = message.activeRouteWaypointIndex ?? mapView.activeRouteWaypointIndex
             mapView.setNeedsDisplay()
+            if !meshVoxelView.isHidden { meshVoxelView.refresh() }
             let ble = message.bleConnected == true ? "BLE connected" : "BLE disconnected"
             statusLabel.text = "\(message.navState ?? "remote") - \(ble)"
         case "gridUpdate":
             applyGridUpdate(message.grid)
+        case "gridReset":
+            remoteGrid.clear()
+            mapView.plannedPath = []
+            mapView.setNeedsDisplay()
+            meshVoxelView.refresh()
         case "servoList", "servoState", "status":
             break
         default:
@@ -274,6 +419,17 @@ final class RemoteControlViewController: UIViewController {
             remoteGrid.markOccupiedBatchWithClassification(occupiedCells)
         }
         mapView.setNeedsDisplay()
+        if !meshVoxelView.isHidden { meshVoxelView.refresh() }
+    }
+
+    @objc private func mapViewToggleTapped() {
+        showingMesh.toggle()
+        mapView.isHidden = showingMesh
+        meshVoxelView.isHidden = !showingMesh
+        var cfg = mapToggleButton.configuration ?? .plain()
+        cfg.image = UIImage(systemName: showingMesh ? "map.fill" : "square.3.layers.3d")
+        mapToggleButton.configuration = cfg
+        if showingMesh { meshVoxelView.refresh() }
     }
 
     @objc private func runRouteTapped() {
@@ -291,6 +447,9 @@ final class RemoteControlViewController: UIViewController {
 
     @objc private func settingsTapped() {
         let settings = RemoteControlSettingsViewController(client: client, discoveredHosts: discoveredHosts)
+        settings.onWillConnect = { [weak self] isTailscale in
+            self?.isTailscaleConnection = isTailscale
+        }
         settingsViewController = settings
         settings.preferredContentSize = CGSize(width: 620, height: 760)
     #if targetEnvironment(macCatalyst)
@@ -314,9 +473,190 @@ final class RemoteControlViewController: UIViewController {
     private func stopKeyboardDriveIfNeeded() {
         _ = handleKeyboardDrive(keyboardDriveState.reset())
     }
+
+    // MARK: - NL Command Bar
+
+    private func setupNLCommandBar() {
+        nlCommandBar.translatesAutoresizingMaskIntoConstraints = false
+        nlCommandBar.backgroundColor = UIColor(white: 0.08, alpha: 1)
+        view.addSubview(nlCommandBar)
+
+        nlCommandField.translatesAutoresizingMaskIntoConstraints = false
+        nlCommandField.backgroundColor = UIColor(white: 0.18, alpha: 1)
+        nlCommandField.textColor = .white
+        nlCommandField.font = .systemFont(ofSize: 15)
+        nlCommandField.layer.cornerRadius = 10
+        nlCommandField.leftView = UIView(frame: CGRect(x: 0, y: 0, width: 10, height: 1))
+        nlCommandField.leftViewMode = .always
+        nlCommandField.returnKeyType = .send
+        nlCommandField.delegate = self
+        nlCommandField.attributedPlaceholder = NSAttributedString(
+            string: "Send a command to the robot…",
+            attributes: [.foregroundColor: UIColor(white: 0.45, alpha: 1)]
+        )
+        nlCommandBar.addSubview(nlCommandField)
+
+        var micCfg = UIButton.Configuration.plain()
+        micCfg.image = UIImage(systemName: "mic.fill")
+        micCfg.baseForegroundColor = .white
+        nlCommandMicButton.translatesAutoresizingMaskIntoConstraints = false
+        nlCommandMicButton.configuration = micCfg
+        nlCommandMicButton.addTarget(self, action: #selector(nlMicTapped), for: .touchUpInside)
+        nlCommandBar.addSubview(nlCommandMicButton)
+
+        var sendCfg = UIButton.Configuration.plain()
+        sendCfg.image = UIImage(systemName: "arrow.up.circle.fill")
+        sendCfg.baseForegroundColor = UIColor(red: 0.3, green: 0.7, blue: 1.0, alpha: 1)
+        nlCommandSendButton.translatesAutoresizingMaskIntoConstraints = false
+        nlCommandSendButton.configuration = sendCfg
+        nlCommandSendButton.addTarget(self, action: #selector(nlSendTapped), for: .touchUpInside)
+        nlCommandBar.addSubview(nlCommandSendButton)
+
+        var stopCfg = UIButton.Configuration.plain()
+        stopCfg.image = UIImage(systemName: "stop.circle.fill")
+        stopCfg.baseForegroundColor = UIColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1)
+        nlCommandStopButton.translatesAutoresizingMaskIntoConstraints = false
+        nlCommandStopButton.configuration = stopCfg
+        nlCommandStopButton.isHidden = true
+        nlCommandStopButton.addTarget(self, action: #selector(nlStopTapped), for: .touchUpInside)
+        nlCommandBar.addSubview(nlCommandStopButton)
+
+        NSLayoutConstraint.activate([
+            nlCommandBar.leadingAnchor.constraint(equalTo: view.leadingAnchor),
+            nlCommandBar.trailingAnchor.constraint(equalTo: view.trailingAnchor),
+            nlCommandBar.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor),
+            nlCommandBar.heightAnchor.constraint(equalToConstant: 52),
+
+            nlCommandStopButton.trailingAnchor.constraint(equalTo: nlCommandBar.trailingAnchor, constant: -10),
+            nlCommandStopButton.centerYAnchor.constraint(equalTo: nlCommandBar.centerYAnchor),
+            nlCommandStopButton.widthAnchor.constraint(equalToConstant: 40),
+            nlCommandStopButton.heightAnchor.constraint(equalToConstant: 40),
+
+            nlCommandSendButton.trailingAnchor.constraint(equalTo: nlCommandStopButton.leadingAnchor, constant: -2),
+            nlCommandSendButton.centerYAnchor.constraint(equalTo: nlCommandBar.centerYAnchor),
+            nlCommandSendButton.widthAnchor.constraint(equalToConstant: 40),
+            nlCommandSendButton.heightAnchor.constraint(equalToConstant: 40),
+
+            nlCommandMicButton.trailingAnchor.constraint(equalTo: nlCommandSendButton.leadingAnchor, constant: -2),
+            nlCommandMicButton.centerYAnchor.constraint(equalTo: nlCommandBar.centerYAnchor),
+            nlCommandMicButton.widthAnchor.constraint(equalToConstant: 40),
+            nlCommandMicButton.heightAnchor.constraint(equalToConstant: 40),
+
+            nlCommandField.leadingAnchor.constraint(equalTo: nlCommandBar.leadingAnchor, constant: 10),
+            nlCommandField.trailingAnchor.constraint(equalTo: nlCommandMicButton.leadingAnchor, constant: -6),
+            nlCommandField.centerYAnchor.constraint(equalTo: nlCommandBar.centerYAnchor),
+            nlCommandField.heightAnchor.constraint(equalToConstant: 36),
+        ])
+    }
+
+    @objc private func nlMicTapped() {
+        if isRecording {
+            stopSpeechRecognition()
+        } else {
+            startSpeechRecognition()
+        }
+    }
+
+    @objc private func nlSendTapped() {
+        sendNLCommand()
+    }
+
+    @objc private func nlStopTapped() {
+        client.sendStopNLCommand()
+        nlCommandStopButton.isHidden = true
+        nlCommandField.text = nil
+    }
+
+    private func sendNLCommand() {
+        stopSpeechRecognition()
+        guard let text = nlCommandField.text?.trimmingCharacters(in: .whitespacesAndNewlines), !text.isEmpty else { return }
+        client.sendNLCommand(text)
+        nlCommandField.resignFirstResponder()
+        nlCommandField.text = nil
+        nlCommandStopButton.isHidden = false
+    }
+
+    // MARK: - Speech Recognition
+
+    private func startSpeechRecognition() {
+        SFSpeechRecognizer.requestAuthorization { [weak self] status in
+            guard status == .authorized else { return }
+            DispatchQueue.main.async { self?.beginSpeechCapture() }
+        }
+    }
+
+    private func beginSpeechCapture() {
+        sfRecognizer = SFSpeechRecognizer()
+        guard let recognizer = sfRecognizer, recognizer.isAvailable else { return }
+
+        let request = SFSpeechAudioBufferRecognitionRequest()
+        sfRequest = request
+        request.shouldReportPartialResults = true
+
+        sfTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+            guard let self else { return }
+            if let result {
+                self.nlCommandField.text = result.bestTranscription.formattedString
+            }
+            if result?.isFinal == true || error != nil {
+                self.stopSpeechRecognition()
+            }
+        }
+
+        let engine = AVAudioEngine()
+        audioEngine = engine
+        let inputNode = engine.inputNode
+        let format = inputNode.outputFormat(forBus: 0)
+        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+            self?.sfRequest?.append(buffer)
+        }
+
+        do {
+            try AVAudioSession.sharedInstance().setCategory(.record, mode: .measurement, options: .duckOthers)
+            try AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+            engine.prepare()
+            try engine.start()
+            isRecording = true
+            updateMicButtonAppearance()
+        } catch {
+            print("[NLCmd] Audio error: \(error)")
+            stopSpeechRecognition()
+        }
+    }
+
+    private func stopSpeechRecognition() {
+        audioEngine?.stop()
+        audioEngine?.inputNode.removeTap(onBus: 0)
+        sfRequest?.endAudio()
+        sfTask?.cancel()
+        audioEngine = nil
+        sfRequest = nil
+        sfTask = nil
+        isRecording = false
+        try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
+        updateMicButtonAppearance()
+    }
+
+    private func updateMicButtonAppearance() {
+        var cfg = UIButton.Configuration.plain()
+        cfg.image = UIImage(systemName: isRecording ? "mic.slash.fill" : "mic.fill")
+        cfg.baseForegroundColor = isRecording ? UIColor(red: 1.0, green: 0.4, blue: 0.4, alpha: 1) : .white
+        nlCommandMicButton.configuration = cfg
+    }
+}
+
+extension RemoteControlViewController: UITextFieldDelegate {
+    func textFieldShouldReturn(_ textField: UITextField) -> Bool {
+        if textField === nlCommandField {
+            sendNLCommand()
+        }
+        return true
+    }
 }
 
 private final class RemoteControlSettingsViewController: UIViewController {
+    var onWillConnect: ((_ isTailscale: Bool) -> Void)?
+
     private let client: RemoteControlClientService
     private var discoveredHosts: [RemoteControlDiscoveredHost]
     private let keyboardDriveState = KeyboardDriveState()
@@ -623,12 +963,14 @@ private final class RemoteControlSettingsViewController: UIViewController {
         let host = hostField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !host.isEmpty else { return }
         UserDefaults.standard.set(host, forKey: "remoteControlHost")
+        onWillConnect?(true)
         client.connect(host: host)
         hostField.resignFirstResponder()
     }
 
     @objc private func discoveredHostTapped(_ sender: UIButton) {
         guard discoveredHosts.indices.contains(sender.tag) else { return }
+        onWillConnect?(false)
         client.connect(to: discoveredHosts[sender.tag].endpoint)
     }
 

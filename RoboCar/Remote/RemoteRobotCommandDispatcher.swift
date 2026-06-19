@@ -41,6 +41,13 @@ enum RemoteRobotCommandDispatcher {
             case "stopNavigation":
                 NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
 
+            case "nlCommand":
+                guard let command = message.nlCommand, !command.isEmpty else { return }
+                NLNavigator.shared.start(command: command)
+
+            case "stopNLCommand":
+                NLNavigator.shared.stop()
+
             case "scanServos":
                 ESP32BLEManager.shared.rescanServos(from: message.from ?? 1, to: message.to ?? 20)
 

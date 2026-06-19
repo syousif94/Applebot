@@ -12,6 +12,8 @@ final class RemoteControlClientService {
     var onMessage: ((RemoteMessage) -> Void)?
     var onVideoTrack: ((RTCVideoTrack) -> Void)?
     var onVideoFrameImage: ((UIImage) -> Void)?
+    var onConnected: (() -> Void)?
+    var onDisconnected: (() -> Void)?
 
     private let queue = DispatchQueue(label: "com.robocar.remote.client", qos: .userInitiated)
     private let encoder = JSONEncoder()
@@ -30,21 +32,22 @@ final class RemoteControlClientService {
         parameters.includePeerToPeer = true
         let connection = NWConnection(to: endpoint, using: parameters)
         self.connection = connection
-        connection.stateUpdateHandler = { [weak self] state in
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, connection === self.connection else { return }
             switch state {
             case .ready:
-                self?.isTCPConnected = true
-                self?.publishStatus("WebRTC signaling connected")
-                self?.startWebRTC()
-                self?.receive()
+                self.isTCPConnected = true
+                self.publishStatus("WebRTC signaling connected")
+                self.startWebRTC()
+                self.receive()
+                DispatchQueue.main.async { self.onConnected?() }
             case .waiting(let error):
-                self?.publishStatus("Waiting: \(error.localizedDescription)")
+                self.publishStatus("Waiting: \(error.localizedDescription)")
             case .failed(let error):
-                self?.publishStatus("Connection failed: \(error.localizedDescription)")
-                self?.disconnect(sendStop: false)
+                self.publishStatus("Connection failed: \(error.localizedDescription)")
+                self.handleConnectionLost()
             case .cancelled:
-                self?.isTCPConnected = false
-                self?.publishStatus("Disconnected")
+                self.publishStatus("Disconnected")
             default:
                 break
             }
@@ -80,6 +83,16 @@ final class RemoteControlClientService {
         send(RemoteMessage(type: "stopDrive"))
     }
 
+    func sendNLCommand(_ text: String) {
+        var message = RemoteMessage(type: "nlCommand")
+        message.nlCommand = text
+        send(message)
+    }
+
+    func sendStopNLCommand() {
+        send(RemoteMessage(type: "stopNLCommand"))
+    }
+
     func send(_ message: RemoteMessage) {
         guard let connection else { return }
         queue.async { [weak self] in
@@ -92,6 +105,14 @@ final class RemoteControlClientService {
             var framed = data
             framed.append(0x0A)
             connection.send(content: framed, completion: .contentProcessed { _ in })
+        }
+    }
+
+    private func handleConnectionLost() {
+        let wasConnected = isTCPConnected
+        disconnect(sendStop: false)
+        if wasConnected {
+            DispatchQueue.main.async { [weak self] in self?.onDisconnected?() }
         }
     }
 
@@ -134,7 +155,7 @@ final class RemoteControlClientService {
                 self.handle(chunk: chunk)
             }
             if isComplete || error != nil {
-                self.disconnect(sendStop: false)
+                self.handleConnectionLost()
                 return
             }
             self.receive()

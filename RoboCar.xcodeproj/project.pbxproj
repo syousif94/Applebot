@@ -154,10 +154,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = RoboCar/RoboCar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Applebot;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
 				INFOPLIST_KEY_NSBonjourServices = "_robocar-remote._tcp";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
@@ -198,10 +200,12 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = RoboCar/RoboCar.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 1;
+				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				INFOPLIST_KEY_CFBundleDisplayName = Applebot;
+				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
 				INFOPLIST_KEY_NSBonjourServices = "_robocar-remote._tcp";
 				INFOPLIST_KEY_NSCameraUsageDescription = "Camera access is required for AR and LiDAR scanning to visualize your environment.";
