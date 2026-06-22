@@ -679,8 +679,8 @@ final class TelemetryService {
                     width: Float(person.boundingBox.width),
                     height: Float(person.boundingBox.height)
                 ),
-                isGesturing: person.isGesturing,
-                gestureStreak: person.gestureStreakCount,
+                isGesturing: false,
+                gestureStreak: 0,
                 isActive: person.id == tracker.activePersonID,
                 lastSeenAgo: Float(now.timeIntervalSince(person.lastSeen))
             )
@@ -1205,4 +1205,12 @@ extension Notification.Name {
     static let startFollowing = Notification.Name("startFollowing")
     /// Stop follow mode.
     static let stopFollowing = Notification.Name("stopFollowing")
+    /// Controller tapped a person to follow. userInfo: ["personID": String]
+    static let remoteFollowPerson = Notification.Name("remoteFollowPerson")
+    /// Controller asked to follow a saved person by name. userInfo: ["personName": String]
+    static let remoteFollowPersonByName = Notification.Name("remoteFollowPersonByName")
+    /// Controller named/renamed a person. userInfo: ["personID": String, "personName": String]
+    static let remoteNamePerson = Notification.Name("remoteNamePerson")
+    /// Controller deleted a saved person. userInfo: ["personName": String]
+    static let remoteDeleteNamedPerson = Notification.Name("remoteDeleteNamedPerson")
 }

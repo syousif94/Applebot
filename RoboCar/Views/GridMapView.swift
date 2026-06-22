@@ -59,6 +59,10 @@ class GridMapView: UIView {
     /// Last computed relative heading and scale for tap coordinate conversion
     private var lastRelativeHeading: CGFloat = 0
     private var lastScale: CGFloat = 50.0
+
+    /// True compass bearing in degrees (0=North, CW positive). Set by LiDARViewController via CLLocationManager.
+    /// Negative means not yet received — compass falls back to ARKit-relative orientation.
+    var compassBearingDegrees: Double = -1
     
     /// Planned path in world coordinates (set externally after pathfinding)
     var plannedPath: [(x: Float, y: Float)] = []
@@ -190,8 +194,8 @@ class GridMapView: UIView {
         let devicePos = grid.devicePosition
         let viewCenterX = devicePos.x - panOffsetX
         let viewCenterY = devicePos.y - panOffsetY
-        let worldX = viewCenterX + Float((centerX - unrotatedX) / lastScale)
-        let worldY = viewCenterY + Float((centerY - unrotatedY) / lastScale)
+        let worldX = viewCenterX - Float((unrotatedX - centerX) / lastScale)
+        let worldY = viewCenterY - Float((unrotatedY - centerY) / lastScale)
         
         print("[GridMapView] Tap at screen (\(tapPoint.x), \(tapPoint.y)) → world (\(String(format: "%.2f", worldX)), \(String(format: "%.2f", worldY)))")
         
@@ -342,15 +346,13 @@ class GridMapView: UIView {
         for (xi, column) in region.cells.enumerated() {
             let worldX = region.originX + Float(xi) * cellSize
             let relX = CGFloat(worldX - viewCenterWorldX) * scale
-            // Negate X to fix horizontal flip
             let screenX = centerX - relX - cellPixelSize / 2
-            
+
             for (yi, state) in column.enumerated() {
                 guard state != .unknown else { continue }
-                
+
                 let worldY = region.originY + Float(yi) * cellSize
                 let relY = CGFloat(worldY - viewCenterWorldY) * scale
-                // Y increases upward in world, but downward on screen, so negate
                 let screenY = centerY - relY - cellPixelSize / 2
                 
                 let cellRect = CGRect(x: screenX, y: screenY, width: cellPixelSize, height: cellPixelSize)
@@ -430,11 +432,16 @@ class GridMapView: UIView {
                 .font: labelFont
             ]
             let size = label.size(withAttributes: labelAttrs)
-            let drawPoint = CGPoint(x: cx - size.width / 2, y: cy - size.height / 2)
+            
+            context.saveGState()
+            context.translateBy(x: cx, y: cy)
+            context.rotate(by: -relativeHeading)
+            let drawPoint = CGPoint(x: -size.width / 2, y: -size.height / 2)
             
             // Draw shadow for readability
             label.draw(at: CGPoint(x: drawPoint.x + 1, y: drawPoint.y + 1), withAttributes: labelShadowAttrs)
             label.draw(at: drawPoint, withAttributes: labelAttrs)
+            context.restoreGState()
         }
         
         // Draw position trail (in rotated coordinate system)
@@ -790,11 +797,11 @@ class GridMapView: UIView {
             context.move(to: CGPoint(x: screenX, y: -rect.height))
             context.addLine(to: CGPoint(x: screenX, y: rect.height * 2))
         }
-        
+
         // Draw horizontal lines (every meter)
         let startY = floor(viewCenterY - viewRadiusMeters * 1.5)
         let endY = ceil(viewCenterY + viewRadiusMeters * 1.5)
-        
+
         for y in stride(from: startY, through: endY, by: 1.0) {
             let screenY = centerY - CGFloat(y - viewCenterY) * scale
             context.move(to: CGPoint(x: -rect.width, y: screenY))
@@ -855,20 +862,20 @@ class GridMapView: UIView {
     private func drawDevice(context: CGContext, centerX: CGFloat, centerY: CGFloat) {
         let size: CGFloat = 20
         
-        // Arrow always points UP (forward direction after rotation)
+        // Pointed end marks the rear of the device; the broad edge faces forward.
         context.setFillColor(deviceColor.cgColor)
-        context.move(to: CGPoint(x: centerX, y: centerY - size))  // Top point
-        context.addLine(to: CGPoint(x: centerX - size * 0.6, y: centerY + size * 0.5))  // Bottom left
-        context.addLine(to: CGPoint(x: centerX + size * 0.6, y: centerY + size * 0.5))  // Bottom right
+        context.move(to: CGPoint(x: centerX, y: centerY + size))
+        context.addLine(to: CGPoint(x: centerX - size * 0.6, y: centerY - size * 0.5))
+        context.addLine(to: CGPoint(x: centerX + size * 0.6, y: centerY - size * 0.5))
         context.closePath()
         context.fillPath()
         
         // Draw outline
         context.setStrokeColor(UIColor.white.cgColor)
         context.setLineWidth(2)
-        context.move(to: CGPoint(x: centerX, y: centerY - size))
-        context.addLine(to: CGPoint(x: centerX - size * 0.6, y: centerY + size * 0.5))
-        context.addLine(to: CGPoint(x: centerX + size * 0.6, y: centerY + size * 0.5))
+        context.move(to: CGPoint(x: centerX, y: centerY + size))
+        context.addLine(to: CGPoint(x: centerX - size * 0.6, y: centerY - size * 0.5))
+        context.addLine(to: CGPoint(x: centerX + size * 0.6, y: centerY - size * 0.5))
         context.closePath()
         context.strokePath()
     }
@@ -877,8 +884,9 @@ class GridMapView: UIView {
         let scaleBarMeters: CGFloat = 1.0
         let scaleBarPixels = scaleBarMeters * scale
         
+        // Top-left, across from the compass (which sits at the top-right)
         let x: CGFloat = 20
-        let y = rect.height - 30
+        let y: CGFloat = 45
         
         // Draw scale bar
         context.setStrokeColor(UIColor.white.cgColor)
@@ -908,18 +916,25 @@ class GridMapView: UIView {
         let radius: CGFloat = 25
         let compassX = rect.width - 40
         let compassY: CGFloat = 40
-        
+
         // Draw circle
         context.setStrokeColor(UIColor.white.withAlphaComponent(0.5).cgColor)
         context.setLineWidth(1)
         context.addEllipse(in: CGRect(x: compassX - radius, y: compassY - radius, width: radius * 2, height: radius * 2))
         context.strokePath()
-        
+
         // Draw north indicator (rotates to show where north is)
         context.saveGState()
         context.translateBy(x: compassX, y: compassY)
-        context.rotate(by: -heading)  // Rotate by negative heading to show north direction
-        
+
+        // Use true compass bearing when available (0°=N, 90°=E, CW positive).
+        // Screen "up" = current device facing direction, so rotating by -bearing places N correctly.
+        // Fall back to ARKit-relative heading (radians) if no compass data yet.
+        let rotation: CGFloat = compassBearingDegrees >= 0
+            ? -CGFloat(compassBearingDegrees) * .pi / 180
+            : -heading
+        context.rotate(by: rotation)
+
         // North arrow
         context.setFillColor(UIColor.red.cgColor)
         context.move(to: CGPoint(x: 0, y: -radius + 5))
@@ -927,7 +942,7 @@ class GridMapView: UIView {
         context.addLine(to: CGPoint(x: 5, y: -radius + 15))
         context.closePath()
         context.fillPath()
-        
+
         // N label
         let nLabel = "N"
         let attrs: [NSAttributedString.Key: Any] = [
@@ -936,7 +951,7 @@ class GridMapView: UIView {
         ]
         let size = nLabel.size(withAttributes: attrs)
         nLabel.draw(at: CGPoint(x: -size.width / 2, y: -radius - 15), withAttributes: attrs)
-        
+
         context.restoreGState()
     }
 }

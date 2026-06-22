@@ -12,19 +12,18 @@ import ARKit
 import simd
 
 /// Tracks all visible people with stable IDs using VNDetectHumanRectanglesRequest
-/// and OSNet ReID embeddings. Waits for an activation gesture (raised open palm)
-/// to select which person to follow, then uses VNTrackObjectRequest for efficient
-/// frame-to-frame tracking of that person.
+/// and OSNet ReID embeddings. A person is selected for following externally
+/// (e.g. by tapping their bounding box), then uses VNTrackObjectRequest for
+/// efficient frame-to-frame tracking of that person.
 ///
 /// Flow:
 ///   1. `startScanning()` — enters scanning mode. Every few frames, detects all
-///      people and runs hand pose detection looking for an open-palm gesture.
-///   2. When a person holds an open palm for several consecutive detection cycles,
-///      they become the *active* person, their ReID embedding is captured, and
-///      a VN tracker begins.
-///   3. `update(frame:)` — in scanning mode, runs multi-person detection + gesture
-///      check. In tracking mode, runs the VN tracker on the active person, with
-///      ReID fallback if the tracker loses them.
+///      people and assigns stable IDs / ReID embeddings.
+///   2. `activateExternalPerson(...)` or `activatePerson(id:frame:)` selects the
+///      person to follow, captures their ReID embedding, and starts a VN tracker.
+///   3. `update(frame:)` — in scanning mode, runs multi-person detection. In
+///      tracking mode, runs the VN tracker on the active person, with ReID
+///      fallback if the tracker loses them.
 ///   4. `stopTracking()` — clears all state and returns to idle.
 class PersonTracker {
     
@@ -41,10 +40,6 @@ class PersonTracker {
         var embedding: [Float]?          // OSNet 512-dim ReID embedding
         var worldPosition: simd_float2?  // (ARKit X, ARKit Z)
         var lastSeen: Date
-        /// Whether this person is currently showing the activation gesture
-        var isGesturing: Bool = false
-        /// How many consecutive detection cycles the gesture has been seen
-        var gestureStreakCount: Int = 0
     }
     
     enum TrackingState: String {
@@ -72,12 +67,6 @@ class PersonTracker {
     /// How many frames between full detection scans during scanning mode
     var scanDetectionInterval: Int = 5
     
-    /// Minimum confidence for hand joint detection
-    var handConfidenceThreshold: Float = 0.3
-    
-    /// Timeout (seconds) for completing a multi-step gesture before it resets
-    var gestureTimeout: TimeInterval = 3.0
-    
     /// IoU threshold for matching detections to existing tracked people
     var iouMatchThreshold: CGFloat = 0.25
     
@@ -91,7 +80,7 @@ class PersonTracker {
     /// All currently detected/tracked people (updated during scanning)
     private(set) var detectedPeople: [DetectedPerson] = []
     
-    /// The ID of the person activated via gesture (the one being followed)
+    /// The ID of the person being followed (activated by tap or by name)
     private(set) var activePersonID: UUID? = nil
     
     /// World position of the tracked person (ARKit X = x, ARKit Z = y), updated each frame
@@ -170,7 +159,7 @@ class PersonTracker {
         state = .scanning
         scanFrameCount = 0
         onStateChanged?(.scanning)
-        log("👀 Scanning for people — raise an open hand to activate following")
+        log("👀 Scanning for people — tap a person to start following")
     }
     
     /// Legacy entry point: detect the closest person and immediately start tracking.
@@ -295,26 +284,19 @@ class PersonTracker {
         let pixelBuffer = frame.capturedImage
         let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
         
-        // Run person detection and hand pose detection in a single perform call
         let detectRequest = VNDetectHumanRectanglesRequest()
-        let handPoseRequest = VNDetectHumanHandPoseRequest()
-        handPoseRequest.maximumHandCount = 6
         
         do {
-            try handler.perform([detectRequest, handPoseRequest])
+            try handler.perform([detectRequest])
         } catch {
             log("⚠️ Scan detection failed: \(error)")
             return
         }
         
         let personResults = detectRequest.results ?? []
-        let handResults = handPoseRequest.results ?? []
         
         // Update the tracked people list (match detections to existing IDs)
         reconcileDetectedPeople(persons: personResults, pixelBuffer: pixelBuffer, frame: frame)
-        
-        // Check for activation gesture — open palm matched to a person
-        checkForActivationGesture(hands: handResults, frame: frame)
         
         // Prune people not seen recently
         let now = Date()
@@ -431,344 +413,6 @@ class PersonTracker {
         }
         
         detectedPeople = updatedPeople
-    }
-    
-    // MARK: - Gesture Detection
-    
-    /// State machine for the activation gesture (peace-sign double-tap).
-    enum ActivateGesturePhase {
-        case idle
-        case peaceOpen1         // First peace sign detected
-        case peaceClosed1       // Fingers closed after first peace
-        case peaceOpen2         // Second peace sign detected → activate!
-    }
-    
-    /// State machine for the cancel gesture (index finger wag).
-    enum CancelGesturePhase: Int {
-        case idle = 0
-        case movedRight1 = 1   // First rightward movement
-        case movedLeft1 = 2    // First leftward movement
-        case movedRight2 = 3   // Second rightward movement
-        case movedLeft2 = 4    // Complete — cancel!
-    }
-    
-    /// Per-person activation gesture state
-    private var activatePhase: [UUID: ActivateGesturePhase] = [:]
-    private var activatePhaseTimestamp: [UUID: Date] = [:]
-    
-    /// Cancel gesture state (not per-person, any hand can cancel)
-    private var cancelPhase: CancelGesturePhase = .idle
-    private var cancelLastWristX: CGFloat?
-    private var cancelPhaseTimestamp: Date = .distantPast
-    /// Minimum fingertip X movement (normalised coords) to count as a direction change
-    private let wagMinDelta: CGFloat = 0.04
-    
-    /// Callback when cancel gesture is detected
-    var onCancelGesture: (() -> Void)?
-    
-    /// Check all detected hands for activation and cancel gestures, matched to people.
-    private func checkForActivationGesture(hands: [VNHumanHandPoseObservation], frame: ARFrame) {
-        let now = Date()
-        
-        // Classify each hand
-        var peaceHands: [(wrist: CGPoint, hand: VNHumanHandPoseObservation)] = []
-        var fistHands: [CGPoint] = []   // wrist locations of closed hands
-        var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
-        
-        for hand in hands {
-            if let wrist = detectPeaceSign(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(wrist, inside: $0.boundingBox) }) {
-                peaceHands.append((wrist, hand))
-            } else if let wrist = detectClosedHand(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(wrist, inside: $0.boundingBox) }) {
-                fistHands.append(wrist)
-            }
-            if let info = detectIndexPointer(hand: hand), detectedPeople.contains(where: { isRaisedHandPoint(info.wrist, inside: $0.boundingBox) }) {
-                pointerHands.append(info)
-            }
-        }
-        
-        // --- Activation gesture: peace-sign double-tap ---
-        var gesturedPersonIDs = Set<UUID>()
-        
-        for (wrist, _) in peaceHands {
-            for i in detectedPeople.indices {
-                guard isRaisedHandPoint(wrist, inside: detectedPeople[i].boundingBox) else { continue }
-                let pid = detectedPeople[i].id
-                gesturedPersonIDs.insert(pid)
-                
-                let phase = activatePhase[pid] ?? .idle
-                let phaseTime = activatePhaseTimestamp[pid] ?? .distantPast
-                let elapsed = now.timeIntervalSince(phaseTime)
-                
-                switch phase {
-                case .idle:
-                    activatePhase[pid] = .peaceOpen1
-                    activatePhaseTimestamp[pid] = now
-                    detectedPeople[i].isGesturing = true
-                    detectedPeople[i].gestureStreakCount = 1
-                    log("✌️ Person \(pid.uuidString.prefix(8)) — peace sign detected (1/2)")
-                case .peaceOpen1:
-                    // Still holding peace — keep waiting for close
-                    detectedPeople[i].isGesturing = true
-                case .peaceClosed1:
-                    if elapsed < gestureTimeout {
-                        activatePhase[pid] = .peaceOpen2
-                        activatePhaseTimestamp[pid] = now
-                        detectedPeople[i].isGesturing = true
-                        detectedPeople[i].gestureStreakCount = 2
-                        log("✌️ Person \(pid.uuidString.prefix(8)) — second peace sign! Activating…")
-                        let pixelBuffer = frame.capturedImage
-                        activatePersonForTracking(person: detectedPeople[i], pixelBuffer: pixelBuffer, frame: frame)
-                        activatePhase.removeAll()
-                        activatePhaseTimestamp.removeAll()
-                        return
-                    } else {
-                        // Timeout — restart
-                        activatePhase[pid] = .peaceOpen1
-                        activatePhaseTimestamp[pid] = now
-                        detectedPeople[i].gestureStreakCount = 1
-                    }
-                case .peaceOpen2:
-                    break // shouldn't reach here
-                }
-                break  // one hand matches at most one person
-            }
-        }
-        
-        // Check for fist (closed hand) to transition peaceOpen1 → peaceClosed1
-        for wrist in fistHands {
-            for i in detectedPeople.indices {
-                guard isRaisedHandPoint(wrist, inside: detectedPeople[i].boundingBox) else { continue }
-                let pid = detectedPeople[i].id
-                let phase = activatePhase[pid] ?? .idle
-                let phaseTime = activatePhaseTimestamp[pid] ?? .distantPast
-                let elapsed = now.timeIntervalSince(phaseTime)
-                
-                if phase == .peaceOpen1 && elapsed < gestureTimeout {
-                    activatePhase[pid] = .peaceClosed1
-                    activatePhaseTimestamp[pid] = now
-                    log("✊ Person \(pid.uuidString.prefix(8)) — fingers closed (waiting for second peace)")
-                }
-                break
-            }
-        }
-        
-        // Reset gesture state for people NOT involved this cycle
-        for i in detectedPeople.indices {
-            let pid = detectedPeople[i].id
-            if !gesturedPersonIDs.contains(pid) {
-                detectedPeople[i].isGesturing = false
-                detectedPeople[i].gestureStreakCount = 0
-            }
-            // Timeout stale phases
-            if let phaseTime = activatePhaseTimestamp[pid],
-               now.timeIntervalSince(phaseTime) > gestureTimeout {
-                activatePhase.removeValue(forKey: pid)
-                activatePhaseTimestamp.removeValue(forKey: pid)
-            }
-        }
-        
-        // --- Cancel gesture: index finger wag left-right (one full sweep) ---
-        if let (wrist, tipX) = pointerHands.first {
-            let _ = wrist  // wrist position available if needed
-            let elapsed = now.timeIntervalSince(cancelPhaseTimestamp)
-            
-            if elapsed > gestureTimeout {
-                // Timeout — restart
-                cancelPhase = .idle
-                cancelLastWristX = nil
-            }
-            
-            if let lastX = cancelLastWristX {
-                let delta = tipX - lastX
-                
-                switch cancelPhase {
-                case .idle:
-                    if abs(delta) > wagMinDelta {
-                        cancelPhase = delta > 0 ? .movedRight1 : .movedLeft1
-                        cancelPhaseTimestamp = now
-                        cancelLastWristX = tipX
-                    }
-                case .movedRight1:
-                    if delta < -wagMinDelta {
-                        // Moved right then left — cancel!
-                        log("👆↔️ Cancel gesture detected (finger wag R→L)!")
-                        cancelPhase = .idle
-                        cancelLastWristX = nil
-                        onCancelGesture?()
-                        return
-                    } else if delta > wagMinDelta {
-                        cancelLastWristX = tipX  // accumulating rightward
-                    }
-                case .movedLeft1:
-                    if delta > wagMinDelta {
-                        // Moved left then right — cancel!
-                        log("👆↔️ Cancel gesture detected (finger wag L→R)!")
-                        cancelPhase = .idle
-                        cancelLastWristX = nil
-                        onCancelGesture?()
-                        return
-                    } else if delta < -wagMinDelta {
-                        cancelLastWristX = tipX  // accumulating leftward
-                    }
-                case .movedRight2, .movedLeft2:
-                    break // unused now
-                }
-            } else {
-                cancelLastWristX = tipX
-                cancelPhaseTimestamp = now
-            }
-        }
-    }
-    
-    /// Detect a peace/victory sign: index + middle extended, ring + little curled.
-    /// Returns the wrist location if detected, nil otherwise.
-    func detectPeaceSign(hand: VNHumanHandPoseObservation) -> CGPoint? {
-        guard let wrist = try? hand.recognizedPoint(.wrist),
-              let indexTip = try? hand.recognizedPoint(.indexTip),
-              let middleTip = try? hand.recognizedPoint(.middleTip),
-              let ringTip = try? hand.recognizedPoint(.ringTip),
-              let littleTip = try? hand.recognizedPoint(.littleTip),
-              let indexPIP = try? hand.recognizedPoint(.indexPIP),
-              let middlePIP = try? hand.recognizedPoint(.middlePIP),
-              let ringPIP = try? hand.recognizedPoint(.ringPIP),
-              let littlePIP = try? hand.recognizedPoint(.littlePIP)
-        else { return nil }
-        
-        let minConf = handConfidenceThreshold
-        guard wrist.confidence > minConf,
-              indexTip.confidence > minConf,
-              middleTip.confidence > minConf
-        else { return nil }
-        
-        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            hypot(a.x - b.x, a.y - b.y)
-        }
-        
-        let w = wrist.location
-        
-        // Index + middle EXTENDED (tip farther from wrist than PIP)
-        let indexExtended = dist(indexTip.location, w) > dist(indexPIP.location, w)
-        let middleExtended = dist(middleTip.location, w) > dist(middlePIP.location, w)
-        
-        // Ring + little CURLED (tip closer to wrist than PIP, or at least not extended)
-        let ringCurled = dist(ringTip.location, w) < dist(ringPIP.location, w) * 1.15
-        let littleCurled = dist(littleTip.location, w) < dist(littlePIP.location, w) * 1.15
-        
-        guard indexExtended && middleExtended && ringCurled && littleCurled else { return nil }
-        
-        return wrist.location
-    }
-    
-    /// Detect a closed fist / curled fingers. Returns wrist location if detected.
-    func detectClosedHand(hand: VNHumanHandPoseObservation) -> CGPoint? {
-        guard let wrist = try? hand.recognizedPoint(.wrist),
-              let indexTip = try? hand.recognizedPoint(.indexTip),
-              let middleTip = try? hand.recognizedPoint(.middleTip),
-              let indexPIP = try? hand.recognizedPoint(.indexPIP),
-              let middlePIP = try? hand.recognizedPoint(.middlePIP)
-        else { return nil }
-        
-        let minConf = handConfidenceThreshold
-        guard wrist.confidence > minConf else { return nil }
-        
-        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            hypot(a.x - b.x, a.y - b.y)
-        }
-        
-        let w = wrist.location
-        
-        // Both index and middle should be curled
-        let indexCurled = dist(indexTip.location, w) < dist(indexPIP.location, w) * 1.15
-        let middleCurled = dist(middleTip.location, w) < dist(middlePIP.location, w) * 1.15
-        
-        guard indexCurled && middleCurled else { return nil }
-        
-        return wrist.location
-    }
-    
-    /// Detect a pointing hand (index finger extended).
-    /// Returns (wrist location, index fingertip X in normalised coords) or nil.
-    /// Requires index extended above the palm and middle finger NOT extended.
-    func detectIndexPointer(hand: VNHumanHandPoseObservation) -> (wrist: CGPoint, wristX: CGFloat)? {
-        guard let wrist = try? hand.recognizedPoint(.wrist),
-              let indexTip = try? hand.recognizedPoint(.indexTip),
-              let indexPIP = try? hand.recognizedPoint(.indexPIP),
-              let middleTip = try? hand.recognizedPoint(.middleTip),
-              let middlePIP = try? hand.recognizedPoint(.middlePIP),
-              let middleMCP = try? hand.recognizedPoint(.middleMCP)
-        else { return nil }
-        
-        let minConf = handConfidenceThreshold
-        guard wrist.confidence > minConf,
-              indexTip.confidence > minConf
-        else { return nil }
-        
-        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            hypot(a.x - b.x, a.y - b.y)
-        }
-        
-        let w = wrist.location
-        let indexExtended = dist(indexTip.location, w) > dist(indexPIP.location, w)
-        
-        // Index fingertip must be above the palm (higher Y in Vision coords = higher in image)
-        let palmCenterY = (wrist.location.y + middleMCP.location.y) / 2
-        let indexAbovePalm = indexTip.location.y > palmCenterY
-        
-        // Middle finger must NOT be extended
-        let middleExtended = dist(middleTip.location, w) > dist(middlePIP.location, w)
-        
-        guard indexExtended && indexAbovePalm && !middleExtended else { return nil }
-        
-        // Return fingertip X (not wrist X) — the tip sweeps much more during a wag
-        return (wrist.location, indexTip.location.x)
-    }
-    
-    /// Legacy open-palm detection kept for reference but no longer used for activation.
-    func detectOpenPalm(hand: VNHumanHandPoseObservation) -> CGPoint? {
-        guard let wrist = try? hand.recognizedPoint(.wrist),
-              let thumbTip = try? hand.recognizedPoint(.thumbTip),
-              let indexTip = try? hand.recognizedPoint(.indexTip),
-              let middleTip = try? hand.recognizedPoint(.middleTip),
-              let ringTip = try? hand.recognizedPoint(.ringTip),
-              let littleTip = try? hand.recognizedPoint(.littleTip),
-              let thumbIP = try? hand.recognizedPoint(.thumbIP),
-              let indexPIP = try? hand.recognizedPoint(.indexPIP),
-              let middlePIP = try? hand.recognizedPoint(.middlePIP),
-              let ringPIP = try? hand.recognizedPoint(.ringPIP),
-              let littlePIP = try? hand.recognizedPoint(.littlePIP)
-        else { return nil }
-        
-        let minConf = handConfidenceThreshold
-        guard wrist.confidence > minConf,
-              indexTip.confidence > minConf,
-              middleTip.confidence > minConf,
-              ringTip.confidence > minConf,
-              littleTip.confidence > minConf
-        else { return nil }
-        
-        func dist(_ a: CGPoint, _ b: CGPoint) -> CGFloat {
-            hypot(a.x - b.x, a.y - b.y)
-        }
-        
-        let w = wrist.location
-        let fingersExtended =
-            dist(indexTip.location, w)  > dist(indexPIP.location, w)  &&
-            dist(middleTip.location, w) > dist(middlePIP.location, w) &&
-            dist(ringTip.location, w)   > dist(ringPIP.location, w)   &&
-            dist(littleTip.location, w) > dist(littlePIP.location, w) &&
-            dist(thumbTip.location, w)  > dist(thumbIP.location, w)
-        
-        guard fingersExtended else { return nil }
-        
-        let spread = min(
-            dist(indexTip.location, middleTip.location),
-            dist(middleTip.location, ringTip.location),
-            dist(ringTip.location, littleTip.location)
-        )
-        let palmSize = dist(wrist.location, middleTip.location)
-        guard palmSize > 0, spread / palmSize > 0.05 else { return nil }
-        
-        return wrist.location
     }
     
     // MARK: - Activation
@@ -972,6 +616,16 @@ class PersonTracker {
             embedding[i] = multiArray[i].floatValue
         }
         
+        // L2-normalize so that `cosineSimilarity` (a plain dot product) yields a
+        // true cosine in [-1, 1]. Without this, raw magnitudes vary frame-to-frame
+        // and ReID matching becomes unstable (same person gets new IDs).
+        var norm: Float = 0
+        for value in embedding { norm += value * value }
+        norm = norm.squareRoot()
+        if norm > 1e-6 {
+            for i in 0..<count { embedding[i] /= norm }
+        }
+        
         return embedding
     }
     
@@ -997,13 +651,6 @@ class PersonTracker {
         return intersectionArea / unionArea
     }
 
-    private func isRaisedHandPoint(_ point: CGPoint, inside personBox: CGRect) -> Bool {
-        let expandedBox = personBox.insetBy(dx: -0.08, dy: -0.04)
-        guard expandedBox.contains(point) else { return false }
-        let upperBodyThreshold = personBox.origin.y + personBox.height * 0.45
-        return point.y >= upperBodyThreshold
-    }
-    
     // MARK: - Depth Projection
     
     /// Project the center of a bounding box to 3D world coordinates using

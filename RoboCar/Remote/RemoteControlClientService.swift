@@ -12,6 +12,7 @@ final class RemoteControlClientService {
     var onMessage: ((RemoteMessage) -> Void)?
     var onVideoTrack: ((RTCVideoTrack) -> Void)?
     var onVideoFrameImage: ((UIImage) -> Void)?
+    var onVideoFrameSize: ((CGSize) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
 
@@ -93,6 +94,19 @@ final class RemoteControlClientService {
         send(RemoteMessage(type: "stopNLCommand"))
     }
 
+    /// Recovers a stalled video feed without dropping the TCP connection by
+    /// rebuilding the local receiver and asking the host to send a fresh offer
+    /// (which forces a new keyframe).
+    func restartVideo() {
+        queue.async { [weak self] in
+            guard let self, self.isTCPConnected else { return }
+            self.publishStatus("WebRTC restarting video")
+            self.webRTCSession?.stop()
+            self.startWebRTC()
+            self.sendSignal(RemoteMessage(type: "restartVideo"))
+        }
+    }
+
     func send(_ message: RemoteMessage) {
         guard let connection else { return }
         queue.async { [weak self] in
@@ -125,6 +139,7 @@ final class RemoteControlClientService {
             self?.onVideoTrack?(track)
         }
         session.onRemoteFrameRendered = { [weak self] size, count in
+            self?.onVideoFrameSize?(size)
             guard count == 1 || count % 30 == 0 else { return }
             self?.publishStatus("WebRTC received view frame #\(count) (\(Int(size.width))x\(Int(size.height)))")
         }

@@ -17,6 +17,7 @@ final class RemoteControlViewController: UIViewController {
 
     private let cameraVideoView = RTCMTLVideoView()
     private let videoFallbackImageView = UIImageView()
+    private let personBoxOverlay = RemotePersonBoxOverlay()
     private let mapView: GridMapView
     private let meshVoxelView = MeshVoxelView()
     private let mapToggleButton = UIButton(type: .system)
@@ -51,6 +52,15 @@ final class RemoteControlViewController: UIViewController {
     private var isTailscaleConnection = false
     private var pendingReconnect: DispatchWorkItem?
 
+    // Video stall recovery: the feed travels over WebRTC while telemetry uses TCP,
+    // so the video can freeze (e.g. a dropped keyframe) while everything else keeps
+    // streaming. The watchdog restarts the video when frames stop arriving.
+    private var lastVideoFrameAt = Date()
+    private var lastVideoRecoveryAt = Date.distantPast
+    private var videoWatchdog: Timer?
+    private let videoStallThreshold: TimeInterval = 3.0
+    private let videoRecoveryCooldown: TimeInterval = 5.0
+
     private let connectionBadgeLabel = UILabel()
     private var connectionBadgeHiddenConstraint: NSLayoutConstraint!
 
@@ -72,12 +82,19 @@ final class RemoteControlViewController: UIViewController {
         setupNetworking()
         browser.start()
         startAutoConnect()
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAppDidBecomeActive),
+            name: UIApplication.didBecomeActiveNotification,
+            object: nil
+        )
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         pendingReconnect?.cancel()
         pendingReconnect = nil
+        stopVideoWatchdog()
         stopKeyboardDriveIfNeeded()
         stopSpeechRecognition()
         client.sendStopNLCommand()
@@ -88,6 +105,39 @@ final class RemoteControlViewController: UIViewController {
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+        startVideoWatchdog()
+    }
+
+    @objc private func handleAppDidBecomeActive() {
+        // Returning to the foreground commonly recovers a frozen WebRTC feed; do it
+        // automatically instead of relying on the user re-entering the app.
+        recoverVideoIfStalled(force: false)
+    }
+
+    private func startVideoWatchdog() {
+        stopVideoWatchdog()
+        lastVideoFrameAt = Date()
+        let timer = Timer(timeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.recoverVideoIfStalled(force: false)
+        }
+        RunLoop.main.add(timer, forMode: .common)
+        videoWatchdog = timer
+    }
+
+    private func stopVideoWatchdog() {
+        videoWatchdog?.invalidate()
+        videoWatchdog = nil
+    }
+
+    private func recoverVideoIfStalled(force: Bool) {
+        guard client.isConnected else { return }
+        let now = Date()
+        let stalled = now.timeIntervalSince(lastVideoFrameAt) > videoStallThreshold
+        guard force || stalled else { return }
+        guard now.timeIntervalSince(lastVideoRecoveryAt) > videoRecoveryCooldown else { return }
+        lastVideoRecoveryAt = now
+        lastVideoFrameAt = now
+        client.restartVideo()
     }
 
     override func viewDidLayoutSubviews() {
@@ -129,6 +179,24 @@ final class RemoteControlViewController: UIViewController {
         videoFallbackImageView.clipsToBounds = true
         videoFallbackImageView.isHidden = true
         view.addSubview(videoFallbackImageView)
+
+        personBoxOverlay.translatesAutoresizingMaskIntoConstraints = false
+        personBoxOverlay.onTapBody = { [weak self] id in
+            self?.sendFollowPerson(id: id)
+        }
+        personBoxOverlay.onTapName = { [weak self] id in
+            self?.promptNamePerson(id: id)
+        }
+        personBoxOverlay.onTapDelete = { [weak self] id in
+            self?.sendDeleteNamedPerson(id: id)
+        }
+        view.addSubview(personBoxOverlay)
+        NSLayoutConstraint.activate([
+            personBoxOverlay.topAnchor.constraint(equalTo: cameraVideoView.topAnchor),
+            personBoxOverlay.leadingAnchor.constraint(equalTo: cameraVideoView.leadingAnchor),
+            personBoxOverlay.trailingAnchor.constraint(equalTo: cameraVideoView.trailingAnchor),
+            personBoxOverlay.bottomAnchor.constraint(equalTo: cameraVideoView.bottomAnchor),
+        ])
 
         mapView.translatesAutoresizingMaskIntoConstraints = false
         mapView.backgroundColor = UIColor(white: 0.1, alpha: 1)
@@ -276,12 +344,19 @@ final class RemoteControlViewController: UIViewController {
             track.add(self.cameraVideoView)
         }
         client.onVideoFrameImage = { [weak self] image in
-            self?.videoFallbackImageView.image = image
-            self?.videoFallbackImageView.isHidden = false
+            guard let self else { return }
+            self.lastVideoFrameAt = Date()
+            self.videoFallbackImageView.image = image
+            self.videoFallbackImageView.isHidden = false
+        }
+        client.onVideoFrameSize = { [weak self] size in
+            self?.personBoxOverlay.videoSize = size
         }
         client.onConnected = { [weak self] in
             guard let self else { return }
             self.pendingReconnect?.cancel()
+            self.lastVideoFrameAt = Date()
+            self.lastVideoRecoveryAt = Date()
             self.updateConnectionBadge()
             var info = RemoteMessage(type: "connectionInfo")
             info.isLocalConnection = !self.isTailscaleConnection
@@ -390,6 +465,8 @@ final class RemoteControlViewController: UIViewController {
             if let anchors = message.meshAnchors, !anchors.isEmpty {
                 meshVoxelView.updateMeshAnchors(anchors)
             }
+        case "personBoxes":
+            personBoxOverlay.people = message.personBoxes ?? []
         case "servoList", "servoState", "status":
             break
         default:
@@ -424,6 +501,54 @@ final class RemoteControlViewController: UIViewController {
         }
         mapView.setNeedsDisplay()
         if !meshVoxelView.isHidden { meshVoxelView.refresh() }
+    }
+
+    // MARK: - Person follow / naming (controller → host)
+
+    /// Tapping a person follows them; tapping the active person again cancels.
+    private func sendFollowPerson(id: String) {
+        if let box = personBoxOverlay.people.first(where: { $0.id == id }), box.isActive {
+            client.send(RemoteMessage(type: "stopFollowing"))
+            return
+        }
+        var message = RemoteMessage(type: "followPerson")
+        message.personID = id
+        client.send(message)
+    }
+
+    /// Prompt for a name and ask the host to save this person's embedding.
+    private func promptNamePerson(id: String) {
+        let existingName = personBoxOverlay.people.first(where: { $0.id == id })?.name
+        let alert = UIAlertController(
+            title: existingName == nil ? "Name this person" : "Rename person",
+            message: "The robot will remember them and can follow them by name.",
+            preferredStyle: .alert
+        )
+        alert.addTextField { tf in
+            tf.placeholder = "Name"
+            tf.text = existingName
+            tf.autocapitalizationType = .words
+            tf.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let name = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !name.isEmpty else { return }
+            var message = RemoteMessage(type: "namePerson")
+            message.personID = id
+            message.personName = name
+            self.client.send(message)
+        })
+        present(alert, animated: true)
+    }
+
+    /// Ask the host to delete the saved person matching this box's name.
+    private func sendDeleteNamedPerson(id: String) {
+        guard let name = personBoxOverlay.people.first(where: { $0.id == id })?.name else { return }
+        var message = RemoteMessage(type: "deleteNamedPerson")
+        message.personName = name
+        client.send(message)
     }
 
     @objc private func mapViewToggleTapped() {

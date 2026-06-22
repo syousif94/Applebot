@@ -20,7 +20,6 @@ final class MeshVoxelView: UIView {
     private var cameraAzimuth: Float = 0
     private var cameraElevation: Float = 0.85
     private var cameraDistance: Float = 8.0
-    private var panStart: CGPoint = .zero
     private var deviceHeight: Float = 0.3   // ARKit Y of the device; updated from devicePosition.z
 
     private var isBuilding = false
@@ -86,6 +85,9 @@ final class MeshVoxelView: UIView {
     private func setupGestures() {
         let pan = UIPanGestureRecognizer(target: self, action: #selector(handlePan))
         pan.maximumNumberOfTouches = 1
+        if #available(iOS 13.4, *) {
+            pan.allowedScrollTypesMask = .all
+        }
         addGestureRecognizer(pan)
 
         let pinch = UIPinchGestureRecognizer(target: self, action: #selector(handlePinch))
@@ -146,19 +148,18 @@ final class MeshVoxelView: UIView {
     // MARK: - Camera
 
     @objc private func handlePan(_ g: UIPanGestureRecognizer) {
-        switch g.state {
-        case .began:
-            panStart = g.location(in: self)
-        case .changed:
-            let loc = g.location(in: self)
-            // Positive delta_x → orbit right; positive delta_y (finger moves down) → lower elevation
-            cameraAzimuth -= Float(loc.x - panStart.x) * 0.013
-            cameraElevation = max(0.1, min(.pi / 2 - 0.05, cameraElevation - Float(loc.y - panStart.y) * 0.013))
-            panStart = loc
-            let pos = occupancyGrid?.devicePosition ?? .zero
-            updateCamera(cx: pos.x, cz: pos.y)
-        default: break
-        }
+        guard g.state == .began || g.state == .changed else { return }
+
+        let delta = g.translation(in: self)
+        guard delta != .zero else { return }
+
+        // Positive delta_x → orbit right; positive delta_y (mouse moves down/scrolls down) → raise elevation
+        cameraAzimuth -= Float(delta.x) * 0.013
+        cameraElevation = max(0.1, min(.pi / 2 - 0.05, cameraElevation + Float(delta.y) * 0.013))
+        g.setTranslation(.zero, in: self)
+
+        let pos = occupancyGrid?.devicePosition ?? .zero
+        updateCamera(cx: pos.x, cz: pos.y)
     }
 
     @objc private func handlePinch(_ g: UIPinchGestureRecognizer) {
@@ -276,6 +277,8 @@ final class MeshVoxelView: UIView {
             Array(ptr.bindMemory(to: UInt32.self))
         }
         let classBytes = Array(cData)
+        let vertexColorBytes = anchor.vertexColorsB64.flatMap { Data(base64Encoded: $0) }
+        let hasVertexColors = vertexColorBytes?.count == vertexCount * 4
 
         // Reconstruct column-major 4x4 transform
         let t = anchor.transform
@@ -339,6 +342,16 @@ final class MeshVoxelView: UIView {
             vectorCount: vertexCount, usesFloatComponents: true,
             componentsPerVector: 3, bytesPerComponent: 4, dataOffset: 0, dataStride: 12)
 
+        var sources = [posSource, normSource]
+        if hasVertexColors, let vertexColorBytes {
+            let colorFloats = makeNormalizedColorFloats(from: vertexColorBytes)
+            let colorData = colorFloats.withUnsafeBufferPointer { Data(buffer: $0) }
+            let colorSource = SCNGeometrySource(data: colorData, semantic: .color,
+                vectorCount: vertexCount, usesFloatComponents: true,
+                componentsPerVector: 4, bytesPerComponent: 4, dataOffset: 0, dataStride: 16)
+            sources.append(colorSource)
+        }
+
         var elements:  [SCNGeometryElement] = []
         var materials: [SCNMaterial] = []
 
@@ -348,17 +361,30 @@ final class MeshVoxelView: UIView {
                 primitiveCount: triIndices.count / 3, bytesPerIndex: 4)
             elements.append(element)
 
-            let classification = MeshClassification(rawValue: cls) ?? .none
             let mat = SCNMaterial()
-            let c = classification.color
-            mat.diffuse.contents = UIColor(red: c.r, green: c.g, blue: c.b, alpha: 0.9)
+            if hasVertexColors {
+                mat.diffuse.contents = UIColor.white
+            } else {
+                let classification = MeshClassification(rawValue: cls) ?? .none
+                let c = classification.color
+                mat.diffuse.contents = UIColor(red: c.r, green: c.g, blue: c.b, alpha: 0.9)
+            }
             mat.lightingModel = .lambert
             mat.isDoubleSided = true
             materials.append(mat)
         }
 
-        let geo = SCNGeometry(sources: [posSource, normSource], elements: elements)
+        let geo = SCNGeometry(sources: sources, elements: elements)
         geo.materials = materials
         return SCNNode(geometry: geo)
+    }
+
+    private func makeNormalizedColorFloats(from data: Data) -> [Float] {
+        var colors: [Float] = []
+        colors.reserveCapacity(data.count)
+        for byte in data {
+            colors.append(Float(byte) / 255.0)
+        }
+        return colors
     }
 }

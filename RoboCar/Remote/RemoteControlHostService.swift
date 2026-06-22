@@ -93,9 +93,9 @@ final class RemoteControlHostService {
         broadcast(message)
     }
 
-    func broadcastMapState(occupancyGrid: OccupancyGrid, routeWaypoints: [(x: Float, y: Float)], plannedPath: [(x: Float, y: Float)], routePreviewPaths: [[(x: Float, y: Float)]], activeRouteWaypointIndex: Int, navState: String) {
+    func broadcastMapState(occupancyGrid: OccupancyGrid, routeWaypoints: [(x: Float, y: Float)], plannedPath: [(x: Float, y: Float)], routePreviewPaths: [[(x: Float, y: Float)]], activeRouteWaypointIndex: Int, navState: String, compassBearingDeg: Double? = nil) {
         var message = RemoteMessage(type: "mapState")
-        message.pose = RemotePose(devicePosition: occupancyGrid.devicePosition)
+        message.pose = RemotePose(devicePosition: occupancyGrid.devicePosition, compassBearingDeg: compassBearingDeg)
         message.routeWaypoints = routeWaypoints.map(RemotePoint.init)
         message.plannedPath = plannedPath.map(RemotePoint.init)
         message.routePreviewPaths = routePreviewPaths.map { $0.map(RemotePoint.init) }
@@ -169,6 +169,14 @@ final class RemoteControlHostService {
         broadcast(message)
     }
 
+    /// Broadcasts the currently detected people so the controller can draw
+    /// tappable outlines over the video stream.
+    func broadcastPersonBoxes(_ boxes: [RemotePersonBox]) {
+        var message = RemoteMessage(type: "personBoxes")
+        message.personBoxes = boxes
+        broadcast(message)
+    }
+
     func broadcastGridReset() {
         latestMeshMessage = nil
         broadcast(RemoteMessage(type: "gridReset"))
@@ -188,13 +196,7 @@ final class RemoteControlHostService {
         }
     }
 
-    private func accept(_ connection: NWConnection) {
-        motorStopTimer?.cancel()
-        motorStopTimer = nil
-        signalingConnection?.cancel()
-        signalingConnection = connection
-        receiveBuffer = ""
-        let oldSession = webRTCSession
+    private func makeHostSession() -> RemoteControlWebRTCSession {
         let session = RemoteControlWebRTCSession(role: .host)
         session.onSignal = { [weak self] message in
             self?.sendSignal(message)
@@ -206,6 +208,31 @@ final class RemoteControlHostService {
             guard count == 1 || count % 30 == 0 else { return }
             self?.publishStatus("WebRTC sent view frame #\(count) (\(width)x\(height))")
         }
+        return session
+    }
+
+    /// Tears down the current peer connection and starts a fresh one (new offer),
+    /// which forces a new keyframe. Used to recover a stalled video feed without
+    /// dropping the TCP signaling/telemetry connection.
+    private func restartWebRTCSession() {
+        guard signalingConnection != nil else { return }
+        let oldSession = webRTCSession
+        let session = makeHostSession()
+        webRTCSession = session
+        oldSession?.stop()
+        session.start()
+        session.configureForLocalConnection(isLocalConnectionDetected)
+        publishStatus("WebRTC video restarted")
+    }
+
+    private func accept(_ connection: NWConnection) {
+        motorStopTimer?.cancel()
+        motorStopTimer = nil
+        signalingConnection?.cancel()
+        signalingConnection = connection
+        receiveBuffer = ""
+        let oldSession = webRTCSession
+        let session = makeHostSession()
         webRTCSession = session
         oldSession?.stop()
         connection.stateUpdateHandler = { [weak self, weak connection] state in
@@ -275,6 +302,11 @@ final class RemoteControlHostService {
             if message.type == "webrtcSignal" {
                 print("[RemoteWebRTC] host: received signal \(message.signalType ?? "unknown")")
                 webRTCSession?.handleSignal(message)
+                continue
+            }
+            if message.type == "restartVideo" {
+                print("[RemoteWebRTC] host: restartVideo requested")
+                restartWebRTCSession()
                 continue
             }
             if message.type == "connectionInfo" {

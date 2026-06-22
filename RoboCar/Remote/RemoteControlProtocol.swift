@@ -21,13 +21,16 @@ struct RemotePose: Codable {
     let z: Float
     let heading: Float
     let headingDeg: Float
+    /// True compass bearing in degrees (0 = North, CW positive). Nil when not yet available.
+    let compassBearingDeg: Double?
 
-    init(devicePosition: DevicePosition) {
+    init(devicePosition: DevicePosition, compassBearingDeg: Double? = nil) {
         x = devicePosition.x
         y = devicePosition.y
         z = devicePosition.z
         heading = devicePosition.heading
         headingDeg = devicePosition.heading * 180 / .pi
+        self.compassBearingDeg = compassBearingDeg
     }
 }
 
@@ -49,6 +52,20 @@ struct RemoteGridUpdate: Codable {
     let radius: Float
     let cellSize: Float
     let cells: [RemoteGridCell]
+}
+
+/// A detected person sent to the remote controller for drawing tappable
+/// outlines over the video stream. Bounding box is in Vision-normalised
+/// coordinates (origin bottom-left, values 0-1), matching the host overlay.
+struct RemotePersonBox: Codable {
+    let id: String
+    let x: Float
+    let y: Float
+    let width: Float
+    let height: Float
+    let isActive: Bool
+    let label: String
+    let name: String?
 }
 
 struct RemoteServoState: Codable {
@@ -103,6 +120,14 @@ struct RemoteMessage: Codable {
     var nlCommand: String?
     var isLocalConnection: Bool?
     var meshAnchors: [MeshAnchorSnapshot]?
+
+    /// Detected people broadcast to the controller (host → controller).
+    var personBoxes: [RemotePersonBox]?
+    /// Stable UUID string of a person targeted by a controller command.
+    var personID: String?
+    /// Name supplied by the controller for naming a person, or the name to
+    /// follow/delete by name.
+    var personName: String?
 
     init(type: String) {
         self.type = type

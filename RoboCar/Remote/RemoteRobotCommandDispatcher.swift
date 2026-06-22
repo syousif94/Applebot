@@ -48,6 +48,28 @@ enum RemoteRobotCommandDispatcher {
             case "stopNLCommand":
                 NLNavigator.shared.stop()
 
+            case "followPerson":
+                if let personID = message.personID {
+                    NotificationCenter.default.post(name: .remoteFollowPerson, object: nil,
+                                                    userInfo: ["personID": personID])
+                } else if let personName = message.personName {
+                    NotificationCenter.default.post(name: .remoteFollowPersonByName, object: nil,
+                                                    userInfo: ["personName": personName])
+                }
+
+            case "stopFollowing":
+                NotificationCenter.default.post(name: .stopFollowing, object: nil)
+
+            case "namePerson":
+                guard let personID = message.personID, let personName = message.personName else { return }
+                NotificationCenter.default.post(name: .remoteNamePerson, object: nil,
+                                                userInfo: ["personID": personID, "personName": personName])
+
+            case "deleteNamedPerson":
+                guard let personName = message.personName else { return }
+                NotificationCenter.default.post(name: .remoteDeleteNamedPerson, object: nil,
+                                                userInfo: ["personName": personName])
+
             case "scanServos":
                 ESP32BLEManager.shared.rescanServos(from: message.from ?? 1, to: message.to ?? 20)
 

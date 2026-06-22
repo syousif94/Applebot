@@ -6,6 +6,7 @@
 //
 
 import ARKit
+import UIKit
 import simd
 
 /// Extracted mesh data that can be processed without retaining ARMeshAnchor
@@ -20,6 +21,7 @@ struct ExtractedMeshData {
 
 /// Processes ARMeshAnchor data and updates the occupancy grid
 class MeshProcessor {
+    private static var vertexColorCache: [String: [UInt8]] = [:]
     
     // MARK: - Configuration
     
@@ -250,7 +252,12 @@ class MeshProcessor {
     /// Extract a telemetry-ready snapshot from an ARMeshAnchor.
     /// Call on the main thread while the anchor is still valid.
     /// Returns nil if the geometry buffers have been invalidated.
-    static func extractAnchorSnapshot(from anchor: ARMeshAnchor, generation: Int) -> MeshAnchorSnapshot? {
+    static func extractAnchorSnapshot(
+        from anchor: ARMeshAnchor,
+        generation: Int,
+        frame: ARFrame? = nil,
+        projectionOrientation: UIInterfaceOrientation = .landscapeRight
+    ) -> MeshAnchorSnapshot? {
         let geometry = anchor.geometry
         let vertexSource = geometry.vertices
         let vertexCount = vertexSource.count
@@ -289,6 +296,14 @@ class MeshProcessor {
             floats.append(v.z)
         }
         let verticesB64 = floatArrayToBase64(floats)
+        pruneVertexColorCache(keepingGeneration: generation)
+        let vertexColorsB64 = sampleVertexColors(
+            cacheKey: "\(generation):\(anchor.identifier.uuidString)",
+            localVertices: floats,
+            anchorTransform: anchor.transform,
+            frame: frame,
+            orientation: projectionOrientation
+        )
 
         // Indices: UInt32 triangle indices
         let fBuf = facesElement.buffer.contents()
@@ -342,8 +357,168 @@ class MeshProcessor {
             indicesB64: indicesB64,
             triangleCount: faceCount,
             classificationsB64: classificationsB64,
+            vertexColorsB64: vertexColorsB64,
             generation: generation
         )
+    }
+
+    private static func sampleVertexColors(
+        cacheKey: String,
+        localVertices: [Float],
+        anchorTransform: simd_float4x4,
+        frame: ARFrame?,
+        orientation: UIInterfaceOrientation
+    ) -> String? {
+        let vertexCount = localVertices.count / 3
+        let requiredColorBytes = vertexCount * 4
+        let cachedColors = vertexColorCache[cacheKey]
+        let hasCachedColors = cachedColors != nil && !cachedColors!.isEmpty
+
+        guard let frame,
+              vertexCount > 0,
+              CVPixelBufferGetPlaneCount(frame.capturedImage) >= 2 else {
+            return hasCachedColors ? uint8ArrayToBase64(Array(cachedColors!.prefix(requiredColorBytes))) : nil
+        }
+
+        let pixelBuffer = frame.capturedImage
+        guard let depthMap = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap else {
+            return hasCachedColors ? uint8ArrayToBase64(Array(cachedColors!.prefix(requiredColorBytes))) : nil
+        }
+
+        let viewportSize = frame.camera.imageResolution
+        guard viewportSize.width > 0, viewportSize.height > 0 else { return nil }
+
+        CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+        defer {
+            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+        }
+
+        guard let yBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 0),
+              let cbcrBase = CVPixelBufferGetBaseAddressOfPlane(pixelBuffer, 1) else { return nil }
+
+        let imageWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 0)
+        let imageHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 0)
+        let yBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 0)
+        let cbcrWidth = CVPixelBufferGetWidthOfPlane(pixelBuffer, 1)
+        let cbcrHeight = CVPixelBufferGetHeightOfPlane(pixelBuffer, 1)
+        let cbcrBytesPerRow = CVPixelBufferGetBytesPerRowOfPlane(pixelBuffer, 1)
+        let depthWidth = CVPixelBufferGetWidth(depthMap)
+        let depthHeight = CVPixelBufferGetHeight(depthMap)
+        let depthBytesPerRow = CVPixelBufferGetBytesPerRow(depthMap)
+        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap),
+              depthWidth > 0,
+              depthHeight > 0 else { return nil }
+
+        var colors: [UInt8]
+        if let cached = cachedColors, cached.count == requiredColorBytes {
+            // Same vertex count — reuse accumulated colors directly
+            colors = cached
+        } else if let cached = cachedColors, !cached.isEmpty {
+            // Vertex count changed (mesh refined); preserve old colors, pad/trim as needed
+            colors = [UInt8](repeating: 180, count: requiredColorBytes)
+            for alphaIndex in stride(from: 3, to: colors.count, by: 4) { colors[alphaIndex] = 255 }
+            let copyCount = min(cached.count, requiredColorBytes)
+            colors.replaceSubrange(0..<copyCount, with: cached.prefix(copyCount))
+        } else {
+            colors = [UInt8](repeating: 180, count: requiredColorBytes)
+            for alphaIndex in stride(from: 3, to: colors.count, by: 4) { colors[alphaIndex] = 255 }
+        }
+
+        let worldToCamera = frame.camera.transform.inverse
+        var sampledCount = 0
+
+        for vertexIndex in 0..<vertexCount {
+            let local = simd_float4(
+                localVertices[vertexIndex * 3],
+                localVertices[vertexIndex * 3 + 1],
+                localVertices[vertexIndex * 3 + 2],
+                1
+            )
+            let world4 = anchorTransform * local
+            let world = simd_float3(world4.x, world4.y, world4.z)
+            let cameraSpace = worldToCamera * world4
+            let cameraDepth = -cameraSpace.z
+            guard cameraDepth > 0.05 else { continue }
+
+            let point = frame.camera.projectPoint(world, orientation: orientation, viewportSize: viewportSize)
+            let px = Int(point.x.rounded())
+            let py = Int(point.y.rounded())
+            let out = vertexIndex * 4
+
+            guard px >= 0, py >= 0, px < imageWidth, py < imageHeight else { continue }
+            guard depthMatchesVertex(
+                pixelX: px,
+                pixelY: py,
+                imageWidth: imageWidth,
+                imageHeight: imageHeight,
+                cameraDepth: cameraDepth,
+                depthBase: depthBase,
+                depthWidth: depthWidth,
+                depthHeight: depthHeight,
+                depthBytesPerRow: depthBytesPerRow
+            ) else { continue }
+
+            let y = yBase.advanced(by: py * yBytesPerRow + px).assumingMemoryBound(to: UInt8.self).pointee
+            let cbcrX = min(max(px / 2, 0), cbcrWidth - 1)
+            let cbcrY = min(max(py / 2, 0), cbcrHeight - 1)
+            let cbcrOffset = cbcrY * cbcrBytesPerRow + cbcrX * 2
+            let cb = cbcrBase.advanced(by: cbcrOffset).assumingMemoryBound(to: UInt8.self).pointee
+            let cr = cbcrBase.advanced(by: cbcrOffset + 1).assumingMemoryBound(to: UInt8.self).pointee
+            let rgb = ycbcrToRGB(y: y, cb: cb, cr: cr)
+
+            colors[out] = rgb.r
+            colors[out + 1] = rgb.g
+            colors[out + 2] = rgb.b
+            colors[out + 3] = 255
+            sampledCount += 1
+        }
+
+        guard sampledCount > 0 || hasCachedColors else { return nil }
+        vertexColorCache[cacheKey] = colors
+        return uint8ArrayToBase64(colors)
+    }
+
+    private static func pruneVertexColorCache(keepingGeneration generation: Int) {
+        let prefix = "\(generation):"
+        vertexColorCache = vertexColorCache.filter { $0.key.hasPrefix(prefix) }
+    }
+
+    private static func depthMatchesVertex(
+        pixelX: Int,
+        pixelY: Int,
+        imageWidth: Int,
+        imageHeight: Int,
+        cameraDepth: Float,
+        depthBase: UnsafeMutableRawPointer,
+        depthWidth: Int,
+        depthHeight: Int,
+        depthBytesPerRow: Int
+    ) -> Bool {
+        let depthX = min(max(Int((Float(pixelX) / Float(imageWidth)) * Float(depthWidth)), 0), depthWidth - 1)
+        let depthY = min(max(Int((Float(pixelY) / Float(imageHeight)) * Float(depthHeight)), 0), depthHeight - 1)
+        let depth = depthBase.advanced(by: depthY * depthBytesPerRow + depthX * MemoryLayout<Float32>.size)
+            .assumingMemoryBound(to: Float32.self)
+            .pointee
+
+        guard depth.isFinite, depth > 0 else { return false }
+        let tolerance = max(0.08, cameraDepth * 0.06)
+        return abs(Float(depth) - cameraDepth) <= tolerance
+    }
+
+    private static func ycbcrToRGB(y: UInt8, cb: UInt8, cr: UInt8) -> (r: UInt8, g: UInt8, b: UInt8) {
+        let yf = Float(y)
+        let cbf = Float(cb) - 128
+        let crf = Float(cr) - 128
+        let r = yf + 1.4020 * crf
+        let g = yf - 0.3441 * cbf - 0.7141 * crf
+        let b = yf + 1.7720 * cbf
+        return (clampToByte(r), clampToByte(g), clampToByte(b))
+    }
+
+    private static func clampToByte(_ value: Float) -> UInt8 {
+        UInt8(max(0, min(255, Int(value.rounded()))))
     }
 
     // MARK: - Face Processing (for more accurate obstacles)

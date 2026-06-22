@@ -237,6 +237,7 @@ struct MeshAnchorSnapshot: Codable {
     let indicesB64: String       // base64(u32[]) — triangle indices
     let triangleCount: Int
     let classificationsB64: String // base64(u8[]) — one per face
+    let vertexColorsB64: String?   // base64(rgba8[]) — sender-baked per-vertex mesh colors
     let generation: Int
 }
 

@@ -10,6 +10,7 @@ import ARKit
 import RealityKit
 import Vision
 import CoreImage
+import CoreLocation
 
 class LiDARViewController: UIViewController {
     
@@ -25,9 +26,10 @@ class LiDARViewController: UIViewController {
     private var voiceStatusLabel: UILabel!
     private var obstaclePointOverlay: ObstaclePointOverlayView!
     private var personBoundingBoxOverlay: PersonBoundingBoxOverlay!
-    private var handJointOverlay: HandJointOverlayView!
     private var navigateButton: UIButton!
     private var clearWaypointsButton: UIButton!
+    /// Bottom glass container grouping the overlay action buttons
+    private var bottomControlsBar: UIVisualEffectView!
     // MARK: - Voice Assistant
     
     private let voiceAssistant = VoiceAssistantManager.shared
@@ -54,6 +56,9 @@ class LiDARViewController: UIViewController {
     
     /// Counter for mesh updates to ensure newer meshes overwrite older ones
     private var meshUpdateCounter: UInt64 = 0
+
+    /// Last baked per-vertex color buffer for each outgoing mesh anchor layout.
+    private var meshAnchorVertexColorCache: [String: String] = [:]
     
     /// Flag to pause mesh processing during reset
     private var isResetting = false
@@ -87,6 +92,16 @@ class LiDARViewController: UIViewController {
     /// Whether we're currently re-planning for follow mode
     private var isFollowReplanning = false
 
+    /// A pending voice-initiated follow request that is waiting for its target
+    /// person to become visible in the always-on detector.
+    private enum PendingFollow: Equatable {
+        /// Follow the saved person with this name as soon as they're recognised.
+        case named(String)
+        /// Follow the first / nearest person that appears.
+        case any
+    }
+    private var pendingFollow: PendingFollow?
+
     /// Always-on person detection results with stable ReID-based IDs
     private var alwaysOnPersonBoxes: [PersonBoxInfo] = []
     /// Known person embeddings keyed by stable UUID
@@ -95,28 +110,17 @@ class LiDARViewController: UIViewController {
     private var knownPersonBoundingBoxes: [UUID: CGRect] = [:]
     /// Last time each always-on person was seen
     private var knownPersonLastSeen: [UUID: Date] = [:]
+    /// First time each always-on person was seen — used to pick the canonical ID
+    /// when merging duplicate identities (the older one wins).
+    private var knownPersonFirstSeen: [UUID: Date] = [:]
     /// Whether a background detection request is in flight
     private var personDetectionInFlight = false
-    /// ReID match threshold for always-on scanner
-    private let alwaysOnReidThreshold: Float = 0.55
+    /// ReID match threshold for always-on scanner (true cosine on normalised embeddings)
+    private let alwaysOnReidThreshold: Float = 0.5
     /// IoU threshold for keeping an always-on ID stable across adjacent frames
     private let alwaysOnIouThreshold: CGFloat = 0.18
     /// How long to retain always-on ID memory while a person is briefly missed
-    private let alwaysOnPersonMemoryTimeout: TimeInterval = 4.0
-    /// Per-person activation gesture phase for always-on scanner (peace→fist→peace)
-    private var alwaysOnActivatePhase: [UUID: PersonTracker.ActivateGesturePhase] = [:]
-    /// Timestamps for activation gesture phase transitions
-    private var alwaysOnActivateTimestamp: [UUID: Date] = [:]
-    /// Cancel gesture phase for always-on scanner (index wag)
-    private var alwaysOnCancelPhase: PersonTracker.CancelGesturePhase = .idle
-    /// Last wrist X position for wag detection
-    private var alwaysOnCancelLastWristX: CGFloat?
-    /// Timestamp of last cancel gesture phase transition
-    private var alwaysOnCancelTimestamp: Date = .distantPast
-    /// Gesture timeout (seconds)
-    private let alwaysOnGestureTimeout: TimeInterval = 3.0
-    /// Minimum fingertip X delta for wag detection
-    private let alwaysOnWagMinDelta: CGFloat = 0.04
+    private let alwaysOnPersonMemoryTimeout: TimeInterval = 6.0
     
     /// Index of the current route waypoint being navigated to
     private var currentRouteWaypointIndex = 0
@@ -132,14 +136,17 @@ class LiDARViewController: UIViewController {
     private var isRemoteSnapshotInFlight = false
     private var remoteServoListObserverID: UUID?
     private var remoteServoStateObserverID: UUID?
-    
+
+    // MARK: - Compass
+    private let locationManager = CLLocationManager()
+
     // MARK: - Lifecycle
-    
+
     override func viewDidLoad() {
         super.viewDidLoad()
-        
+
         view.backgroundColor = .black
-        
+
         setupARView()
         setupGridMapView()
         setupStatusLabels()
@@ -151,11 +158,13 @@ class LiDARViewController: UIViewController {
         setupPersonBoundingBoxOverlay()
         setupNavigateButton()
         setupFollowButton()
+        setupBottomControlBar()
         setupMeshProcessor()
         setupObstacleDetector()
         setupNavigationController()
         setupRemoteControlHost()
         setupNLNavigator()
+        setupCompassUpdates()
         
         // Use CADisplayLink for smooth updates
         displayLink = CADisplayLink(target: self, selector: #selector(updateFrame))
@@ -235,6 +244,15 @@ class LiDARViewController: UIViewController {
         ])
     }
 
+    private func setupCompassUpdates() {
+        locationManager.delegate = self
+        locationManager.headingFilter = 1  // update every 1 degree change
+        locationManager.requestWhenInUseAuthorization()
+        if CLLocationManager.headingAvailable() {
+            locationManager.startUpdatingHeading()
+        }
+    }
+
     private func setupRemoteControlHost() {
         RemoteControlHostService.shared.start()
         remoteServoListObserverID = ESP32BLEManager.shared.addServoListObserver { ids in
@@ -296,6 +314,7 @@ class LiDARViewController: UIViewController {
         view.addSubview(positionLabel)
         
         NSLayoutConstraint.activate([
+            positionLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
             positionLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
     }
@@ -303,19 +322,16 @@ class LiDARViewController: UIViewController {
     private func setupResetButton() {
         resetButton = UIButton(type: .system)
         resetButton.translatesAutoresizingMaskIntoConstraints = false
-        resetButton.setTitle("Reset", for: .normal)
-        resetButton.setTitleColor(.white, for: .normal)
-        resetButton.titleLabel?.font = .systemFont(ofSize: 16, weight: .semibold)
+        let resetConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
+        resetButton.setImage(UIImage(systemName: "xmark", withConfiguration: resetConfig), for: .normal)
+        resetButton.tintColor = .white
         resetButton.backgroundColor = UIColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 0.9)
-        resetButton.layer.cornerRadius = 8
-        resetButton.contentEdgeInsets = UIEdgeInsets(top: 10, left: 24, bottom: 10, right: 24)
+        resetButton.layer.cornerRadius = 22
         resetButton.addTarget(self, action: #selector(resetButtonTapped), for: .touchUpInside)
-        
-        view.addSubview(resetButton)
-        
+        // Added to the bottom glass control bar in setupBottomControlBar()
         NSLayoutConstraint.activate([
-            resetButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            resetButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
+            resetButton.widthAnchor.constraint(equalToConstant: 44),
+            resetButton.heightAnchor.constraint(equalToConstant: 44),
         ])
     }
     
@@ -330,13 +346,10 @@ class LiDARViewController: UIViewController {
         settingsButton.layer.cornerRadius = 22
         settingsButton.addTarget(self, action: #selector(settingsButtonTapped), for: .touchUpInside)
         
-        view.addSubview(settingsButton)
-        
+        // Added to the bottom glass control bar in setupBottomControlBar()
         NSLayoutConstraint.activate([
             settingsButton.widthAnchor.constraint(equalToConstant: 44),
-            settingsButton.heightAnchor.constraint(equalToConstant: 44),
-            settingsButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -16),
-            settingsButton.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -16)
+            settingsButton.heightAnchor.constraint(equalToConstant: 44)
         ])
     }
     
@@ -351,9 +364,7 @@ class LiDARViewController: UIViewController {
         micButton.layer.cornerRadius = 22
         micButton.addTarget(self, action: #selector(micButtonTapped), for: .touchUpInside)
         
-        view.addSubview(micButton)
-        
-        // Voice status label (shows above mic button)
+        // Voice status label (shows above the bottom control bar)
         voiceStatusLabel = UILabel()
         voiceStatusLabel.translatesAutoresizingMaskIntoConstraints = false
         voiceStatusLabel.font = .systemFont(ofSize: 12, weight: .medium)
@@ -368,17 +379,14 @@ class LiDARViewController: UIViewController {
         
         view.addSubview(voiceStatusLabel)
         
+        // micButton is placed in the bottom glass control bar in setupBottomControlBar().
+        // The voiceStatusLabel's vertical anchor is also set there (above the bar).
         NSLayoutConstraint.activate([
             micButton.widthAnchor.constraint(equalToConstant: 44),
             micButton.heightAnchor.constraint(equalToConstant: 44),
-            micButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            micButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
             
-            voiceStatusLabel.trailingAnchor.constraint(equalTo: micButton.leadingAnchor, constant: -8),
-            voiceStatusLabel.centerYAnchor.constraint(equalTo: micButton.centerYAnchor),
-            voiceStatusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 200),
-            
-            positionLabel.topAnchor.constraint(equalTo: micButton.bottomAnchor, constant: 8)
+            voiceStatusLabel.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            voiceStatusLabel.widthAnchor.constraint(lessThanOrEqualToConstant: 280)
         ])
     }
     
@@ -511,6 +519,7 @@ class LiDARViewController: UIViewController {
         
         // Reset mesh tracking
         processedMeshVersions.removeAll()
+        meshAnchorVertexColorCache.removeAll()
         
         // Clear planned path
         plannedPath.removeAll()
@@ -553,54 +562,175 @@ class LiDARViewController: UIViewController {
             personBoundingBoxOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
             personBoundingBoxOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
         ])
-        
-        handJointOverlay = HandJointOverlayView()
-        handJointOverlay.translatesAutoresizingMaskIntoConstraints = false
-        arView.addSubview(handJointOverlay)
-        NSLayoutConstraint.activate([
-            handJointOverlay.topAnchor.constraint(equalTo: arView.topAnchor),
-            handJointOverlay.leadingAnchor.constraint(equalTo: arView.leadingAnchor),
-            handJointOverlay.trailingAnchor.constraint(equalTo: arView.trailingAnchor),
-            handJointOverlay.bottomAnchor.constraint(equalTo: arView.bottomAnchor),
-        ])
+        personBoundingBoxOverlay.onTapBody = { [weak self] id in
+            self?.handleHostPersonTapFollow(id: id)
+        }
+        personBoundingBoxOverlay.onTapName = { [weak self] id in
+            self?.handleHostPersonRename(id: id)
+        }
+        personBoundingBoxOverlay.onTapDelete = { [weak self] id in
+            self?.handleHostPersonDelete(id: id)
+        }
     }
+
+    // MARK: - Host tap-to-follow / naming
+
+    /// Start following the tapped person, using their cached embedding and box.
+    private func handleHostPersonTapFollow(id: UUID) {
+        // Tapping to start follow only applies when idle; while tracking, use the
+        // bottom-bar cancel button instead.
+        guard personTracker.state == .idle else { return }
+        guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }) else { return }
+        let embedding = knownPersonEmbeddings[id] ?? []
+        startFollowModeForPerson(
+            id: id,
+            embedding: embedding,
+            boundingBox: box.boundingBox,
+            worldPosition: box.worldPosition
+        )
+    }
+
+    /// Prompt to name or rename the tapped person, saving their current embedding.
+    private func handleHostPersonRename(id: UUID) {
+        guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }) else { return }
+        guard let embedding = knownPersonEmbeddings[id], !embedding.isEmpty else {
+            SpeechSynthesisManager.shared.speak("Can't read that person yet")
+            return
+        }
+        let existingName = box.name
+        let alert = UIAlertController(
+            title: existingName == nil ? "Name this person" : "Rename person",
+            message: "The robot will remember them and can follow them by name.",
+            preferredStyle: .alert
+        )
+        alert.addTextField { tf in
+            tf.placeholder = "Name"
+            tf.text = existingName
+            tf.autocapitalizationType = .words
+            tf.clearButtonMode = .whileEditing
+        }
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Save", style: .default) { [weak self] _ in
+            guard let self = self else { return }
+            let newName = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            guard !newName.isEmpty else { return }
+            // If renaming, remove the old saved entry first.
+            if let old = existingName, old.caseInsensitiveCompare(newName) != .orderedSame {
+                NamedPersonStore.shared.delete(name: old)
+            }
+            // Use the freshest embedding available for this id.
+            let freshEmbedding = self.knownPersonEmbeddings[id] ?? embedding
+            NamedPersonStore.shared.save(name: newName, embedding: freshEmbedding)
+            SpeechSynthesisManager.shared.speak("Saved \(newName)")
+        })
+        present(alert, animated: true)
+    }
+
+    /// Delete the saved entry for the tapped person.
+    private func handleHostPersonDelete(id: UUID) {
+        guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }),
+              let name = box.name else { return }
+        NamedPersonStore.shared.delete(name: name)
+        SpeechSynthesisManager.shared.speak("Removed \(name)")
+    }
+
+    // MARK: - Controller person-box sync
+
+    private var lastPersonBoxBroadcast = Date.distantPast
+    private var lastPersonBoxBroadcastWasEmpty = false
+
+    /// Sends the current detected people to the remote controller (throttled).
+    private func broadcastPersonBoxesToController() {
+        let boxes = personBoundingBoxOverlay.people.map { p in
+            RemotePersonBox(
+                id: p.id.uuidString,
+                x: Float(p.boundingBox.origin.x),
+                y: Float(p.boundingBox.origin.y),
+                width: Float(p.boundingBox.size.width),
+                height: Float(p.boundingBox.size.height),
+                isActive: p.isActive,
+                label: p.label,
+                name: p.name
+            )
+        }
+        if boxes.isEmpty {
+            // Send a single "cleared" frame, then go quiet.
+            if !lastPersonBoxBroadcastWasEmpty {
+                lastPersonBoxBroadcastWasEmpty = true
+                RemoteControlHostService.shared.broadcastPersonBoxes([])
+            }
+            return
+        }
+        lastPersonBoxBroadcastWasEmpty = false
+        let now = Date()
+        guard now.timeIntervalSince(lastPersonBoxBroadcast) > 0.066 else { return }
+        lastPersonBoxBroadcast = now
+        RemoteControlHostService.shared.broadcastPersonBoxes(boxes)
+    }
+
+    /// Controller asked to follow a specific detected person by id.
+    @objc private func handleRemoteFollowPerson(_ notification: Notification) {
+        guard let idString = notification.userInfo?["personID"] as? String,
+              let id = UUID(uuidString: idString) else { return }
+        handleHostPersonTapFollow(id: id)
+    }
+
+    /// Controller asked to follow / unfollow by name.
+    @objc private func handleRemoteFollowPersonByName(_ notification: Notification) {
+        guard let name = notification.userInfo?["personName"] as? String else { return }
+        startFollowingByName(name)
+    }
+
+    /// Controller asked to name/rename a detected person, saving their embedding.
+    @objc private func handleRemoteNamePerson(_ notification: Notification) {
+        guard let idString = notification.userInfo?["personID"] as? String,
+              let id = UUID(uuidString: idString),
+              let name = (notification.userInfo?["personName"] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines),
+              !name.isEmpty else { return }
+        let existingName = personBoundingBoxOverlay.people.first(where: { $0.id == id })?.name
+        if let old = existingName, old.caseInsensitiveCompare(name) != .orderedSame {
+            NamedPersonStore.shared.delete(name: old)
+        }
+        guard let embedding = knownPersonEmbeddings[id], !embedding.isEmpty else { return }
+        NamedPersonStore.shared.save(name: name, embedding: embedding)
+    }
+
+    /// Controller asked to delete a saved person by name.
+    @objc private func handleRemoteDeleteNamedPerson(_ notification: Notification) {
+        guard let name = notification.userInfo?["personName"] as? String else { return }
+        NamedPersonStore.shared.delete(name: name)
+    }
+
 
     private func setupNavigateButton() {
         navigateButton = UIButton(type: .system)
         navigateButton.translatesAutoresizingMaskIntoConstraints = false
-        navigateButton.setTitle("Navigate", for: .normal)
-        navigateButton.setTitleColor(.white, for: .normal)
-        navigateButton.titleLabel?.font = .systemFont(ofSize: 15, weight: .semibold)
-        navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
-        navigateButton.layer.cornerRadius = 18
-        navigateButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 24, bottom: 8, right: 24)
+        let navConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
+        navigateButton.setImage(UIImage(systemName: "play.fill", withConfiguration: navConfig), for: .normal)
+        navigateButton.tintColor = .white
+        navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.75, blue: 0.3, alpha: 0.9)
+        navigateButton.layer.cornerRadius = 22
         navigateButton.addTarget(self, action: #selector(navigateButtonTapped), for: .touchUpInside)
         navigateButton.isHidden = true
-        
-        view.addSubview(navigateButton)
         
         // Clear waypoints button
         clearWaypointsButton = UIButton(type: .system)
         clearWaypointsButton.translatesAutoresizingMaskIntoConstraints = false
-        clearWaypointsButton.setTitle("Clear", for: .normal)
-        clearWaypointsButton.setTitleColor(.white, for: .normal)
-        clearWaypointsButton.titleLabel?.font = .systemFont(ofSize: 14, weight: .medium)
-        clearWaypointsButton.backgroundColor = UIColor(white: 0.3, alpha: 0.9)
-        clearWaypointsButton.layer.cornerRadius = 18
-        clearWaypointsButton.contentEdgeInsets = UIEdgeInsets(top: 8, left: 16, bottom: 8, right: 16)
+        let clearConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
+        clearWaypointsButton.setImage(UIImage(systemName: "stop.fill", withConfiguration: clearConfig), for: .normal)
+        clearWaypointsButton.tintColor = .white
+        clearWaypointsButton.backgroundColor = UIColor(white: 0.35, alpha: 0.9)
+        clearWaypointsButton.layer.cornerRadius = 22
         clearWaypointsButton.addTarget(self, action: #selector(clearWaypointsButtonTapped), for: .touchUpInside)
         clearWaypointsButton.isHidden = true
         
-        view.addSubview(clearWaypointsButton)
-        
+        // Both buttons are placed in the bottom glass control bar in setupBottomControlBar().
         NSLayoutConstraint.activate([
-            navigateButton.centerXAnchor.constraint(equalTo: view.centerXAnchor),
-            navigateButton.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
-            navigateButton.heightAnchor.constraint(equalToConstant: 36),
-            
-            clearWaypointsButton.leadingAnchor.constraint(equalTo: navigateButton.trailingAnchor, constant: 8),
-            clearWaypointsButton.centerYAnchor.constraint(equalTo: navigateButton.centerYAnchor),
-            clearWaypointsButton.heightAnchor.constraint(equalToConstant: 36),
+            navigateButton.widthAnchor.constraint(equalToConstant: 44),
+            navigateButton.heightAnchor.constraint(equalToConstant: 44),
+            clearWaypointsButton.widthAnchor.constraint(equalToConstant: 44),
+            clearWaypointsButton.heightAnchor.constraint(equalToConstant: 44),
         ])
     }
     
@@ -613,144 +743,89 @@ class LiDARViewController: UIViewController {
         followButton.translatesAutoresizingMaskIntoConstraints = false
         
         let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)
-        followButton.setImage(UIImage(systemName: "figure.walk", withConfiguration: config), for: .normal)
-        followButton.tintColor = .white
+        followButton.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: config), for: .normal)
+        followButton.tintColor = .systemRed
         followButton.backgroundColor = UIColor(white: 0.2, alpha: 0.9)
         followButton.layer.cornerRadius = 22
         followButton.addTarget(self, action: #selector(followButtonTapped), for: .touchUpInside)
+        // Only visible while actively scanning/following; tapping cancels.
+        followButton.isHidden = true
         
-        view.addSubview(followButton)
-        
+        // Added to the bottom glass control bar in setupBottomControlBar()
         NSLayoutConstraint.activate([
             followButton.widthAnchor.constraint(equalToConstant: 44),
             followButton.heightAnchor.constraint(equalToConstant: 44),
-            followButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12),
-            followButton.topAnchor.constraint(equalTo: positionLabel.bottomAnchor, constant: 8),
+        ])
+    }
+
+    /// Groups the overlay action buttons (settings, mic, follow, navigate, clear, reset)
+    /// into a single glass container pinned to the bottom of the screen. Individual
+    /// buttons keep their existing show/hide logic via `isHidden`; the stack collapses
+    /// hidden buttons so the group re-centers exactly as before.
+    private func setupBottomControlBar() {
+        let container = UIVisualEffectView(effect: UIBlurEffect(style: .systemUltraThinMaterialDark))
+        container.translatesAutoresizingMaskIntoConstraints = false
+        container.layer.cornerRadius = 30
+        container.layer.cornerCurve = .continuous
+        container.clipsToBounds = true
+        container.layer.borderWidth = 1
+        container.layer.borderColor = UIColor.white.withAlphaComponent(0.18).cgColor
+        bottomControlsBar = container
+
+        let stack = UIStackView(arrangedSubviews: [
+            settingsButton,
+            micButton,
+            followButton,
+            navigateButton,
+            clearWaypointsButton,
+            resetButton
+        ])
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        stack.axis = .horizontal
+        stack.alignment = .center
+        stack.spacing = 8
+
+        container.contentView.addSubview(stack)
+        view.addSubview(container)
+
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: container.contentView.topAnchor, constant: 8),
+            stack.bottomAnchor.constraint(equalTo: container.contentView.bottomAnchor, constant: -8),
+            stack.leadingAnchor.constraint(equalTo: container.contentView.leadingAnchor, constant: 12),
+            stack.trailingAnchor.constraint(equalTo: container.contentView.trailingAnchor, constant: -12),
+
+            container.centerXAnchor.constraint(equalTo: view.centerXAnchor),
+            container.leadingAnchor.constraint(greaterThanOrEqualTo: view.leadingAnchor, constant: 12),
+            container.trailingAnchor.constraint(lessThanOrEqualTo: view.trailingAnchor, constant: -12),
+            container.bottomAnchor.constraint(equalTo: view.safeAreaLayoutGuide.bottomAnchor, constant: -12),
+
+            // Voice status label sits just above the control bar
+            voiceStatusLabel.bottomAnchor.constraint(equalTo: container.topAnchor, constant: -8)
         ])
     }
     
     @objc private func followButtonTapped() {
-        if personTracker.state == .idle {
-            startFollowMode()
-        } else {
-            stopFollowMode()
+        // Cancel-only button: hidden while idle (unless a voice-follow is pending).
+        if pendingFollow != nil {
+            pendingFollow = nil
+            voiceStatusLabel.alpha = 0
+            updateFollowButtonAppearance(isFollowing: false)
+            return
         }
+        guard personTracker.state != .idle else { return }
+        stopFollowMode()
     }
     
     private func updateFollowButtonAppearance(isFollowing: Bool) {
+        // The button doubles as the cancel control: shown (red ✕) only while a
+        // scan/follow is active, hidden otherwise.
         let config = UIImage.SymbolConfiguration(pointSize: 22, weight: .medium)
-        if isFollowing {
-            followButton.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: config), for: .normal)
-            followButton.tintColor = .systemRed
-        } else {
-            followButton.setImage(UIImage(systemName: "figure.walk", withConfiguration: config), for: .normal)
-            followButton.tintColor = .white
-        }
+        followButton.setImage(UIImage(systemName: "xmark.circle.fill", withConfiguration: config), for: .normal)
+        followButton.tintColor = .systemRed
+        followButton.isHidden = !isFollowing
     }
     
     // MARK: - Follow Mode
-    
-    private func startFollowMode() {
-        // Stop any existing navigation
-        pathNavigator.stopNavigation()
-        
-        // Start scanning for people — gesture activation will trigger tracking
-        personTracker.startScanning()
-        
-        // Update button to show stop icon
-        updateFollowButtonAppearance(isFollowing: true)
-        
-        // Wire cancel gesture to stop follow mode
-        personTracker.onCancelGesture = { [weak self] in
-            DispatchQueue.main.async {
-                self?.stopFollowMode()
-            }
-        }
-        
-        // Wire up person tracker callbacks
-        personTracker.onPeopleUpdated = { [weak self] people in
-            guard let self = self else { return }
-            // Emit telemetry for detected people (~2 Hz, throttled by scanDetectionInterval)
-            TelemetryService.shared.logPersonTracking(
-                event: "scan_update",
-                message: "\(people.count) people visible",
-                occupancyGrid: self.occupancyGrid,
-                cameraTransform: TelemetryService.shared.lastCameraTransform
-            )
-        }
-        
-        personTracker.onPersonActivated = { [weak self] person in
-            guard let self = self else { return }
-            let idPrefix = String(person.id.uuidString.prefix(8))
-            
-            SpeechSynthesisManager.shared.speak("Following started")
-            
-            TelemetryService.shared.logPersonTracking(
-                event: "person_activated",
-                message: "Person \(idPrefix) activated via gesture",
-                occupancyGrid: self.occupancyGrid,
-                cameraTransform: TelemetryService.shared.lastCameraTransform
-            )
-            
-            // Now that a person is activated, start the follow navigation
-            DispatchQueue.main.async {
-                if let personPos = self.personTracker.trackedWorldPosition {
-                    self.obstacleDetector.excludedPersonPosition = simd_float2(personPos.x, personPos.y)
-                    self.pathNavigator.updateFollowTarget(x: personPos.x, y: personPos.y)
-                }
-                self.pathNavigator.startFollowing()
-                if let personPos = self.personTracker.trackedWorldPosition {
-                    self.planFollowPath(toX: personPos.x, toY: personPos.y)
-                }
-            }
-        }
-        
-        personTracker.onPositionUpdated = { [weak self] worldPos in
-            guard let self = self else { return }
-            self.pathNavigator.updateFollowTarget(x: worldPos.x, y: worldPos.y)
-            self.obstacleDetector.excludedPersonPosition = worldPos
-        }
-        
-        personTracker.onStateChanged = { [weak self] state in
-            guard let self = self else { return }
-            
-            TelemetryService.shared.logPersonTracking(
-                event: "state_change",
-                message: "State → \(state.rawValue)",
-                occupancyGrid: self.occupancyGrid,
-                cameraTransform: TelemetryService.shared.lastCameraTransform
-            )
-            
-            DispatchQueue.main.async {
-                switch state {
-                case .scanning:
-                    self.voiceStatusLabel.text = "Scanning — raise open hand to follow"
-                    self.voiceStatusLabel.textColor = .cyan
-                    self.voiceStatusLabel.alpha = 1
-                case .lost:
-                    // Person lost — turn toward their last known position
-                    // instead of stopping, to attempt visual reacquisition.
-                    self.pathNavigator.handleFollowTargetLost()
-                    self.voiceStatusLabel.text = "Turning to last known position"
-                    self.voiceStatusLabel.textColor = .orange
-                    self.voiceStatusLabel.alpha = 1
-                case .tracking:
-                    self.voiceStatusLabel.text = "Following person"
-                    self.voiceStatusLabel.textColor = UIColor(red: 0.7, green: 0.5, blue: 1.0, alpha: 1)
-                    self.voiceStatusLabel.alpha = 1
-                    UIView.animate(withDuration: 0.3, delay: 2.0) {
-                        self.voiceStatusLabel.alpha = 0
-                    }
-                case .reacquiring:
-                    self.voiceStatusLabel.text = "Re-acquiring person..."
-                    self.voiceStatusLabel.textColor = .yellow
-                    self.voiceStatusLabel.alpha = 1
-                case .idle:
-                    break
-                }
-            }
-        }
-    }
     
     /// Start follow mode for a specific person identified by the always-on scanner.
     private func startFollowModeForPerson(id: UUID, embedding: [Float], boundingBox: CGRect, worldPosition: simd_float2?) {
@@ -760,12 +835,6 @@ class LiDARViewController: UIViewController {
         SpeechSynthesisManager.shared.speak("Following started")
         
         // Wire up callbacks (same as startFollowMode)
-        personTracker.onCancelGesture = { [weak self] in
-            DispatchQueue.main.async {
-                self?.stopFollowMode()
-            }
-        }
-        
         personTracker.onPeopleUpdated = { [weak self] people in
             guard let self = self else { return }
             TelemetryService.shared.logPersonTracking(
@@ -782,7 +851,7 @@ class LiDARViewController: UIViewController {
             
             TelemetryService.shared.logPersonTracking(
                 event: "person_activated",
-                message: "Person \(idPrefix) activated via gesture",
+                message: "Person \(idPrefix) activated by tap",
                 occupancyGrid: self.occupancyGrid,
                 cameraTransform: TelemetryService.shared.lastCameraTransform
             )
@@ -818,7 +887,7 @@ class LiDARViewController: UIViewController {
             DispatchQueue.main.async {
                 switch state {
                 case .scanning:
-                    self.voiceStatusLabel.text = "Scanning — raise open hand to follow"
+                    self.voiceStatusLabel.text = "Scanning for people — tap someone to follow"
                     self.voiceStatusLabel.textColor = .cyan
                     self.voiceStatusLabel.alpha = 1
                 case .lost:
@@ -861,7 +930,6 @@ class LiDARViewController: UIViewController {
             occupancyGrid: occupancyGrid,
             cameraTransform: TelemetryService.shared.lastCameraTransform
         )
-        personTracker.onCancelGesture = nil
         personTracker.onPeopleUpdated = nil
         personTracker.onPersonActivated = nil
         personTracker.onPositionUpdated = nil
@@ -871,8 +939,6 @@ class LiDARViewController: UIViewController {
         obstacleDetector.excludedPersonPosition = nil
         personBoundingBoxOverlay.people = []
         personBoundingBoxOverlay.setNeedsDisplay()
-        handJointOverlay.hands = []
-        handJointOverlay.setNeedsDisplay()
         gridMapView.personPositions = []
         isFollowReplanning = false
         
@@ -884,21 +950,101 @@ class LiDARViewController: UIViewController {
         gridMapView.setNeedsDisplay()
         
         updateFollowButtonAppearance(isFollowing: false)
-        
-        // Reset gesture state machines
-        alwaysOnActivatePhase.removeAll()
-        alwaysOnActivateTimestamp.removeAll()
-        alwaysOnCancelPhase = .idle
-        alwaysOnCancelLastWristX = nil
     }
     
-    @objc private func handleStartFollowing() {
-        startFollowMode()
+    @objc private func handleStartFollowing(_ notification: Notification) {
+        let name = (notification.userInfo?["name"] as? String)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if let name = name, !name.isEmpty {
+            startFollowingByName(name)
+        } else {
+            startFollowingNearest()
+        }
     }
     
     @objc private func handleStopFollowing() {
+        pendingFollow = nil
         stopFollowMode()
     }
+
+    /// Begin following the saved person with `name`. If they are currently
+    /// visible, start immediately; otherwise enter a pending state and auto-follow
+    /// when they are recognised by the always-on detector.
+    private func startFollowingByName(_ name: String) {
+        guard personTracker.state == .idle else { return }
+        if let box = alwaysOnPersonBoxes.first(where: {
+            $0.name?.caseInsensitiveCompare(name) == .orderedSame
+        }), let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty {
+            startFollowModeForPerson(id: box.id, embedding: embedding,
+                                     boundingBox: box.boundingBox, worldPosition: box.worldPosition)
+        } else {
+            pendingFollow = .named(name)
+            showPendingFollowStatus("Looking for \(name)…")
+        }
+    }
+
+    /// Begin following the nearest currently visible person, or wait for anyone
+    /// to appear if no one is visible.
+    private func startFollowingNearest() {
+        guard personTracker.state == .idle else { return }
+        if let box = nearestVisiblePersonBox(),
+           let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty {
+            startFollowModeForPerson(id: box.id, embedding: embedding,
+                                     boundingBox: box.boundingBox, worldPosition: box.worldPosition)
+        } else {
+            pendingFollow = .any
+            showPendingFollowStatus("Waiting for someone to follow…")
+        }
+    }
+
+    /// The visible person closest to the camera (smallest world distance, falling
+    /// back to the largest bounding box when depth is unavailable).
+    private func nearestVisiblePersonBox() -> PersonBoxInfo? {
+        let people = alwaysOnPersonBoxes
+        guard !people.isEmpty else { return nil }
+        let withWorld = people.compactMap { box -> (PersonBoxInfo, Float)? in
+            guard let pos = box.worldPosition else { return nil }
+            return (box, pos.x * pos.x + pos.y * pos.y)
+        }
+        if let nearest = withWorld.min(by: { $0.1 < $1.1 }) {
+            return nearest.0
+        }
+        // No depth — pick the largest box (likely closest).
+        return people.max(by: {
+            ($0.boundingBox.width * $0.boundingBox.height) < ($1.boundingBox.width * $1.boundingBox.height)
+        })
+    }
+
+    /// Show the pending-follow status label and reveal the cancel button.
+    private func showPendingFollowStatus(_ text: String) {
+        voiceStatusLabel.text = text
+        voiceStatusLabel.textColor = .cyan
+        voiceStatusLabel.alpha = 1
+        followButton.isHidden = false
+        updateFollowButtonAppearance(isFollowing: true)
+    }
+
+    /// Checks any pending voice-follow request against the latest detections and
+    /// activates follow mode when the target appears. Called from the always-on
+    /// detection update on the main thread.
+    private func checkPendingFollow() {
+        guard let pending = pendingFollow, personTracker.state == .idle else { return }
+        let candidate: PersonBoxInfo?
+        switch pending {
+        case .named(let name):
+            candidate = alwaysOnPersonBoxes.first {
+                $0.name?.caseInsensitiveCompare(name) == .orderedSame
+            }
+        case .any:
+            candidate = nearestVisiblePersonBox()
+        }
+        guard let box = candidate,
+              let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty else { return }
+        pendingFollow = nil
+        startFollowModeForPerson(id: box.id, embedding: embedding,
+                                 boundingBox: box.boundingBox, worldPosition: box.worldPosition)
+    }
+
     
     /// Plan a path to the followed person's current position (with standoff).
     private func planFollowPath(toX: Float, toY: Float) {
@@ -975,8 +1121,12 @@ class LiDARViewController: UIViewController {
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerSetNavTarget(_:)), name: .serverSetNavTarget, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerStartNavigation), name: .serverStartNavigation, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerStopNavigation), name: .serverStopNavigation, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(handleStartFollowing), name: .startFollowing, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleStartFollowing(_:)), name: .startFollowing, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleStopFollowing), name: .stopFollowing, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleRemoteFollowPerson(_:)), name: .remoteFollowPerson, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleRemoteFollowPersonByName(_:)), name: .remoteFollowPersonByName, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleRemoteNamePerson(_:)), name: .remoteNamePerson, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(handleRemoteDeleteNamedPerson(_:)), name: .remoteDeleteNamedPerson, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerAddRoutePoint(_:)), name: .serverAddRoutePoint, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerRunRoute), name: .serverRunRoute, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(handleServerPauseRoute), name: .serverPauseRoute, object: nil)
@@ -1391,19 +1541,20 @@ class LiDARViewController: UIViewController {
     
     /// Update the navigate button state for route mode
     private func updateNavigateButtonForRouteState() {
+        let cfg = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
         if isRouteActive {
-            navigateButton.setTitle("Stop Route", for: .normal)
+            navigateButton.setImage(UIImage(systemName: "stop.fill", withConfiguration: cfg), for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
             navigateButton.isHidden = false
             clearWaypointsButton.isHidden = true
         } else if isRoutePaused {
-            navigateButton.setTitle("Resume Route", for: .normal)
+            navigateButton.setImage(UIImage(systemName: "play.fill", withConfiguration: cfg), for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.2, green: 0.7, blue: 1.0, alpha: 0.9)
             navigateButton.isHidden = false
             clearWaypointsButton.isHidden = false
         } else if !gridMapView.routeWaypoints.isEmpty {
-            navigateButton.setTitle("Run Route (\(gridMapView.routeWaypoints.count))", for: .normal)
-            navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+            navigateButton.setImage(UIImage(systemName: "play.fill", withConfiguration: cfg), for: .normal)
+            navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.75, blue: 0.3, alpha: 0.9)
             navigateButton.isHidden = false
             clearWaypointsButton.isHidden = false
         } else {
@@ -1515,6 +1666,7 @@ class LiDARViewController: UIViewController {
     }
     
     private func updateNavigateButtonForState(_ state: NavigationState) {
+        let cfg = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
         // If a route is active, use route-specific button states
         if isRouteActive || isRoutePaused || !gridMapView.routeWaypoints.isEmpty {
             updateNavigateButtonForRouteState()
@@ -1522,11 +1674,11 @@ class LiDARViewController: UIViewController {
             if isRouteActive {
                 switch state {
                 case .navigating:
-                    navigateButton.setTitle("Stop Route (\(currentRouteWaypointIndex + 1)/\(gridMapView.routeWaypoints.count))", for: .normal)
+                    navigateButton.setImage(UIImage(systemName: "stop.fill", withConfiguration: cfg), for: .normal)
                     navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
                     navigateButton.isHidden = false
                 case .paused:
-                    navigateButton.setTitle("Stop Route (paused)", for: .normal)
+                    navigateButton.setImage(UIImage(systemName: "stop.fill", withConfiguration: cfg), for: .normal)
                     navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.6, blue: 0.1, alpha: 0.9)
                     navigateButton.isHidden = false
                 default:
@@ -1539,22 +1691,22 @@ class LiDARViewController: UIViewController {
         switch state {
         case .idle:
             if gridMapView.pathTargetPoint != nil && !plannedPath.isEmpty {
-                navigateButton.setTitle("Navigate", for: .normal)
-                navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.6, blue: 1.0, alpha: 0.9)
+                navigateButton.setImage(UIImage(systemName: "play.fill", withConfiguration: cfg), for: .normal)
+                navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.75, blue: 0.3, alpha: 0.9)
                 navigateButton.isHidden = false
             } else {
                 navigateButton.isHidden = true
             }
         case .navigating:
-            navigateButton.setTitle("Stop", for: .normal)
+            navigateButton.setImage(UIImage(systemName: "stop.fill", withConfiguration: cfg), for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.2, blue: 0.2, alpha: 0.9)
             navigateButton.isHidden = false
         case .paused:
-            navigateButton.setTitle("Stop", for: .normal)
+            navigateButton.setImage(UIImage(systemName: "play.fill", withConfiguration: cfg), for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.9, green: 0.6, blue: 0.1, alpha: 0.9)
             navigateButton.isHidden = false
         case .arrived:
-            navigateButton.setTitle("Arrived ✓", for: .normal)
+            navigateButton.setImage(UIImage(systemName: "checkmark", withConfiguration: cfg), for: .normal)
             navigateButton.backgroundColor = UIColor(red: 0.1, green: 0.8, blue: 0.3, alpha: 0.9)
             navigateButton.isHidden = false
             // Auto-hide after a delay
@@ -2009,29 +2161,23 @@ class LiDARViewController: UIViewController {
                 let knownEmbeddings = self.knownPersonEmbeddings
                 let knownBoxes = self.knownPersonBoundingBoxes
                 let knownLastSeen = self.knownPersonLastSeen
+                let knownFirstSeen = self.knownPersonFirstSeen
                 let threshold = self.alwaysOnReidThreshold
                 let iouThreshold = self.alwaysOnIouThreshold
                 let memoryTimeout = self.alwaysOnPersonMemoryTimeout
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let request = VNDetectHumanRectanglesRequest()
                     request.revision = VNDetectHumanRectanglesRequestRevision2
-                    let handPoseRequest = VNDetectHumanHandPoseRequest()
-                    handPoseRequest.maximumHandCount = 6
                     let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
-                    try? handler.perform([request, handPoseRequest])
+                    try? handler.perform([request])
                     let observations = (request.results as? [VNHumanObservation]) ?? []
-                    let handResults = handPoseRequest.results ?? []
-                    
-                    // Extract hand joint data for overlay (before gesture classification)
-                    let handJoints: [HandJointData] = handResults.compactMap {
-                        HandJointOverlayView.extractJoints(from: $0)
-                    }
                     
                     // Generate embeddings and match against known people
                     var boxes: [PersonBoxInfo] = []
                     var updatedEmbeddings = knownEmbeddings
                     var updatedKnownBoxes = knownBoxes
                     var updatedLastSeen = knownLastSeen
+                    var updatedFirstSeen = knownFirstSeen
                     var matchedKnownIDs = Set<UUID>()
                     let now = Date()
                     let retainedIDs = Set(knownLastSeen.compactMap { id, lastSeen in
@@ -2042,43 +2188,45 @@ class LiDARViewController: UIViewController {
                         let bbox = obs.boundingBox
                         let embedding = tracker.generateEmbedding(pixelBuffer: pixelBuffer, boundingBox: obs.boundingBox)
                         
-                        // Prefer temporal overlap before ReID. Streaming can perturb crops enough
-                        // that adjacent-frame IoU is the more stable identity signal.
-                        var bestMatch: (id: UUID, sim: Float)?
-                        var bestIouMatch: (id: UUID, iou: CGFloat)?
+                        // Collect every known ID this observation could belong to —
+                        // via temporal overlap (IoU) and/or appearance (ReID). If more
+                        // than one known ID matches, they are duplicate identities for
+                        // the same person and get merged so the visible ID stays stable
+                        // instead of flip-flopping between an old and a new ID.
+                        var candidateIDs = Set<UUID>()
                         for (knownID, knownBox) in knownBoxes where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
                             let iou = self?.computeIoU(bbox, knownBox) ?? 0
-                            if iou > iouThreshold && (bestIouMatch == nil || iou > bestIouMatch!.iou) {
-                                bestIouMatch = (knownID, iou)
-                            }
+                            if iou > iouThreshold { candidateIDs.insert(knownID) }
                         }
-
                         if let embed = embedding {
                             for (knownID, knownEmbed) in knownEmbeddings where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
                                 let sim = tracker.cosineSimilarity(embed, knownEmbed)
-                                if sim > threshold && (bestMatch == nil || sim > bestMatch!.sim) {
-                                    bestMatch = (knownID, sim)
-                                }
+                                if sim > threshold { candidateIDs.insert(knownID) }
                             }
                         }
                         
                         let personID: UUID
-                        if let match = bestIouMatch {
-                            personID = match.id
-                            matchedKnownIDs.insert(match.id)
-                            if let embed = embedding {
-                                updatedEmbeddings[personID] = embed
+                        if !candidateIDs.isEmpty {
+                            // Canonical = the oldest matching identity (earliest first-seen).
+                            let canonical = candidateIDs.min { lhs, rhs in
+                                (updatedFirstSeen[lhs] ?? now) < (updatedFirstSeen[rhs] ?? now)
+                            }!
+                            personID = canonical
+                            // Merge away every other duplicate ID this person matched.
+                            for dup in candidateIDs where dup != canonical {
+                                updatedEmbeddings[dup] = nil
+                                updatedKnownBoxes[dup] = nil
+                                updatedLastSeen[dup] = nil
+                                updatedFirstSeen[dup] = nil
                             }
-                        } else if let match = bestMatch {
-                            personID = match.id
-                            matchedKnownIDs.insert(match.id)
-                            // Update embedding with latest
+                            matchedKnownIDs.formUnion(candidateIDs)
                             if let embed = embedding {
-                                updatedEmbeddings[personID] = embed
+                                updatedEmbeddings[personID] = Self.blendEmbedding(updatedEmbeddings[personID], embed)
                             }
                         } else {
                             // New person
                             personID = UUID()
+                            updatedFirstSeen[personID] = now
                             if let embed = embedding {
                                 updatedEmbeddings[personID] = embed
                             }
@@ -2086,58 +2234,17 @@ class LiDARViewController: UIViewController {
                         updatedKnownBoxes[personID] = bbox
                         updatedLastSeen[personID] = now
                         
+                        // Match this person against the saved named-people store.
+                        let savedName = embedding.flatMap { NamedPersonStore.shared.name(matching: $0) }
+                        
                         boxes.append(PersonBoxInfo(
                             id: personID,
                             boundingBox: bbox,
                             isActive: false,
-                            isGesturing: false,
                             label: String(personID.uuidString.prefix(4)),
-                            worldPosition: tracker.projectToWorld(boundingBox: bbox, frame: capturedFrame)
+                            worldPosition: tracker.projectToWorld(boundingBox: bbox, frame: capturedFrame),
+                            name: savedName
                         ))
-                    }
-                    
-                    // Detect gestures and match to people
-                    var peaceHands: [(wrist: CGPoint, hand: VNHumanHandPoseObservation)] = []
-                    var fistHands: [CGPoint] = []
-                    var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
-                    
-                    for hand in handResults {
-                        if let wrist = tracker.detectPeaceSign(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true }) {
-                            peaceHands.append((wrist, hand))
-                        } else if let wrist = tracker.detectClosedHand(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true }) {
-                            fistHands.append(wrist)
-                        }
-                        if let info = tracker.detectIndexPointer(hand: hand), boxes.contains(where: { box in self?.isRaisedHandPoint(info.wrist, inside: box.boundingBox) == true }) {
-                            pointerHands.append(info)
-                        }
-                    }
-                    
-                    // Mark peace-sign gesturing people (hand must be raised — upper 40% of bbox)
-                    var gesturedIDs = Set<UUID>()
-                    for (wrist, _) in peaceHands {
-                        for i in boxes.indices {
-                            guard self?.isRaisedHandPoint(wrist, inside: boxes[i].boundingBox) == true else { continue }
-                            gesturedIDs.insert(boxes[i].id)
-                            boxes[i] = PersonBoxInfo(
-                                id: boxes[i].id,
-                                boundingBox: boxes[i].boundingBox,
-                                isActive: false,
-                                isGesturing: true,
-                                label: boxes[i].label,
-                                worldPosition: boxes[i].worldPosition
-                            )
-                            break
-                        }
-                    }
-                    
-                    // Collect fist person IDs (hand must be raised — upper 40% of bbox)
-                    var fistIDs = Set<UUID>()
-                    for wrist in fistHands {
-                        for box in boxes {
-                            guard self?.isRaisedHandPoint(wrist, inside: box.boundingBox) == true else { continue }
-                            fistIDs.insert(box.id)
-                            break
-                        }
                     }
                     
                     // Prune embeddings for people not seen (keep for a few cycles via main thread)
@@ -2145,6 +2252,7 @@ class LiDARViewController: UIViewController {
                     updatedEmbeddings = updatedEmbeddings.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     updatedKnownBoxes = updatedKnownBoxes.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     updatedLastSeen = updatedLastSeen.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
+                    updatedFirstSeen = updatedFirstSeen.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     
                     DispatchQueue.main.async {
                         guard let self = self else { return }
@@ -2152,194 +2260,9 @@ class LiDARViewController: UIViewController {
                         self.knownPersonEmbeddings = updatedEmbeddings
                         self.knownPersonBoundingBoxes = updatedKnownBoxes
                         self.knownPersonLastSeen = updatedLastSeen
+                        self.knownPersonFirstSeen = updatedFirstSeen
                         self.personDetectionInFlight = false
-                        
-                        // Update hand joint overlay
-                        self.handJointOverlay.hands = handJoints
-                        self.handJointOverlay.setNeedsDisplay()
-                        
-                        let now = Date()
-                        let timeout = self.alwaysOnGestureTimeout
-                        
-                        // --- Activation gesture state machine: peace → fist → peace ---
-                        for personID in gesturedIDs {
-                            let phase = self.alwaysOnActivatePhase[personID] ?? .idle
-                            let phaseTime = self.alwaysOnActivateTimestamp[personID] ?? .distantPast
-                            let elapsed = now.timeIntervalSince(phaseTime)
-                            
-                            switch phase {
-                            case .idle:
-                                self.alwaysOnActivatePhase[personID] = .peaceOpen1
-                                self.alwaysOnActivateTimestamp[personID] = now
-                            case .peaceOpen1:
-                                break // still holding peace — wait for fist
-                            case .peaceClosed1:
-                                if elapsed < timeout {
-                                    // Second peace sign detected — activate!
-                                    self.alwaysOnActivatePhase.removeAll()
-                                    self.alwaysOnActivateTimestamp.removeAll()
-                                    if let embed = self.knownPersonEmbeddings[personID],
-                                       let box = boxes.first(where: { $0.id == personID }) {
-                                        self.startFollowModeForPerson(id: personID, embedding: embed, boundingBox: box.boundingBox, worldPosition: box.worldPosition)
-                                    }
-                                    return
-                                } else {
-                                    // Timeout — restart
-                                    self.alwaysOnActivatePhase[personID] = .peaceOpen1
-                                    self.alwaysOnActivateTimestamp[personID] = now
-                                }
-                            case .peaceOpen2:
-                                break
-                            }
-                        }
-                        
-                        // Transition peaceOpen1 → peaceClosed1 for fist detections
-                        for personID in fistIDs {
-                            let phase = self.alwaysOnActivatePhase[personID] ?? .idle
-                            let phaseTime = self.alwaysOnActivateTimestamp[personID] ?? .distantPast
-                            let elapsed = now.timeIntervalSince(phaseTime)
-                            
-                            if phase == .peaceOpen1 && elapsed < timeout {
-                                self.alwaysOnActivatePhase[personID] = .peaceClosed1
-                                self.alwaysOnActivateTimestamp[personID] = now
-                            }
-                        }
-                        
-                        // Prune stale activate phases
-                        for (pid, ts) in self.alwaysOnActivateTimestamp {
-                            if now.timeIntervalSince(ts) > timeout {
-                                self.alwaysOnActivatePhase.removeValue(forKey: pid)
-                                self.alwaysOnActivateTimestamp.removeValue(forKey: pid)
-                            }
-                        }
-                        
-                        // --- Cancel gesture state machine: finger wag (one full sweep) ---
-                        if let (_, tipX) = pointerHands.first {
-                            let elapsed = now.timeIntervalSince(self.alwaysOnCancelTimestamp)
-                            if elapsed > timeout {
-                                self.alwaysOnCancelPhase = .idle
-                                self.alwaysOnCancelLastWristX = nil
-                            }
-                            
-                            if let lastX = self.alwaysOnCancelLastWristX {
-                                let delta = tipX - lastX
-                                let minDelta = self.alwaysOnWagMinDelta
-                                
-                                switch self.alwaysOnCancelPhase {
-                                case .idle:
-                                    if abs(delta) > minDelta {
-                                        self.alwaysOnCancelPhase = delta > 0 ? .movedRight1 : .movedLeft1
-                                        self.alwaysOnCancelTimestamp = now
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedRight1:
-                                    if delta < -minDelta {
-                                        self.alwaysOnCancelPhase = .idle
-                                        self.alwaysOnCancelLastWristX = nil
-                                        self.stopFollowMode()
-                                    } else if delta > minDelta {
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedLeft1:
-                                    if delta > minDelta {
-                                        self.alwaysOnCancelPhase = .idle
-                                        self.alwaysOnCancelLastWristX = nil
-                                        self.stopFollowMode()
-                                    } else if delta < -minDelta {
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedRight2, .movedLeft2:
-                                    break
-                                }
-                            } else {
-                                self.alwaysOnCancelLastWristX = tipX
-                                self.alwaysOnCancelTimestamp = now
-                            }
-                        }
-                    }
-                }
-            }
-            // Cancel gesture detection during follow mode (~10-15 Hz, hand-only, lightweight)
-            if frameCount % 2 == 0 && personTracker.state != .idle {
-                let pixelBuffer = frame.capturedImage
-                let tracker = self.personTracker
-                let trackedPersonBox = self.personTracker.trackedBoundingBox
-                DispatchQueue.global(qos: .userInitiated).async { [weak self] in
-                    let handPoseRequest = VNDetectHumanHandPoseRequest()
-                    handPoseRequest.maximumHandCount = 2
-                    let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
-                    try? handler.perform([handPoseRequest])
-                    let handResults = handPoseRequest.results ?? []
-                    
-                    // Extract hand joint data for overlay
-                    let handJoints: [HandJointData] = handResults.compactMap {
-                        HandJointOverlayView.extractJoints(from: $0)
-                    }
-                    
-                    var pointerHands: [(wrist: CGPoint, wristX: CGFloat)] = []
-                    for hand in handResults {
-                        if let info = tracker.detectIndexPointer(hand: hand),
-                           let trackedPersonBox,
-                           self?.isRaisedHandPoint(info.wrist, inside: trackedPersonBox) == true {
-                            pointerHands.append(info)
-                        }
-                    }
-                    
-                    guard !pointerHands.isEmpty || !handJoints.isEmpty else { return }
-                    
-                    DispatchQueue.main.async {
-                        guard let self = self else { return }
-                        
-                        // Update hand joint overlay during follow mode
-                        self.handJointOverlay.hands = handJoints
-                        self.handJointOverlay.setNeedsDisplay()
-                        
-                        guard !pointerHands.isEmpty else { return }
-                        let now = Date()
-                        let timeout = self.alwaysOnGestureTimeout
-                        
-                        if let (_, tipX) = pointerHands.first {
-                            let elapsed = now.timeIntervalSince(self.alwaysOnCancelTimestamp)
-                            if elapsed > timeout {
-                                self.alwaysOnCancelPhase = .idle
-                                self.alwaysOnCancelLastWristX = nil
-                            }
-                            
-                            if let lastX = self.alwaysOnCancelLastWristX {
-                                let delta = tipX - lastX
-                                let minDelta = self.alwaysOnWagMinDelta
-                                
-                                switch self.alwaysOnCancelPhase {
-                                case .idle:
-                                    if abs(delta) > minDelta {
-                                        self.alwaysOnCancelPhase = delta > 0 ? .movedRight1 : .movedLeft1
-                                        self.alwaysOnCancelTimestamp = now
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedRight1:
-                                    if delta < -minDelta {
-                                        self.alwaysOnCancelPhase = .idle
-                                        self.alwaysOnCancelLastWristX = nil
-                                        self.stopFollowMode()
-                                    } else if delta > minDelta {
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedLeft1:
-                                    if delta > minDelta {
-                                        self.alwaysOnCancelPhase = .idle
-                                        self.alwaysOnCancelLastWristX = nil
-                                        self.stopFollowMode()
-                                    } else if delta < -minDelta {
-                                        self.alwaysOnCancelLastWristX = tipX
-                                    }
-                                case .movedRight2, .movedLeft2:
-                                    break
-                                }
-                            } else {
-                                self.alwaysOnCancelLastWristX = tipX
-                                self.alwaysOnCancelTimestamp = now
-                            }
-                        }
+                        self.checkPendingFollow()
                     }
                 }
             }
@@ -2365,7 +2288,11 @@ class LiDARViewController: UIViewController {
             // Extract mesh anchor geometry for telemetry at ~1 Hz
             if frameCount % 30 == 0 {
                 let gen = meshProcessor.currentGeneration()
-                meshAnchorSnapshots = meshAnchors.compactMap { MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen) }
+                meshAnchorSnapshots = meshAnchors.compactMap {
+                    MeshProcessor.extractAnchorSnapshot(from: $0, generation: gen, frame: frame)
+                }.map {
+                    preserveMeshVertexColors(for: $0)
+                }
             }
             streamRemoteCameraFrameIfNeeded()
             // frame is released here when autoreleasepool drains
@@ -2405,7 +2332,6 @@ class LiDARViewController: UIViewController {
                         id: p.id,
                         boundingBox: p.boundingBox,
                         isActive: p.id == activeID,
-                        isGesturing: p.isGesturing,
                         label: String(p.id.uuidString.prefix(4)),
                         worldPosition: p.worldPosition
                     )
@@ -2419,7 +2345,6 @@ class LiDARViewController: UIViewController {
                         id: activeID,
                         boundingBox: trackedBox,
                         isActive: true,
-                        isGesturing: false,
                         label: String(activeID.uuidString.prefix(4)),
                         worldPosition: personTracker.trackedWorldPosition
                     ))
@@ -2440,11 +2365,11 @@ class LiDARViewController: UIViewController {
             } else if !personBoundingBoxOverlay.people.isEmpty {
                 personBoundingBoxOverlay.people = []
                 personBoundingBoxOverlay.setNeedsDisplay()
-                handJointOverlay.hands = []
-                handJointOverlay.setNeedsDisplay()
                 gridMapView.personPositions = []
                 gridMapView.setNeedsDisplay()
             }
+            // Broadcast detected people to the remote controller for tappable outlines.
+            broadcastPersonBoxesToController()
         }
         
         // Update labels every 3 frames (~10Hz at 30fps)
@@ -2467,7 +2392,8 @@ class LiDARViewController: UIViewController {
                 plannedPath: plannedPath,
                 routePreviewPaths: gridMapView.routePreviewPaths,
                 activeRouteWaypointIndex: gridMapView.activeRouteWaypointIndex,
-                navState: remoteNavigationState
+                navState: remoteNavigationState,
+                compassBearingDeg: gridMapView.compassBearingDegrees >= 0 ? gridMapView.compassBearingDegrees : nil
             )
             if frameCount % 6 == 0 {
                 RemoteControlHostService.shared.broadcastGridUpdate(occupancyGrid: occupancyGrid)
@@ -2578,11 +2504,24 @@ class LiDARViewController: UIViewController {
         return intersectionArea / unionArea
     }
 
-    private func isRaisedHandPoint(_ point: CGPoint, inside personBox: CGRect) -> Bool {
-        let expandedBox = personBox.insetBy(dx: -0.08, dy: -0.04)
-        guard expandedBox.contains(point) else { return false }
-        let upperBodyThreshold = personBox.origin.y + personBox.height * 0.45
-        return point.y >= upperBodyThreshold
+    /// Exponential moving average of a person's reference embedding, kept
+    /// L2-normalised. Smoothing makes the stored identity robust to noisy single
+    /// frames so the same person keeps a stable ID. `previous` may be nil (first
+    /// observation), in which case the new embedding is returned as-is.
+    private static func blendEmbedding(_ previous: [Float]?, _ new: [Float], weight: Float = 0.8) -> [Float] {
+        guard let previous, previous.count == new.count else { return new }
+        var blended = [Float](repeating: 0, count: new.count)
+        var norm: Float = 0
+        for i in 0..<new.count {
+            let v = previous[i] * weight + new[i] * (1 - weight)
+            blended[i] = v
+            norm += v * v
+        }
+        norm = norm.squareRoot()
+        if norm > 1e-6 {
+            for i in 0..<blended.count { blended[i] /= norm }
+        }
+        return blended
     }
 
     private var remoteNavigationState: String {
@@ -2630,7 +2569,10 @@ class LiDARViewController: UIViewController {
         let targetHeight = max(2, Int((pixelHeight * scale).rounded(.down))) & ~1
         let targetSize = CGSize(width: targetWidth, height: targetHeight)
         let overlayBounds = arView.bounds
-        let overlays: [UIView] = [obstaclePointOverlay, personBoundingBoxOverlay, handJointOverlay]
+        // Person boxes are drawn by the controller itself from `personBoxes`
+        // messages, so exclude `personBoundingBoxOverlay` here to avoid duplicate
+        // outlines in the remote stream.
+        let overlays: [UIView] = [obstaclePointOverlay]
 
         let format = UIGraphicsImageRendererFormat.default()
         format.scale = 1
@@ -2651,7 +2593,27 @@ class LiDARViewController: UIViewController {
         }
     }
     
+    private func preserveMeshVertexColors(for snapshot: MeshAnchorSnapshot) -> MeshAnchorSnapshot {
+        // Key without vertexCount so the cache survives mesh refinements that add vertices
+        let cacheKey = "\(snapshot.generation):\(snapshot.anchorId)"
+        if let vertexColors = snapshot.vertexColorsB64 {
+            meshAnchorVertexColorCache[cacheKey] = vertexColors
+            return snapshot
+        }
 
+        guard let cachedVertexColors = meshAnchorVertexColorCache[cacheKey] else { return snapshot }
+        return MeshAnchorSnapshot(
+            anchorId: snapshot.anchorId,
+            transform: snapshot.transform,
+            verticesB64: snapshot.verticesB64,
+            vertexCount: snapshot.vertexCount,
+            indicesB64: snapshot.indicesB64,
+            triangleCount: snapshot.triangleCount,
+            classificationsB64: snapshot.classificationsB64,
+            vertexColorsB64: cachedVertexColors,
+            generation: snapshot.generation
+        )
+    }
 }
 
 // MARK: - ARSessionDelegate
@@ -2744,6 +2706,25 @@ extension LiDARViewController: ARSessionDelegate {
         DispatchQueue.main.async { [weak self] in
             self?.statusLabel.text = "❌ Error: \(error.localizedDescription)"
             self?.statusLabel.textColor = .red
+        }
+    }
+}
+
+// MARK: - CLLocationManagerDelegate
+
+extension LiDARViewController: CLLocationManagerDelegate {
+    func locationManager(_ manager: CLLocationManager, didUpdateHeading newHeading: CLHeading) {
+        // Use true heading when available (requires location fix for declination), otherwise magnetic.
+        let bearing = newHeading.trueHeading >= 0 ? newHeading.trueHeading : newHeading.magneticHeading
+        DispatchQueue.main.async { [weak self] in
+            self?.gridMapView.compassBearingDegrees = bearing
+        }
+    }
+
+    func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
+        let status = manager.authorizationStatus
+        if (status == .authorizedWhenInUse || status == .authorizedAlways) && CLLocationManager.headingAvailable() {
+            manager.startUpdatingHeading()
         }
     }
 }

@@ -19,12 +19,12 @@ struct PersonBoxInfo {
     let boundingBox: CGRect
     /// `true` when this person is the actively tracked target.
     let isActive: Bool
-    /// `true` when this person is showing the activation gesture.
-    let isGesturing: Bool
     /// Short display label, e.g. first 4 chars of the UUID.
     let label: String
     /// World position in occupancy-grid convention (ARKit X, ARKit Z). Nil if depth unavailable.
     let worldPosition: simd_float2?
+    /// Saved name for this person if their embedding matches a stored entry.
+    var name: String? = nil
 }
 
 /// A transparent `UIView` that draws coloured bounding boxes around detected
@@ -36,6 +36,23 @@ class PersonBoundingBoxOverlay: UIView {
 
     /// Set this every time detected people change, then call `setNeedsDisplay()`.
     var people: [PersonBoxInfo] = []
+
+    /// Called when the body of a person's box is tapped — start following them.
+    var onTapBody: ((UUID) -> Void)?
+    /// Called when a person's name/ID label is tapped — prompt to name/rename.
+    var onTapName: ((UUID) -> Void)?
+    /// Called when the "✕" next to a saved name is tapped — delete the saved person.
+    var onTapDelete: ((UUID) -> Void)?
+
+    /// Cached hit targets computed during the last `draw(_:)` pass, in screen
+    /// coordinates, used for tap routing.
+    private struct HitTarget {
+        let id: UUID
+        let bodyRect: CGRect
+        let labelRect: CGRect
+        let deleteRect: CGRect?
+    }
+    private var hitTargets: [HitTarget] = []
 
     // MARK: - Colour palette
 
@@ -67,15 +84,52 @@ class PersonBoundingBoxOverlay: UIView {
     override init(frame: CGRect) {
         super.init(frame: frame)
         isOpaque = false
-        isUserInteractionEnabled = false
+        isUserInteractionEnabled = true
         backgroundColor = .clear
     }
 
     required init?(coder: NSCoder) { fatalError() }
 
+    // MARK: - Hit testing
+
+    /// Only intercept touches that land on a known box/label/delete target so
+    /// that taps elsewhere fall through to the AR view and other controls.
+    override func hitTest(_ point: CGPoint, with event: UIEvent?) -> UIView? {
+        for target in hitTargets {
+            if target.deleteRect?.contains(point) == true { return self }
+            if target.labelRect.contains(point) { return self }
+            if target.bodyRect.contains(point) { return self }
+        }
+        return nil
+    }
+
+    override func touchesEnded(_ touches: Set<UITouch>, with event: UIEvent?) {
+        guard let point = touches.first?.location(in: self) else { return }
+        // Delete badge takes priority, then label (rename), then body (follow).
+        for target in hitTargets {
+            if let del = target.deleteRect, del.contains(point) {
+                onTapDelete?(target.id)
+                return
+            }
+        }
+        for target in hitTargets {
+            if target.labelRect.contains(point) {
+                onTapName?(target.id)
+                return
+            }
+        }
+        for target in hitTargets {
+            if target.bodyRect.contains(point) {
+                onTapBody?(target.id)
+                return
+            }
+        }
+    }
+
     // MARK: - Drawing
 
     override func draw(_ rect: CGRect) {
+        hitTargets.removeAll(keepingCapacity: true)
         guard let ctx = UIGraphicsGetCurrentContext(), !people.isEmpty else { return }
 
         let viewWidth  = bounds.width
@@ -105,14 +159,10 @@ class PersonBoundingBoxOverlay: UIView {
             ctx.setLineWidth(lineWidth)
             ctx.stroke(screenRect)
 
-            // Semi-transparent fill when gesturing
-            if person.isGesturing {
-                ctx.setFillColor(baseColor.withAlphaComponent(0.15).cgColor)
-                ctx.fill(screenRect)
-            }
-
-            // Label background + text
-            let labelText = person.label as NSString
+            // Label background + text — show the saved name if present, else the
+            // short UUID label.
+            let isNamed = (person.name != nil)
+            let labelText = (person.name ?? person.label) as NSString
             let fontSize: CGFloat = 12
             let font = UIFont.systemFont(ofSize: fontSize, weight: .semibold)
             let attrs: [NSAttributedString.Key: Any] = [
@@ -134,6 +184,29 @@ class PersonBoundingBoxOverlay: UIView {
             let textOrigin = CGPoint(x: labelBG.minX + padding, y: labelBG.minY + padding)
             labelText.draw(at: textOrigin, withAttributes: attrs)
 
+            // Delete badge ("✕") next to the name, only for saved people.
+            var deleteRect: CGRect?
+            if isNamed {
+                let xText = "✕" as NSString
+                let xFont = UIFont.systemFont(ofSize: fontSize, weight: .bold)
+                let xAttrs: [NSAttributedString.Key: Any] = [
+                    .font: xFont,
+                    .foregroundColor: UIColor.white,
+                ]
+                let xSize = xText.size(withAttributes: xAttrs)
+                let xBG = CGRect(
+                    x: labelBG.maxX + 4,
+                    y: labelBG.minY,
+                    width: xSize.width + padding * 2,
+                    height: labelBG.height
+                )
+                ctx.setFillColor(UIColor.systemRed.withAlphaComponent(0.9).cgColor)
+                ctx.fill(xBG)
+                xText.draw(at: CGPoint(x: xBG.minX + padding, y: xBG.minY + padding),
+                           withAttributes: xAttrs)
+                deleteRect = xBG.insetBy(dx: -6, dy: -6)
+            }
+
             // Active indicator — draw a small "FOLLOWING" badge below the label
             if person.isActive {
                 let badge = "FOLLOWING" as NSString
@@ -154,6 +227,15 @@ class PersonBoundingBoxOverlay: UIView {
                 badge.draw(at: CGPoint(x: badgeBG.minX + padding, y: badgeBG.minY + padding / 2),
                            withAttributes: badgeAttrs)
             }
+
+            // Record hit targets (slightly expanded for easier tapping).
+            hitTargets.append(HitTarget(
+                id: person.id,
+                bodyRect: screenRect,
+                labelRect: labelBG.insetBy(dx: -6, dy: -6),
+                deleteRect: deleteRect
+            ))
         }
     }
 }
+

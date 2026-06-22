@@ -215,32 +215,39 @@ struct CalibrateMotorsTool: Tool {
     }
 }
 
-/// Tool that starts scanning for people and follows whoever raises an open hand
+/// Tool that starts following a person — either a specific saved person by name,
+/// or the nearest visible person when no name is given.
 struct FollowPersonTool: Tool {
     let name = "followPerson"
-    let description = "Start scanning for people to follow. The car will detect all visible people using the camera and assign each a stable ID. To select which person to follow, that person should raise an open hand (palm facing the camera) for about one second. Once activated, the car will continuously drive to stay behind them at a safe distance. Say 'follow me' or 'follow that person' to trigger this."
+    let description = "Follow a person with the camera. If the user names a specific person (e.g. 'follow Alex'), pass that name and the car will follow that saved person — following immediately if they're visible, or watching for them to appear if they're not. If no name is given (e.g. 'follow me' or 'follow that person'), the car follows the nearest visible person. Once locked on, the car continuously drives to stay behind them at a safe distance."
     
     @Generable
-    struct Arguments {}
+    struct Arguments {
+        @Guide(description: "Optional name of the specific saved person to follow. Omit to follow the nearest visible person.")
+        var personName: String?
+    }
     
     func call(arguments: Arguments) async throws -> String {
+        let requestedName = arguments.personName?.trimmingCharacters(in: .whitespacesAndNewlines)
         await MainActor.run {
-            NotificationCenter.default.post(name: .startFollowing, object: nil)
+            var userInfo: [AnyHashable: Any] = [:]
+            if let requestedName, !requestedName.isEmpty {
+                userInfo["name"] = requestedName
+            }
+            NotificationCenter.default.post(name: .startFollowing, object: nil, userInfo: userInfo)
         }
-        // Brief delay for initial detection
+        // Brief delay for initial detection / activation
         try await Task.sleep(for: .seconds(0.5))
         let state = await MainActor.run { PersonTracker.shared.state }
-        let count = await MainActor.run { PersonTracker.shared.detectedPeople.count }
         if state == .tracking {
-            return "I can see you! Following you now. I'll stay about a meter behind you."
-        } else if state == .scanning {
-            if count > 0 {
-                return "I can see \(count) \(count == 1 ? "person" : "people"). Raise an open hand toward me so I know who to follow!"
-            } else {
-                return "I'm scanning for people now. Step into view of the camera and raise an open hand to start following."
+            if let requestedName, !requestedName.isEmpty {
+                return "Found \(requestedName)! Following them now."
             }
+            return "Got it — following the nearest person now. I'll stay about a meter behind."
+        } else if let requestedName, !requestedName.isEmpty {
+            return "I don't see \(requestedName) yet. I'll keep watching and start following the moment they appear."
         } else {
-            return "I couldn't start scanning. Make sure you're visible to the camera and try again."
+            return "I don't see anyone yet. I'll start following as soon as someone steps into view."
         }
     }
 }
@@ -279,6 +286,8 @@ class FoundationModelService {
     When the user asks to map the room or explore the area, use the exploreArea tool. \
     When the user asks to calibrate, test the motors, or measure speed, use the calibrateMotors tool. \
     When the user asks to follow them or follow a person, use the followPerson tool. \
+    If they name a specific person (e.g. "follow Alex"), pass that name to the tool; \
+    otherwise it follows the nearest visible person. \
     When the user asks to stop following, use the stopFollowing tool. \
     Keep your spoken responses very brief and conversational — you are being read aloud. \
     If the user asks something unrelated to the car, answer briefly. \
