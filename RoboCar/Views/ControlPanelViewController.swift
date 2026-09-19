@@ -8,7 +8,10 @@
 import UIKit
 
 /// Bottom sheet that shows ESP32 BLE connection status and a joystick for manual driving
-class ControlPanelViewController: UIViewController {
+class ControlPanelViewController: PanelViewController {
+    var onResetMap: (() -> Void)?
+    var onPairDevices: (() -> Void)?
+    private var remoteConnectionRow: RemoteConnectionStatusView!
     
     // MARK: - Views
     
@@ -30,37 +33,18 @@ class ControlPanelViewController: UIViewController {
     private let servoStatusLabel = UILabel()
     private let servoSettingsButton = UIButton(type: .custom)
     private let servoStack = UIStackView()
-    private let servoListStack = UIStackView()
+    private let servoListView = ServoControlListView()
     private let servoScanFromField = UITextField()
     private let servoScanToField = UITextField()
     private let rescanServosButton = UIButton(type: .custom)
-    private let servoIDField = UITextField()
-    private let servoNewIDField = UITextField()
-    private let changeServoIDButton = UIButton(type: .custom)
-    private let servoPositionLabel = UILabel()
-    private let servoPositionSlider = UISlider()
     private let servoSpeedField = UITextField()
-    private let refreshServoStateButton = UIButton(type: .custom)
-    private let moveServoButton = UIButton(type: .custom)
     private let moveAllServosButton = UIButton(type: .custom)
-    private let servoTorqueOnButton = UIButton(type: .custom)
-    private let servoTorqueOffButton = UIButton(type: .custom)
     private let servoAllTorqueOnButton = UIButton(type: .custom)
     private let servoAllTorqueOffButton = UIButton(type: .custom)
     private var servoControlViews: [UIView] = []
     private var scannedServoIDs: [UInt8] = []
-    private var servoNewIDFieldsByID: [UInt8: UITextField] = [:]
-    private var servoWheelSpeedFieldsByID: [UInt8: UITextField] = [:]
-    private var servoPositionSlidersByID: [UInt8: UISlider] = [:]
-    private var servoPositionLabelsByID: [UInt8: UILabel] = [:]
-    private var servoStateLabelsByID: [UInt8: UILabel] = [:]
-    private var servoStatesByID: [UInt8: ServoState] = [:]
-    private var servoTargetPositionsByID: [UInt8: UInt16] = [:]
-    private var servoTorqueOffIDs = Set<UInt8>()
-    private var servoWheelMovingIDs = Set<UInt8>()
     private var servoPopupConstraints: [NSLayoutConstraint] = []
     private weak var servoSettingsViewController: UIViewController?
-    private let servoSettledTolerance = 12
     
     // WiFi config views
     private let wifiLabel = UILabel()
@@ -114,6 +98,7 @@ class ControlPanelViewController: UIViewController {
         setupJoystick()
         setupWiFiConfig()
         setupTelemetryConfig()
+        setupResetMapButton()
         
         // Dismiss keyboard on tap outside text fields
         let tap = UITapGestureRecognizer(target: self, action: #selector(dismissKeyboard))
@@ -133,6 +118,11 @@ class ControlPanelViewController: UIViewController {
         // Adjust scroll view insets when keyboard appears/disappears
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillShow(_:)), name: UIResponder.keyboardWillShowNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(keyboardWillHide(_:)), name: UIResponder.keyboardWillHideNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
+    }
+
+    @objc private func appDidEnterBackground() {
+        servoListView.stopAllJogs()
     }
     
     override func viewDidLayoutSubviews() {
@@ -151,6 +141,15 @@ class ControlPanelViewController: UIViewController {
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         stopKeyboardDriveIfNeeded()
+        #if !targetEnvironment(macCatalyst)
+        servoListView.stopAllJogs()
+        #endif
+    }
+
+    override func panelResignedKey() {
+        super.panelResignedKey()
+        stopKeyboardDriveIfNeeded()
+        ble.stopAll()
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -183,13 +182,19 @@ class ControlPanelViewController: UIViewController {
         scrollView.keyboardDismissMode = .interactive
         scrollView.delaysContentTouches = false
         scrollView.canCancelContentTouches = false
+        #if targetEnvironment(macCatalyst)
+        scrollView.contentInsetAdjustmentBehavior = .never
+        let scrollTopAnchor = view.safeAreaLayoutGuide.topAnchor
+        #else
+        let scrollTopAnchor = view.topAnchor
+        #endif
         view.addSubview(scrollView)
         
         contentView.translatesAutoresizingMaskIntoConstraints = false
         scrollView.addSubview(contentView)
         
         NSLayoutConstraint.activate([
-            scrollView.topAnchor.constraint(equalTo: view.topAnchor),
+            scrollView.topAnchor.constraint(equalTo: scrollTopAnchor),
             scrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor),
@@ -253,8 +258,7 @@ class ControlPanelViewController: UIViewController {
     }
 
     @objc private func dismissPanelTapped() {
-        view.endEditing(true)
-        dismiss(animated: true)
+        PanelPresentation.close(self)
     }
 
     private func configureGlassButton(_ button: UIButton, title: String, systemImageName: String) {
@@ -304,6 +308,15 @@ class ControlPanelViewController: UIViewController {
     }
     
     private func setupConnectionRow() {
+        remoteConnectionRow = RemoteConnectionStatusView { [weak self] _ in self?.onPairDevices?() }
+        remoteConnectionRow.translatesAutoresizingMaskIntoConstraints = false
+        contentView.addSubview(remoteConnectionRow)
+        NSLayoutConstraint.activate([
+            remoteConnectionRow.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 12),
+            remoteConnectionRow.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 12),
+            remoteConnectionRow.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -12),
+            remoteConnectionRow.heightAnchor.constraint(equalToConstant: 48)
+        ])
         // Status dot
         statusDot.translatesAutoresizingMaskIntoConstraints = false
         statusDot.backgroundColor = .red
@@ -330,7 +343,7 @@ class ControlPanelViewController: UIViewController {
             statusLabel.leadingAnchor.constraint(equalTo: statusDot.trailingAnchor, constant: 8),
             statusLabel.centerYAnchor.constraint(equalTo: connectButton.centerYAnchor),
             
-            connectButton.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 16),
+            connectButton.topAnchor.constraint(equalTo: remoteConnectionRow.bottomAnchor, constant: 16),
             connectButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20)
         ])
     }
@@ -403,8 +416,6 @@ class ControlPanelViewController: UIViewController {
     
     private static let cachedBatteryPercentKey = "cachedBatteryPercent"
     private static let cachedBatteryVoltageKey = "cachedBatteryVoltage"
-    private static let cachedServoIDKey = "cachedServoID"
-    private static let cachedServoNewIDKey = "cachedServoNewID"
     private static let cachedServoPositionKey = "cachedServoPosition"
     private static let cachedServoSpeedKey = "cachedServoSpeed"
     
@@ -533,26 +544,9 @@ class ControlPanelViewController: UIViewController {
         servoStack.axis = .vertical
         servoStack.spacing = 10
 
-        servoListStack.translatesAutoresizingMaskIntoConstraints = false
-        servoListStack.axis = .vertical
-        servoListStack.spacing = 10
-
         configureServoTextField(servoScanFromField, placeholder: "From", text: "1")
         configureServoTextField(servoScanToField, placeholder: "To", text: "20")
         configureServoButton(rescanServosButton, title: "Scan", color: UIColor(red: 0.2, green: 0.5, blue: 1.0, alpha: 1), action: #selector(rescanServosTapped))
-
-        let cachedPosition = UserDefaults.standard.object(forKey: Self.cachedServoPositionKey) as? Int ?? 2048
-        servoPositionLabel.text = "Position \(min(4095, max(0, cachedPosition)))"
-        servoPositionLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
-        servoPositionLabel.textColor = UIColor.white.withAlphaComponent(0.7)
-
-        servoPositionSlider.minimumValue = 0
-        servoPositionSlider.maximumValue = 4095
-        servoPositionSlider.value = Float(min(4095, max(0, cachedPosition)))
-        servoPositionSlider.isContinuous = false
-        servoPositionSlider.minimumTrackTintColor = UIColor(red: 0.2, green: 0.6, blue: 1.0, alpha: 1)
-        servoPositionSlider.maximumTrackTintColor = UIColor(white: 0.35, alpha: 1)
-        servoPositionSlider.addTarget(self, action: #selector(servoPositionChanged), for: .valueChanged)
 
         let cachedSpeed = UserDefaults.standard.object(forKey: Self.cachedServoSpeedKey) as? Int ?? 1000
         configureServoTextField(servoSpeedField, placeholder: "Speed", text: "\(cachedSpeed)")
@@ -560,11 +554,18 @@ class ControlPanelViewController: UIViewController {
         configureServoButton(servoAllTorqueOnButton, title: "All On", color: UIColor(red: 0.2, green: 0.55, blue: 0.35, alpha: 1), action: #selector(enableAllServoTorqueTapped))
         configureServoButton(servoAllTorqueOffButton, title: "All Off", color: UIColor(red: 0.65, green: 0.2, blue: 0.2, alpha: 1), action: #selector(disableAllServoTorqueTapped))
 
+        servoListView.commander = ble
+        servoListView.onStatus = { [weak self] text, isError in
+            self?.setServoStatus(text, isError: isError)
+        }
+        servoListView.presentConfirmation = { [weak self] title, message, action in
+            self?.confirmServoAction(title: title, message: message, confirmTitle: "Confirm", action: action)
+        }
+
         servoStack.addArrangedSubview(makeServoRow([servoScanFromField, servoScanToField, rescanServosButton]))
         servoStack.addArrangedSubview(makeServoRow([servoSpeedField, moveAllServosButton]))
         servoStack.addArrangedSubview(makeServoRow([servoAllTorqueOnButton, servoAllTorqueOffButton]))
-        servoStack.addArrangedSubview(servoListStack)
-        rebuildServoRows()
+        servoStack.addArrangedSubview(servoListView)
 
         servoControlViews = [
             servoScanFromField, servoScanToField, rescanServosButton,
@@ -590,6 +591,15 @@ class ControlPanelViewController: UIViewController {
         }
         ble.onServoStateUpdated = { [weak self] state in
             DispatchQueue.main.async { self?.updateServoState(state) }
+        }
+        ble.onServoPositionsUpdated = { [weak self] positions in
+            DispatchQueue.main.async { self?.servoListView.apply(positions: positions) }
+        }
+        ble.onServoAxisStatusUpdated = { [weak self] status in
+            DispatchQueue.main.async { self?.servoListView.apply(axisStatus: status) }
+        }
+        if ble.connectionState == .connected {
+            updateServoList(ble.latestServoIDs)
         }
     }
 
@@ -643,9 +653,8 @@ class ControlPanelViewController: UIViewController {
     }
 
     private func servoPosition() -> UInt16 {
-        let position = Int(servoPositionSlider.value.rounded())
-        UserDefaults.standard.set(position, forKey: Self.cachedServoPositionKey)
-        return UInt16(position)
+        let position = UserDefaults.standard.object(forKey: Self.cachedServoPositionKey) as? Int ?? 2048
+        return UInt16(min(4095, max(0, position)))
     }
 
     private func servoSpeed() -> UInt16? {
@@ -659,190 +668,16 @@ class ControlPanelViewController: UIViewController {
         servoStatusLabel.textColor = isError ? UIColor(red: 1.0, green: 0.35, blue: 0.35, alpha: 1) : UIColor.cyan.withAlphaComponent(0.8)
     }
 
-    private func rebuildServoRows() {
-        servoListStack.arrangedSubviews.forEach { view in
-            servoListStack.removeArrangedSubview(view)
-            view.removeFromSuperview()
-        }
-        servoNewIDFieldsByID.removeAll()
-        servoWheelSpeedFieldsByID.removeAll()
-        servoPositionSlidersByID.removeAll()
-        servoPositionLabelsByID.removeAll()
-        servoStateLabelsByID.removeAll()
-
-        guard !scannedServoIDs.isEmpty else {
-            let emptyLabel = UILabel()
-            emptyLabel.text = "No servos scanned"
-            emptyLabel.font = .systemFont(ofSize: 13, weight: .medium)
-            emptyLabel.textColor = UIColor.white.withAlphaComponent(0.45)
-            emptyLabel.textAlignment = .center
-            emptyLabel.backgroundColor = UIColor(white: 0.17, alpha: 1)
-            emptyLabel.layer.cornerRadius = 8
-            emptyLabel.layer.masksToBounds = true
-            emptyLabel.heightAnchor.constraint(equalToConstant: 52).isActive = true
-            servoListStack.addArrangedSubview(emptyLabel)
-            return
-        }
-        scannedServoIDs.forEach { id in
-            servoListStack.addArrangedSubview(makeServoControlCard(id: id))
-        }
-        updateServoRowsEnabled(ble.connectionState == .connected)
-    }
-
-    private func makeServoControlCard(id: UInt8) -> UIView {
-        let card = UIView()
-        card.backgroundColor = UIColor(white: 0.16, alpha: 1)
-        card.layer.cornerRadius = 10
-        card.layer.borderWidth = 1
-        card.layer.borderColor = UIColor.white.withAlphaComponent(0.08).cgColor
-
-        let stack = UIStackView()
-        stack.translatesAutoresizingMaskIntoConstraints = false
-        stack.axis = .vertical
-        stack.spacing = 8
-        card.addSubview(stack)
-
-        let titleLabel = UILabel()
-        titleLabel.text = "Servo \(id)"
-        titleLabel.font = .systemFont(ofSize: 16, weight: .semibold)
-        titleLabel.textColor = .white
-
-        let stateLabel = UILabel()
-        stateLabel.text = servoStateText(for: id)
-        stateLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
-        stateLabel.textColor = UIColor.white.withAlphaComponent(0.55)
-        stateLabel.numberOfLines = 2
-        servoStateLabelsByID[id] = stateLabel
-
-        let positionLabel = UILabel()
-        let position = Int(servoStatesByID[id]?.position ?? servoPosition())
-        positionLabel.text = "Position \(position)"
-        positionLabel.font = .monospacedSystemFont(ofSize: 13, weight: .semibold)
-        positionLabel.textColor = UIColor.cyan.withAlphaComponent(0.85)
-        servoPositionLabelsByID[id] = positionLabel
-
-        let positionSlider = UISlider()
-        positionSlider.minimumValue = 0
-        positionSlider.maximumValue = 4095
-        positionSlider.value = Float(position)
-        positionSlider.isContinuous = false
-        positionSlider.minimumTrackTintColor = UIColor(red: 0.2, green: 0.6, blue: 1.0, alpha: 1)
-        positionSlider.maximumTrackTintColor = UIColor(white: 0.35, alpha: 1)
-        positionSlider.tag = Int(id)
-        positionSlider.addTarget(self, action: #selector(scannedServoPositionChanged(_:)), for: .valueChanged)
-        servoPositionSlidersByID[id] = positionSlider
-
-        let readButton = makeServoActionButton(title: "Read", color: UIColor(white: 0.30, alpha: 1), action: #selector(readScannedServoTapped(_:)), id: id)
-        let moveButton = makeServoActionButton(title: "Move", color: UIColor(red: 0.18, green: 0.43, blue: 0.86, alpha: 1), action: #selector(moveScannedServoTapped(_:)), id: id)
-        let stopButton = makeServoActionButton(title: "Stop", color: UIColor(red: 0.68, green: 0.18, blue: 0.16, alpha: 1), action: #selector(stopScannedServoTapped(_:)), id: id)
-        let torqueOnButton = makeServoActionButton(title: "Torque On", color: UIColor(red: 0.18, green: 0.50, blue: 0.31, alpha: 1), action: #selector(enableScannedServoTorqueTapped(_:)), id: id)
-        let torqueOffButton = makeServoActionButton(title: "Torque Off", color: UIColor(red: 0.58, green: 0.18, blue: 0.18, alpha: 1), action: #selector(disableScannedServoTorqueTapped(_:)), id: id)
-        let zeroButton = makeServoActionButton(title: "Set Zero...", color: UIColor(red: 0.70, green: 0.45, blue: 0.12, alpha: 1), action: #selector(calibrateScannedServoZeroTapped(_:)), id: id)
-        let positionModeButton = makeServoActionButton(title: "Position Mode", color: UIColor(white: 0.30, alpha: 1), action: #selector(setScannedServoPositionModeTapped(_:)), id: id)
-
-        let wheelSpeedField = UITextField()
-        configureServoTextField(wheelSpeedField, placeholder: "Wheel speed", text: "0")
-        wheelSpeedField.keyboardType = .numbersAndPunctuation
-        wheelSpeedField.tag = Int(id)
-        servoWheelSpeedFieldsByID[id] = wheelSpeedField
-
-        let wheelButton = makeServoActionButton(title: "Drive Wheel", color: UIColor(red: 0.18, green: 0.43, blue: 0.86, alpha: 1), action: #selector(driveScannedServoWheelTapped(_:)), id: id)
-        let wheelStopButton = makeServoActionButton(title: "Stop Wheel", color: UIColor(red: 0.58, green: 0.18, blue: 0.18, alpha: 1), action: #selector(stopScannedServoWheelTapped(_:)), id: id)
-
-        let newIDField = UITextField()
-        let suggestedID = min(253, Int(id) + 1)
-        configureServoTextField(newIDField, placeholder: "New ID", text: "\(suggestedID)")
-        newIDField.tag = Int(id)
-        servoNewIDFieldsByID[id] = newIDField
-
-        let setIDButton = makeServoActionButton(title: "Change ID...", color: UIColor(white: 0.30, alpha: 1), action: #selector(changeScannedServoIDTapped(_:)), id: id)
-
-        stack.addArrangedSubview(titleLabel)
-        stack.addArrangedSubview(stateLabel)
-        stack.addArrangedSubview(positionLabel)
-        stack.addArrangedSubview(positionSlider)
-        stack.addArrangedSubview(makeServoRow([readButton, moveButton, stopButton]))
-        stack.addArrangedSubview(makeServoRow([torqueOnButton, torqueOffButton]))
-        stack.addArrangedSubview(makeServoRow([zeroButton, positionModeButton]))
-        stack.addArrangedSubview(makeServoRow([wheelSpeedField, wheelButton, wheelStopButton]))
-        stack.addArrangedSubview(makeServoRow([newIDField, setIDButton]))
-
-        NSLayoutConstraint.activate([
-            stack.topAnchor.constraint(equalTo: card.topAnchor, constant: 12),
-            stack.leadingAnchor.constraint(equalTo: card.leadingAnchor, constant: 12),
-            stack.trailingAnchor.constraint(equalTo: card.trailingAnchor, constant: -12),
-            stack.bottomAnchor.constraint(equalTo: card.bottomAnchor, constant: -12),
-        ])
-
-        return card
-    }
-
-    private func makeServoActionButton(title: String, color: UIColor, action: Selector, id: UInt8) -> UIButton {
-        let button = UIButton(type: .custom)
-        configureServoButton(button, title: title, color: color, action: action)
-        button.tag = Int(id)
-        return button
-    }
-
-    private func servoStateText(for id: UInt8) -> String {
-        guard let state = servoStatesByID[id], !state.isReadFailure else {
-            if let target = servoTargetPositionsByID[id] {
-                return "Moving to \(target); waiting for read"
-            }
-            if servoTorqueOffIDs.contains(id) {
-                return "Torque off; waiting for read"
-            }
-            return "Not read yet"
-        }
-        if let target = servoTargetPositionsByID[id] {
-            let delta = abs(Int(state.position) - Int(target))
-            return "Moving to \(target)  Pos \(state.position)  Δ \(delta)  Load \(state.load)"
-        }
-        if servoTorqueOffIDs.contains(id) {
-            return "Torque off  Pos \(state.position)  Load \(state.load)  Temp \(state.temperature)"
-        }
-        if servoWheelMovingIDs.contains(id) {
-            return "Wheel mode  Pos \(state.position)  Load \(state.load)  Temp \(state.temperature)"
-        }
-        return "Pos \(state.position)  Load \(state.load)  Temp \(state.temperature)  Volt \(state.voltage)"
-    }
-
-    private func servoPositionLabelText(id: UInt8, measuredPosition: UInt16? = nil) -> String {
-        if let target = servoTargetPositionsByID[id] {
-            if let measuredPosition {
-                return "Target \(target)  Live \(measuredPosition)"
-            }
-            return "Target \(target)"
-        }
-        let position = measuredPosition ?? UInt16(positionForScannedServo(id: id))
-        return "Position \(position)"
-    }
-
-    private func positionForScannedServo(id: UInt8) -> UInt16 {
-        let position = Int(servoPositionSlidersByID[id]?.value.rounded() ?? Float(servoPosition()))
-        return UInt16(min(4095, max(0, position)))
-    }
-
-    private func wheelSpeedForScannedServo(id: UInt8) -> Int16? {
-        guard let field = servoWheelSpeedFieldsByID[id],
-              let speed = boundedServoNumber(from: field, name: "Wheel speed", range: -4095...4095) else { return nil }
-        return Int16(speed)
-    }
-
-    private func updateServoRowsEnabled(_ enabled: Bool) {
-        servoListStack.arrangedSubviews.forEach { row in
-            row.alpha = enabled ? 1.0 : 0.4
-            row.isUserInteractionEnabled = enabled
-        }
-    }
-
     private func updateServoList(_ ids: [UInt8]) {
-        scannedServoIDs = ids.reduce(into: []) { uniqueIDs, id in
+        let uniqueIDs = ids.reduce(into: [UInt8]()) { uniqueIDs, id in
             if !uniqueIDs.contains(id) {
                 uniqueIDs.append(id)
             }
         }
-        rebuildServoRows()
+        guard uniqueIDs != scannedServoIDs else { return }
+        scannedServoIDs = uniqueIDs
+        servoListView.setServoIDs(scannedServoIDs)
+        servoListView.setControlsEnabled(ble.connectionState == .connected)
         guard !scannedServoIDs.isEmpty else {
             setServoStatus("No servos found")
             return
@@ -852,31 +687,13 @@ class ControlPanelViewController: UIViewController {
     }
 
     private func updateServoState(_ state: ServoState) {
-        servoStatesByID[state.id] = state
+        servoListView.apply(state: state)
         if state.isReadFailure {
             setServoStatus("ID \(state.id) read failed", isError: true)
-            servoStateLabelsByID[state.id]?.text = "Read failed"
         } else {
-            let target = servoTargetPositionsByID[state.id]
-            if let target, abs(Int(state.position) - Int(target)) <= servoSettledTolerance {
-                servoTargetPositionsByID.removeValue(forKey: state.id)
-            }
             setServoStatus("ID \(state.id) pos \(state.position) load \(state.load) temp \(state.temperature)")
-            if target == nil || servoTargetPositionsByID[state.id] == nil {
-                servoPositionSlidersByID[state.id]?.setValue(Float(state.position), animated: true)
-            }
-            servoPositionLabelsByID[state.id]?.text = servoPositionLabelText(id: state.id, measuredPosition: state.position)
-            servoStateLabelsByID[state.id]?.text = servoStateText(for: state.id)
             UserDefaults.standard.set(Int(state.position), forKey: Self.cachedServoPositionKey)
         }
-    }
-
-    private func trackServoTarget(id: UInt8, position: UInt16) {
-        servoTargetPositionsByID[id] = position
-        servoTorqueOffIDs.remove(id)
-        servoWheelMovingIDs.remove(id)
-        servoPositionLabelsByID[id]?.text = servoPositionLabelText(id: id)
-        servoStateLabelsByID[id]?.text = servoStateText(for: id)
     }
 
     private func refreshScannedServoStates(after delay: TimeInterval = 0.2) {
@@ -1060,8 +877,7 @@ class ControlPanelViewController: UIViewController {
             
             telemetryStatusLabel.leadingAnchor.constraint(equalTo: telemetryStatusDot.trailingAnchor, constant: 8),
             telemetryStatusLabel.centerYAnchor.constraint(equalTo: telemetryStatusDot.centerYAnchor),
-            telemetryStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -20),
-            telemetryStatusLabel.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20)
+            telemetryStatusLabel.trailingAnchor.constraint(lessThanOrEqualTo: contentView.trailingAnchor, constant: -20)
         ])
         
         // Listen for connection status
@@ -1070,6 +886,35 @@ class ControlPanelViewController: UIViewController {
         }
         
         updateTelemetryUI(connected: false, url: TelemetryService.shared.serverURL)
+    }
+
+    private func setupResetMapButton() {
+        let resetMapButton = UIButton(type: .system)
+        configureGlassButton(resetMapButton, title: "Reset Map", systemImageName: "arrow.counterclockwise")
+        resetMapButton.configuration?.baseForegroundColor = .systemRed
+        resetMapButton.addTarget(self, action: #selector(resetMapTapped), for: .touchUpInside)
+        contentView.addSubview(resetMapButton)
+
+        NSLayoutConstraint.activate([
+            resetMapButton.topAnchor.constraint(equalTo: telemetryStatusLabel.bottomAnchor, constant: 24),
+            resetMapButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            resetMapButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+            resetMapButton.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            resetMapButton.bottomAnchor.constraint(equalTo: contentView.bottomAnchor, constant: -20)
+        ])
+    }
+
+    @objc private func resetMapTapped() {
+        let alert = UIAlertController(
+            title: "Reset Map",
+            message: "This will clear the grid and reset the starting position. Are you sure?",
+            preferredStyle: .alert
+        )
+        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        alert.addAction(UIAlertAction(title: "Reset", style: .destructive) { [weak self] _ in
+            self?.onResetMap?()
+        })
+        present(alert, animated: true)
     }
 
     @objc private func telemetryButtonTapped() {
@@ -1147,9 +992,19 @@ class ControlPanelViewController: UIViewController {
 
     @objc private func showServoSettingsTapped() {
         dismissKeyboard()
+        #if targetEnvironment(macCatalyst)
+        guard let scene = view.window?.windowScene else { return }
+        if PanelWindows.shared.focus(.servos, from: scene) { return }
+        #endif
         cleanupServoSettingsPopup()
 
-        let settingsViewController = UIViewController()
+        let settingsViewController = PanelViewController()
+        settingsViewController.onPanelVisibilityChanged = { [weak self] visible in
+            self?.servoListView.setScreenActive(visible)
+        }
+        settingsViewController.onPanelResignKey = { [weak self] in
+            self?.servoListView.stopAllJogs()
+        }
         settingsViewController.view.backgroundColor = UIColor(white: 0.12, alpha: 1)
         settingsViewController.modalPresentationStyle = .pageSheet
 
@@ -1158,6 +1013,9 @@ class ControlPanelViewController: UIViewController {
         scrollView.showsVerticalScrollIndicator = true
         scrollView.alwaysBounceVertical = true
         scrollView.keyboardDismissMode = .interactive
+        #if targetEnvironment(macCatalyst)
+        scrollView.contentInsetAdjustmentBehavior = .never
+        #endif
         settingsViewController.view.addSubview(scrollView)
 
         let contentView = UIView()
@@ -1185,14 +1043,15 @@ class ControlPanelViewController: UIViewController {
         listLabel.textColor = UIColor.white.withAlphaComponent(0.6)
         contentView.addSubview(listLabel)
 
-        rebuildServoRows()
+        servoListView.setServoIDs(scannedServoIDs)
+        servoListView.setControlsEnabled(ble.connectionState == .connected)
         contentView.addSubview(servoStack)
 
         servoPopupConstraints = [
             scrollView.topAnchor.constraint(equalTo: settingsViewController.view.safeAreaLayoutGuide.topAnchor),
             scrollView.leadingAnchor.constraint(equalTo: settingsViewController.view.leadingAnchor),
             scrollView.trailingAnchor.constraint(equalTo: settingsViewController.view.trailingAnchor),
-            scrollView.bottomAnchor.constraint(equalTo: settingsViewController.view.bottomAnchor),
+            scrollView.bottomAnchor.constraint(equalTo: settingsViewController.view.keyboardLayoutGuide.topAnchor),
 
             contentView.topAnchor.constraint(equalTo: scrollView.contentLayoutGuide.topAnchor),
             contentView.leadingAnchor.constraint(equalTo: scrollView.contentLayoutGuide.leadingAnchor),
@@ -1223,16 +1082,26 @@ class ControlPanelViewController: UIViewController {
         }
         settingsViewController.presentationController?.delegate = self
         servoSettingsViewController = settingsViewController
+        #if targetEnvironment(macCatalyst)
+        PanelWindows.shared.open(.servos, from: scene, onClose: { [weak self] in
+            self?.cleanupServoSettingsPopup()
+        }) { settingsViewController }
+        #else
+        PanelPresentation.prepare(settingsViewController)
         present(settingsViewController, animated: true)
+        #endif
     }
 
     @objc private func dismissServoSettingsTapped() {
-        servoSettingsViewController?.dismiss(animated: true) { [weak self] in
+        servoListView.setScreenActive(false)
+        guard let servoSettingsViewController else { return }
+        PanelPresentation.close(servoSettingsViewController) { [weak self] in
             self?.cleanupServoSettingsPopup()
         }
     }
 
     private func cleanupServoSettingsPopup() {
+        servoListView.setScreenActive(false)
         NSLayoutConstraint.deactivate(servoPopupConstraints)
         servoPopupConstraints.removeAll()
         servoStack.removeFromSuperview()
@@ -1298,48 +1167,6 @@ class ControlPanelViewController: UIViewController {
         setServoStatus("Scanning \(from)-\(to)")
     }
 
-    @objc private func changeServoIDTapped() {
-        dismissKeyboard()
-        guard let currentID = servoID(from: servoIDField, name: "ID"),
-              let newID = servoID(from: servoNewIDField, name: "New ID") else { return }
-        UserDefaults.standard.set(Int(currentID), forKey: Self.cachedServoIDKey)
-        UserDefaults.standard.set(Int(newID), forKey: Self.cachedServoNewIDKey)
-        ble.changeServoID(currentID: currentID, newID: newID)
-        setServoStatus("Set ID \(currentID) -> \(newID)")
-    }
-
-    @objc private func servoPositionChanged() {
-        let position = Int(servoPositionSlider.value.rounded())
-        servoPositionLabel.text = "Position \(position)"
-        UserDefaults.standard.set(position, forKey: Self.cachedServoPositionKey)
-    }
-
-    @objc private func scannedServoPositionChanged(_ sender: UISlider) {
-        let id = UInt8(sender.tag)
-        let position = Int(sender.value.rounded())
-        sender.setValue(Float(position), animated: false)
-        servoPositionLabelsByID[id]?.text = "Position \(position)"
-        UserDefaults.standard.set(position, forKey: Self.cachedServoPositionKey)
-    }
-
-    @objc private func refreshServoStateTapped() {
-        dismissKeyboard()
-        guard let id = servoID(from: servoIDField, name: "ID") else { return }
-        UserDefaults.standard.set(Int(id), forKey: Self.cachedServoIDKey)
-        ble.refreshServoState(id: id)
-        setServoStatus("Reading ID \(id)")
-    }
-
-    @objc private func moveServoTapped() {
-        dismissKeyboard()
-        guard let id = servoID(from: servoIDField, name: "ID"), let speed = servoSpeed() else { return }
-        let position = servoPosition()
-        UserDefaults.standard.set(Int(id), forKey: Self.cachedServoIDKey)
-        trackServoTarget(id: id, position: position)
-        ble.moveServo(id: id, position: position, speed: speed)
-        setServoStatus("Moving ID \(id)")
-    }
-
     @objc private func moveAllServosTapped() {
         dismissKeyboard()
         guard let speed = servoSpeed() else { return }
@@ -1347,108 +1174,9 @@ class ControlPanelViewController: UIViewController {
             setServoStatus("Scan servos first", isError: true)
             return
         }
-        scannedServoIDs.forEach { id in
-            let position = positionForScannedServo(id: id)
-            trackServoTarget(id: id, position: position)
-            ble.moveServo(id: id, position: position, speed: speed)
-        }
+        ble.moveDiscoveredServos(position: servoPosition(), speed: speed)
         setServoStatus("Moving \(scannedServoIDs.count) servos")
-    }
-
-    @objc private func readScannedServoTapped(_ sender: UIButton) {
-        let id = UInt8(sender.tag)
-        ble.refreshServoState(id: id)
-        setServoStatus("Reading ID \(id)")
-    }
-
-    @objc private func moveScannedServoTapped(_ sender: UIButton) {
-        dismissKeyboard()
-        let id = UInt8(sender.tag)
-        guard let speed = servoSpeed() else { return }
-        let position = positionForScannedServo(id: id)
-        trackServoTarget(id: id, position: position)
-        ble.moveServo(id: id, position: position, speed: speed)
-        setServoStatus("Moving ID \(id)")
-    }
-
-    @objc private func stopScannedServoTapped(_ sender: UIButton) {
-        let id = UInt8(sender.tag)
-        servoTargetPositionsByID.removeValue(forKey: id)
-        servoWheelMovingIDs.remove(id)
-        servoTorqueOffIDs.insert(id)
-        servoPositionLabelsByID[id]?.text = servoPositionLabelText(id: id, measuredPosition: servoStatesByID[id]?.position)
-        servoStateLabelsByID[id]?.text = servoStateText(for: id)
-        ble.stopServo(id: id)
-        setServoStatus("Stopped ID \(id); torque off")
-    }
-
-    @objc private func changeScannedServoIDTapped(_ sender: UIButton) {
-        dismissKeyboard()
-        let currentID = UInt8(sender.tag)
-        guard let newIDField = servoNewIDFieldsByID[currentID],
-              let newID = servoID(from: newIDField, name: "New ID") else { return }
-        confirmServoAction(
-            title: "Change Servo ID?",
-            message: "Servo \(currentID) will become ID \(newID). Use this only when one servo is on the bus or you are sure this is the target.",
-            confirmTitle: "Change ID"
-        ) { [weak self] in
-            guard let self else { return }
-            self.ble.changeServoID(currentID: currentID, newID: newID)
-            self.setServoStatus("Set ID \(currentID) -> \(newID); scan to refresh")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                self?.rescanServosTapped()
-            }
-        }
-    }
-
-    @objc private func calibrateScannedServoZeroTapped(_ sender: UIButton) {
-        dismissKeyboard()
-        let id = UInt8(sender.tag)
-        confirmServoAction(
-            title: "Set Servo \(id) Zero?",
-            message: "This stores the current physical position as the servo's home position.",
-            confirmTitle: "Set Zero"
-        ) { [weak self] in
-            self?.ble.calibrateServoZero(id: id)
-            self?.setServoStatus("Set zero for ID \(id)")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
-                self?.ble.refreshServoState(id: id)
-            }
-        }
-    }
-
-    @objc private func driveScannedServoWheelTapped(_ sender: UIButton) {
-        dismissKeyboard()
-        let id = UInt8(sender.tag)
-        guard let speed = wheelSpeedForScannedServo(id: id) else { return }
-        servoTargetPositionsByID.removeValue(forKey: id)
-        servoTorqueOffIDs.remove(id)
-        if speed == 0 {
-            servoWheelMovingIDs.remove(id)
-        } else {
-            servoWheelMovingIDs.insert(id)
-        }
-        servoStateLabelsByID[id]?.text = servoStateText(for: id)
-        ble.driveServoWheel(id: id, speed: speed)
-        setServoStatus("Wheel ID \(id) at \(speed)")
-    }
-
-    @objc private func stopScannedServoWheelTapped(_ sender: UIButton) {
-        let id = UInt8(sender.tag)
-        servoWheelSpeedFieldsByID[id]?.text = "0"
-        servoWheelMovingIDs.remove(id)
-        ble.driveServoWheel(id: id, speed: 0)
-        setServoStatus("Stopped wheel ID \(id)")
-    }
-
-    @objc private func setScannedServoPositionModeTapped(_ sender: UIButton) {
-        let id = UInt8(sender.tag)
-        servoWheelMovingIDs.remove(id)
-        ble.setServoPositionMode(id: id)
-        setServoStatus("Position mode for ID \(id)")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.ble.refreshServoState(id: id)
-        }
+        refreshScannedServoStates(after: 0.4)
     }
 
     private func confirmServoAction(title: String, message: String, confirmTitle: String, action: @escaping () -> Void) {
@@ -1456,22 +1184,6 @@ class ControlPanelViewController: UIViewController {
         alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
         alert.addAction(UIAlertAction(title: confirmTitle, style: .destructive) { _ in action() })
         (servoSettingsViewController ?? self).present(alert, animated: true)
-    }
-
-    @objc private func enableScannedServoTorqueTapped(_ sender: UIButton) {
-        setScannedServoTorque(id: UInt8(sender.tag), enabled: true)
-    }
-
-    @objc private func disableScannedServoTorqueTapped(_ sender: UIButton) {
-        setScannedServoTorque(id: UInt8(sender.tag), enabled: false)
-    }
-
-    @objc private func enableServoTorqueTapped() {
-        setServoTorque(enabled: true)
-    }
-
-    @objc private func disableServoTorqueTapped() {
-        setServoTorque(enabled: false)
     }
 
     @objc private func enableAllServoTorqueTapped() {
@@ -1482,38 +1194,6 @@ class ControlPanelViewController: UIViewController {
         setAllServoTorque(enabled: false)
     }
 
-    private func setServoTorque(enabled: Bool) {
-        dismissKeyboard()
-        guard let id = servoID(from: servoIDField, name: "ID") else { return }
-        UserDefaults.standard.set(Int(id), forKey: Self.cachedServoIDKey)
-        if enabled {
-            servoTorqueOffIDs.remove(id)
-        } else {
-            servoTorqueOffIDs.insert(id)
-            servoTargetPositionsByID.removeValue(forKey: id)
-            servoWheelMovingIDs.remove(id)
-        }
-        servoStateLabelsByID[id]?.text = servoStateText(for: id)
-        ble.setServoTorque(id: id, enabled: enabled)
-        setServoStatus("Torque \(enabled ? "on" : "off") for ID \(id)")
-    }
-
-    private func setScannedServoTorque(id: UInt8, enabled: Bool) {
-        if enabled {
-            servoTorqueOffIDs.remove(id)
-        } else {
-            servoTorqueOffIDs.insert(id)
-            servoTargetPositionsByID.removeValue(forKey: id)
-            servoWheelMovingIDs.remove(id)
-        }
-        servoStateLabelsByID[id]?.text = servoStateText(for: id)
-        ble.setServoTorque(id: id, enabled: enabled)
-        setServoStatus("Torque \(enabled ? "on" : "off") for ID \(id)")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-            self?.ble.refreshServoState(id: id)
-        }
-    }
-
     private func setAllServoTorque(enabled: Bool) {
         dismissKeyboard()
         guard !scannedServoIDs.isEmpty else {
@@ -1521,14 +1201,6 @@ class ControlPanelViewController: UIViewController {
             return
         }
         scannedServoIDs.forEach { id in
-            if enabled {
-                servoTorqueOffIDs.remove(id)
-            } else {
-                servoTorqueOffIDs.insert(id)
-                servoTargetPositionsByID.removeValue(forKey: id)
-                servoWheelMovingIDs.remove(id)
-            }
-            servoStateLabelsByID[id]?.text = servoStateText(for: id)
             ble.setServoTorque(id: id, enabled: enabled)
         }
         setServoStatus("Torque \(enabled ? "on" : "off") for \(scannedServoIDs.count) servos")
@@ -1569,10 +1241,10 @@ class ControlPanelViewController: UIViewController {
         }
         if !connected {
             scannedServoIDs.removeAll()
-            rebuildServoRows()
-        } else {
-            updateServoRowsEnabled(true)
+            servoListView.stopAllJogs()
+            servoListView.setServoIDs([])
         }
+        servoListView.setControlsEnabled(connected)
         
         // Enable/disable WiFi controls
         ssidField.isEnabled = connected

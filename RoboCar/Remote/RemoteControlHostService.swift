@@ -4,9 +4,7 @@
 //
 
 import Foundation
-import Network
 import UIKit
-import WebRTC
 
 final class RemoteControlHostService {
     static let shared = RemoteControlHostService()
@@ -14,74 +12,65 @@ final class RemoteControlHostService {
     var onStatusChanged: ((String) -> Void)?
 
 
-    private let queue = DispatchQueue(label: "com.robocar.remote.host", qos: .userInitiated)
+    private let queue = DispatchQueue.main
     private let encoder = JSONEncoder()
     private let decoder = JSONDecoder()
-    private var listener: NWListener?
-    private var signalingConnection: NWConnection?
-    private var receiveBuffer = ""
-    private var webRTCSession: RemoteControlWebRTCSession?
+    private let transport = RemoteControlIrohSession.shared
+    private let video = RemoteVideoCodec()
     private var latestStatusMessage: RemoteMessage?
     private var latestMapStateMessage: RemoteMessage?
     private var latestGridUpdateMessage: RemoteMessage?
     private var latestMeshMessage: RemoteMessage?
     private var latestServoIDsMessage: RemoteMessage?
     private var latestServoStateMessage: RemoteMessage?
+    private var latestServoPositionsMessage: RemoteMessage?
+    private var latestServoAxisStatusMessages: [UInt8: RemoteMessage] = [:]
     private var seq: UInt64 = 0
     private var staleDriveTimer: DispatchSourceTimer?
-    private var motorStopTimer: DispatchSourceTimer?
     private var lastDriveCommandDate: Date?
     private let driveTimeout: TimeInterval = 0.75
-    private var attemptedVideoFrameCount: UInt64 = 0
 
     private init() {}
 
-    var isRunning: Bool { listener != nil }
-    var clientCount: Int { signalingConnection == nil ? 0 : 1 }
-    private var isLocalConnectionDetected = false
-    var isLocalConnection: Bool { isLocalConnectionDetected }
+    var isRunning: Bool { transport.role == .robot && transport.isRunning }
+    var clientCount: Int { transport.role == .robot && transport.isConnected ? 1 : 0 }
+    var isLocalConnection: Bool { false }
 
-    func start(port: UInt16 = RemoteControlProtocol.defaultPort) {
-        guard listener == nil else { return }
-
-        do {
-            let parameters = NWParameters.tcp
-            parameters.includePeerToPeer = true
-            let listener = try NWListener(using: parameters, on: NWEndpoint.Port(rawValue: port)!)
-            listener.service = NWListener.Service(name: UIDevice.current.name, type: RemoteControlProtocol.serviceType)
-            listener.stateUpdateHandler = { [weak self] state in
-                self?.handleListenerState(state)
+    func start() {
+        guard !isRunning else { return }
+        transport.start(role: .robot)
+        transport.onMessage = { [weak self] data in
+            guard let self, let message = try? self.decoder.decode(RemoteMessage.self, from: data) else { return }
+            if message.type == "restartVideo" { self.video.requestKeyframe(); return }
+            if message.type == "drive" { self.lastDriveCommandDate = Date() }
+            if message.type == "stopDrive" { self.lastDriveCommandDate = nil }
+            let sessionID = self.transport.sessionID
+            RemoteRobotCommandDispatcher.dispatch(message) { [weak self] in
+                self?.transport.sessionID == sessionID && self?.transport.isConnected == true
             }
-            listener.newConnectionHandler = { [weak self] connection in
-                self?.accept(connection)
-            }
-            self.listener = listener
-            startDriveWatchdog()
-            listener.start(queue: queue)
-        } catch {
-            publishStatus("Remote host failed: \(error.localizedDescription)")
         }
+        transport.onConnected = { [weak self] in self?.replayLatestState() }
+        transport.onDisconnected = { [weak self] in
+            self?.lastDriveCommandDate = nil
+            self?.video.reset()
+            NLNavigator.shared.stop()
+            NotificationCenter.default.post(name: .serverStopNavigation, object: nil)
+            NotificationCenter.default.post(name: .stopFollowing, object: nil)
+            ESP32BLEManager.shared.stopAll()
+        }
+        transport.onNeedsKeyframe = { [weak self] in self?.video.requestKeyframe() }
+        video.onEncoded = { [weak self] data, keyframe in self?.transport.sendVideo(data, keyframe: keyframe) }
+        startDriveWatchdog()
     }
 
     func stop() {
-        queue.async { [weak self] in
-            guard let self else { return }
-            guard self.listener != nil || self.signalingConnection != nil || self.webRTCSession != nil else { return }
-            self.listener?.cancel()
-            self.listener = nil
-            self.signalingConnection?.cancel()
-            self.signalingConnection = nil
-            self.receiveBuffer = ""
-            self.webRTCSession?.stop()
-            self.webRTCSession = nil
-            self.staleDriveTimer?.cancel()
-            self.staleDriveTimer = nil
-            self.motorStopTimer?.cancel()
-            self.motorStopTimer = nil
-            self.lastDriveCommandDate = nil
-            DispatchQueue.main.async { ESP32BLEManager.shared.stopAll() }
-            self.publishStatus("Remote host stopped")
-        }
+        guard transport.role == .robot else { return }
+        transport.stop()
+        video.reset()
+        staleDriveTimer?.cancel()
+        staleDriveTimer = nil
+        lastDriveCommandDate = nil
+        ESP32BLEManager.shared.stopAll()
     }
 
     func broadcastStatus() {
@@ -133,18 +122,8 @@ final class RemoteControlHostService {
     }
 
     func broadcastCameraFrame(image: UIImage) {
-        attemptedVideoFrameCount += 1
-        guard let webRTCSession else {
-            if attemptedVideoFrameCount == 1 || attemptedVideoFrameCount % 30 == 0 {
-                print("[RemoteWebRTC] host: dropped view frame #\(attemptedVideoFrameCount), no session")
-            }
-            return
-        }
-        if !webRTCSession.canAcceptVideoFrame,
-           attemptedVideoFrameCount == 1 || attemptedVideoFrameCount % 30 == 0 {
-            print("[RemoteWebRTC] host: view frame #\(attemptedVideoFrameCount) before local video track ready")
-        }
-        webRTCSession.sendVideoFrame(image)
+        guard clientCount > 0 else { return }
+        video.encode(image)
     }
 
     func broadcastServoIDs(_ ids: [UInt8]) {
@@ -158,6 +137,22 @@ final class RemoteControlHostService {
         var message = RemoteMessage(type: "servoState")
         message.servoState = RemoteServoState(state)
         latestServoStateMessage = message
+        broadcast(message)
+    }
+
+    func broadcastServoPositions(_ positions: [UInt8: UInt16]) {
+        var message = RemoteMessage(type: "servoPositions")
+        message.servoPositions = positions
+            .sorted { $0.key < $1.key }
+            .map { RemoteServoPosition(id: $0.key, position: $0.value) }
+        latestServoPositionsMessage = message
+        broadcast(message)
+    }
+
+    func broadcastServoAxisStatus(_ status: ServoAxisStatus) {
+        var message = RemoteMessage(type: "servoAxisStatus")
+        message.servoAxisStatus = RemoteServoAxisStatus(status)
+        latestServoAxisStatusMessages[status.id] = message
         broadcast(message)
     }
 
@@ -178,169 +173,20 @@ final class RemoteControlHostService {
     }
 
     func broadcastGridReset() {
+        latestMapStateMessage = nil
+        latestGridUpdateMessage = nil
         latestMeshMessage = nil
         broadcast(RemoteMessage(type: "gridReset"))
     }
 
-    private func handleListenerState(_ state: NWListener.State) {
-        switch state {
-        case .ready:
-            publishStatus("Remote host available on Bonjour")
-        case .failed(let error):
-            publishStatus("Remote host failed: \(error.localizedDescription)")
-            stop()
-        case .cancelled:
-            publishStatus("Remote host stopped")
-        default:
-            break
-        }
-    }
-
-    private func makeHostSession() -> RemoteControlWebRTCSession {
-        let session = RemoteControlWebRTCSession(role: .host)
-        session.onSignal = { [weak self] message in
-            self?.sendSignal(message)
-        }
-        session.onStatusChanged = { [weak self] status in
-            self?.publishStatus(status)
-        }
-        session.onLocalFrameSent = { [weak self] width, height, count in
-            guard count == 1 || count % 30 == 0 else { return }
-            self?.publishStatus("WebRTC sent view frame #\(count) (\(width)x\(height))")
-        }
-        return session
-    }
-
-    /// Tears down the current peer connection and starts a fresh one (new offer),
-    /// which forces a new keyframe. Used to recover a stalled video feed without
-    /// dropping the TCP signaling/telemetry connection.
-    private func restartWebRTCSession() {
-        guard signalingConnection != nil else { return }
-        let oldSession = webRTCSession
-        let session = makeHostSession()
-        webRTCSession = session
-        oldSession?.stop()
-        session.start()
-        session.configureForLocalConnection(isLocalConnectionDetected)
-        publishStatus("WebRTC video restarted")
-    }
-
-    private func accept(_ connection: NWConnection) {
-        motorStopTimer?.cancel()
-        motorStopTimer = nil
-        signalingConnection?.cancel()
-        signalingConnection = connection
-        receiveBuffer = ""
-        let oldSession = webRTCSession
-        let session = makeHostSession()
-        webRTCSession = session
-        oldSession?.stop()
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, let connection else { return }
-            switch state {
-            case .ready:
-                self.publishStatus("WebRTC signaling connected")
-                print("[RemoteWebRTC] host: TCP signaling ready, starting peer connection")
-                session.start()
-                self.broadcastStatus()
-                self.replayLatestState()
-                self.receive(on: connection)
-            case .failed, .cancelled:
-                self.remove(connection)
-            default:
-                break
-            }
-        }
-        connection.start(queue: queue)
-    }
-
-    private func remove(_ connection: NWConnection) {
-        guard signalingConnection === connection else { return }
-        signalingConnection = nil
-        receiveBuffer = ""
-        webRTCSession?.stop()
-        webRTCSession = nil
-        DispatchQueue.main.async { [weak self] in self?.isLocalConnectionDetected = false }
-        scheduleMotorStop()
-        publishStatus("Remote client disconnected")
-        broadcastStatus()
-    }
-
-    private func scheduleMotorStop() {
-        motorStopTimer?.cancel()
-        let timer = DispatchSource.makeTimerSource(queue: queue)
-        timer.schedule(deadline: .now() + 2.0)
-        timer.setEventHandler { [weak self] in
-            guard let self, self.signalingConnection == nil else { return }
-            self.motorStopTimer = nil
-            DispatchQueue.main.async { ESP32BLEManager.shared.stopAll() }
-        }
-        motorStopTimer = timer
-        timer.resume()
-    }
-
-    private func receive(on connection: NWConnection) {
-        connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self, weak connection] data, _, isComplete, error in
-            guard let self, let connection else { return }
-            if let data, !data.isEmpty, let chunk = String(data: data, encoding: .utf8) {
-                self.handle(chunk: chunk, from: connection)
-            }
-            if isComplete || error != nil {
-                self.remove(connection)
-                return
-            }
-            self.receive(on: connection)
-        }
-    }
-
-    private func handle(chunk: String, from connection: NWConnection) {
-        receiveBuffer += chunk
-        while let newline = receiveBuffer.firstIndex(of: "\n") {
-            let line = String(receiveBuffer[..<newline])
-            receiveBuffer.removeSubrange(...newline)
-            guard let data = line.data(using: .utf8), let message = try? decoder.decode(RemoteMessage.self, from: data) else { continue }
-            if message.type == "webrtcSignal" {
-                print("[RemoteWebRTC] host: received signal \(message.signalType ?? "unknown")")
-                webRTCSession?.handleSignal(message)
-                continue
-            }
-            if message.type == "restartVideo" {
-                print("[RemoteWebRTC] host: restartVideo requested")
-                restartWebRTCSession()
-                continue
-            }
-            if message.type == "connectionInfo" {
-                let isLocal = message.isLocalConnection ?? false
-                webRTCSession?.configureForLocalConnection(isLocal)
-                DispatchQueue.main.async { [weak self] in
-                    self?.isLocalConnectionDetected = isLocal
-                }
-                publishStatus("WebRTC connection: \(isLocal ? "local" : "remote")")
-                broadcastStatus()
-                continue
-            }
-            if message.type == "drive" {
-                lastDriveCommandDate = Date()
-            }
-            if message.type == "stopDrive" {
-                lastDriveCommandDate = nil
-            }
-            RemoteRobotCommandDispatcher.dispatch(message)
-        }
-    }
-
     private func broadcast(_ message: RemoteMessage) {
-        queue.async { [weak self] in
-            guard let self, let signalingConnection else { return }
-            var outbound = message
-            outbound.seq = self.seq
-            outbound.ts = Date().timeIntervalSince1970
-            self.seq += 1
-            guard let data = try? self.encoder.encode(outbound) else { return }
-            var framed = data
-            framed.append(0x0A)
-            signalingConnection.send(content: framed, completion: .contentProcessed { _ in })
-        }
+        guard clientCount > 0 else { return }
+        var outbound = message
+        outbound.seq = seq
+        outbound.ts = Date().timeIntervalSince1970
+        seq += 1
+        guard let data = try? encoder.encode(outbound) else { return }
+        transport.sendMessage(data)
     }
 
     private func replayLatestState() {
@@ -352,25 +198,17 @@ final class RemoteControlHostService {
             status.message = "\(self.clientCount) remote client(s)"
             self.latestStatusMessage = status
 
-            [
+            self.broadcast(RemoteMessage(type: "gridReset"))
+
+            ([
                 self.latestStatusMessage,
                 self.latestMapStateMessage,
                 self.latestGridUpdateMessage,
                 self.latestMeshMessage,
                 self.latestServoIDsMessage,
-                self.latestServoStateMessage
-            ].compactMap { $0 }.forEach { self.broadcast($0) }
-        }
-    }
-
-    private func sendSignal(_ message: RemoteMessage) {
-        queue.async { [weak self] in
-            guard let self, let signalingConnection else { return }
-            guard let data = try? self.encoder.encode(message) else { return }
-            var framed = data
-            framed.append(0x0A)
-            print("[RemoteWebRTC] host: sending signal \(message.signalType ?? "unknown")")
-            signalingConnection.send(content: framed, completion: .contentProcessed { _ in })
+                self.latestServoStateMessage,
+                self.latestServoPositionsMessage
+            ].compactMap { $0 } + Array(self.latestServoAxisStatusMessages.values)).forEach { self.broadcast($0) }
         }
     }
 
@@ -391,7 +229,6 @@ final class RemoteControlHostService {
 
     private func publishStatus(_ status: String) {
         print("[RemoteHost] \(status)")
-        print("[RemoteWebRTC] host status: \(status)")
         DispatchQueue.main.async { [weak self] in
             self?.onStatusChanged?(status)
         }

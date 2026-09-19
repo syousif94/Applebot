@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 532AA3D42F09D00000B4C836 /* WebRTC */; };
+		533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */ = {isa = PBXBuildFile; productRef = 533516C33040FE6D0090D4A9 /* IrohLib */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -18,6 +19,7 @@
 		532AA3CD2F09C4CD00B4C836 /* Exceptions for "RoboCar" folder in "RoboCar" target */ = {
 			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
 			membershipExceptions = (
+				"Info-Catalyst.plist",
 				Info.plist,
 			);
 			target = 532AA3BA2F09C4CB00B4C836 /* RoboCar */;
@@ -40,6 +42,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */,
 				532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -84,6 +87,7 @@
 			name = RoboCar;
 			packageProductDependencies = (
 				532AA3D42F09D00000B4C836 /* WebRTC */,
+				533516C33040FE6D0090D4A9 /* IrohLib */,
 			);
 			productName = RoboCar;
 			productReference = 532AA3BB2F09C4CB00B4C836 /* RoboCar.app */;
@@ -97,7 +101,7 @@
 			attributes = {
 				BuildIndependentTargetsInParallel = 1;
 				LastSwiftUpdateCheck = 2610;
-				LastUpgradeCheck = 2610;
+				LastUpgradeCheck = 2700;
 				TargetAttributes = {
 					532AA3BA2F09C4CB00B4C836 = {
 						CreatedOnToolsVersion = 26.1.1;
@@ -115,6 +119,7 @@
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
 				532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */,
+				533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 532AA3BC2F09C4CB00B4C836 /* Products */;
@@ -153,11 +158,13 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = RoboCar/RoboCar.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "RoboCar/RoboCar-Catalyst.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				"INFOPLIST_FILE[sdk=macosx*]" = "RoboCar/Info-Catalyst.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Applebot;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
@@ -201,11 +208,13 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				CODE_SIGN_ENTITLEMENTS = RoboCar/RoboCar.entitlements;
+				"CODE_SIGN_ENTITLEMENTS[sdk=macosx*]" = "RoboCar/RoboCar-Catalyst.entitlements";
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 3;
 				DEVELOPMENT_TEAM = 5E7D5R7C83;
 				GENERATE_INFOPLIST_FILE = YES;
 				INFOPLIST_FILE = RoboCar/Info.plist;
+				"INFOPLIST_FILE[sdk=macosx*]" = "RoboCar/Info-Catalyst.plist";
 				INFOPLIST_KEY_CFBundleDisplayName = Applebot;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.navigation";
 				INFOPLIST_KEY_NSBluetoothAlwaysUsageDescription = "RoboCar uses Bluetooth to connect to the ESP32 motor controller.";
@@ -302,6 +311,7 @@
 				MTL_FAST_MATH = YES;
 				ONLY_ACTIVE_ARCH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_ACTIVE_COMPILATION_CONDITIONS = "DEBUG $(inherited)";
 				SWIFT_OPTIMIZATION_LEVEL = "-Onone";
 			};
@@ -359,6 +369,7 @@
 				MTL_ENABLE_DEBUG_INFO = NO;
 				MTL_FAST_MATH = YES;
 				SDKROOT = iphoneos;
+				STRING_CATALOG_GENERATE_SYMBOLS = YES;
 				SWIFT_COMPILATION_MODE = wholemodule;
 				VALIDATE_PRODUCT = YES;
 			};
@@ -396,6 +407,14 @@
 				minimumVersion = 147.0.0;
 			};
 		};
+		533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/n0-computer/iroh-ffi";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 1.1.0;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -403,6 +422,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */;
 			productName = WebRTC;
+		};
+		533516C33040FE6D0090D4A9 /* IrohLib */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */;
+			productName = IrohLib;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

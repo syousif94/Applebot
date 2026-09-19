@@ -45,9 +45,15 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func setRoot(for role: RoboCarAppRole) {
+        #if targetEnvironment(macCatalyst)
+        if let session = window?.windowScene?.session {
+            PanelWindows.shared.closeAll(ownerID: session.persistentIdentifier)
+        }
+        #endif
         if currentRole == .robot || role == .controller {
             RemoteControlHostService.shared.stop()
         }
+        RemoteControlIrohSession.shared.stop()
         TelemetryService.shared.stop(reason: "mode_switch")
         currentRole = role
         switch role {
@@ -66,6 +72,9 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidDisconnect(_ scene: UIScene) {
+        #if targetEnvironment(macCatalyst)
+        PanelWindows.shared.closeAll(ownerID: scene.session.persistentIdentifier)
+        #endif
         // Called as the scene is being released by the system.
         // This occurs shortly after the scene enters the background, or when its session is discarded.
         // Release any resources associated with this scene that can be re-created the next time the scene connects.
@@ -73,8 +82,9 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidBecomeActive(_ scene: UIScene) {
-        // Called when the scene has moved from an inactive state to an active state.
-        // Use this method to restart any tasks that were paused (or not yet started) when the scene was inactive.
+        guard currentRole == .controller,
+              let controller = window?.rootViewController as? RemoteControlViewController else { return }
+        controller.resumeRemoteConnection()
     }
 
     func sceneWillResignActive(_ scene: UIScene) {
@@ -92,8 +102,12 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     func sceneDidEnterBackground(_ scene: UIScene) {
+        #if targetEnvironment(macCatalyst)
+        if PanelWindows.shared.hasForegroundPanels(ownerID: scene.session.persistentIdentifier) { return }
+        #endif
         // Stop telemetry when app backgrounds
         TelemetryService.shared.stop(reason: "background")
+        RemoteControlIrohSession.shared.stop()
         guard currentRole == .robot else { return }
         RemoteControlHostService.shared.stop()
     }

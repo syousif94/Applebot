@@ -42,8 +42,47 @@ struct ServoState {
     let load: UInt16
     let voltage: UInt8
     let temperature: UInt8
+    /// Nil for older firmware or an unavailable torque-register read.
+    var torqueEnabled: Bool? = nil
 
     var isReadFailure: Bool { error == 0xFF }
+}
+
+/// Direction for continuous multi-turn jogging.
+enum ServoJogDirection: Int8 {
+    case counterclockwise = -1
+    case clockwise = 1
+}
+
+/// Travel endpoint marked at the servo's current physical position.
+enum ServoTravelMark: UInt8 {
+    case min = 0
+    case max = 1
+}
+
+/// Multi-turn axis status pushed by the firmware (telemetry frame 0x02).
+struct ServoAxisStatus {
+    let id: UInt8
+    let isTracked: Bool
+    let hasMin: Bool
+    let hasMax: Bool
+    let hasZero: Bool
+    let isMoving: Bool
+    let isError: Bool
+    /// Cumulative encoder ticks (4096 per revolution).
+    let cumulativeTicks: Int32
+    /// Degrees from hardware center; nil when tracking is unavailable.
+    let angleDegrees: Double?
+    /// Percent of marked travel (0–100); nil until both marks are set.
+    let percent: Double?
+    /// Total travel in degrees since tracking started.
+    let totalDegrees: Double
+
+    /// Signed displacement from hardware center, including accumulated turns.
+    var cumulativeDegrees: Double { Double(cumulativeTicks) * 360.0 / 4096.0 }
+
+    /// Complete revolutions, truncated toward zero so a partial negative turn is still zero.
+    var fullTurns: Int32 { cumulativeTicks / 4096 }
 }
 
 /// Manages the BLE connection to the ESP32 Motor controller
@@ -59,6 +98,7 @@ class ESP32BLEManager: NSObject {
     static let stListUUID     = CBUUID(string: "E3910011-4567-4321-ABCD-ABCDEF012345")
     static let stCmdUUID      = CBUUID(string: "E3910012-4567-4321-ABCD-ABCDEF012345")
     static let stStateUUID    = CBUUID(string: "E3910013-4567-4321-ABCD-ABCDEF012345")
+    static let stTelemetryUUID = CBUUID(string: "E3910014-4567-4321-ABCD-ABCDEF012345")
     
     /// Expected device advertisement name
     static let deviceName = "ESP32 Motor"
@@ -84,8 +124,14 @@ class ESP32BLEManager: NSObject {
 
     /// Callback when ST3215 servo state is refreshed
     var onServoStateUpdated: ((ServoState) -> Void)?
+    /// Callback when live servo positions arrive (telemetry push, ~150 ms)
+    var onServoPositionsUpdated: (([UInt8: UInt16]) -> Void)?
+    /// Callback when a multi-turn axis status frame arrives
+    var onServoAxisStatusUpdated: ((ServoAxisStatus) -> Void)?
     private var servoListObservers: [UUID: ([UInt8]) -> Void] = [:]
     private var servoStateObservers: [UUID: (ServoState) -> Void] = [:]
+    private var servoPositionsObservers: [UUID: ([UInt8: UInt16]) -> Void] = [:]
+    private var servoAxisStatusObservers: [UUID: (ServoAxisStatus) -> Void] = [:]
     
     /// Latest battery percentage (0–100)
     private(set) var batteryPercentage: UInt8 = 0
@@ -108,15 +154,12 @@ class ESP32BLEManager: NSObject {
     private var stListChar: CBCharacteristic?
     private var stCmdChar: CBCharacteristic?
     private var stStateChar: CBCharacteristic?
+    private var stTelemetryChar: CBCharacteristic?
     private var shouldReadServoListAfterCommand = false
     private var pendingServoStateReadIDs: [UInt8] = []
-    private var latestServoIDs: [UInt8] = []
-    private var servoMotionTargets: [UInt8: UInt16] = [:]
-    private var servoTorqueOffPollIDs = Set<UInt8>()
-    private var servoWheelPollIDs = Set<UInt8>()
-    private var servoPollTimer: Timer?
-    private let servoPollInterval: TimeInterval = 0.35
-    private let servoSettledTolerance: UInt16 = 12
+    private(set) var latestServoIDs: [UInt8] = []
+    /// Latest pushed position per servo (updated by telemetry frames)
+    private(set) var latestServoPositions: [UInt8: UInt16] = [:]
     
     /// Number of active motors reported by the ESP32 (2 or 4, default 4)
     private(set) var motorCount: Int = 4
@@ -191,6 +234,7 @@ class ESP32BLEManager: NSObject {
     func addServoListObserver(_ observer: @escaping ([UInt8]) -> Void) -> UUID {
         let id = UUID()
         servoListObservers[id] = observer
+        observer(latestServoIDs)
         return id
     }
 
@@ -201,9 +245,25 @@ class ESP32BLEManager: NSObject {
         return id
     }
 
+    @discardableResult
+    func addServoPositionsObserver(_ observer: @escaping ([UInt8: UInt16]) -> Void) -> UUID {
+        let id = UUID()
+        servoPositionsObservers[id] = observer
+        return id
+    }
+
+    @discardableResult
+    func addServoAxisStatusObserver(_ observer: @escaping (ServoAxisStatus) -> Void) -> UUID {
+        let id = UUID()
+        servoAxisStatusObservers[id] = observer
+        return id
+    }
+
     func removeServoObserver(_ id: UUID) {
         servoListObservers.removeValue(forKey: id)
         servoStateObservers.removeValue(forKey: id)
+        servoPositionsObservers.removeValue(forKey: id)
+        servoAxisStatusObservers.removeValue(forKey: id)
     }
     
     /// Stop scanning
@@ -370,7 +430,6 @@ class ESP32BLEManager: NSObject {
     func moveServo(id: UInt8, position: UInt16, speed: UInt16) {
         let clampedPosition = min(position, 4095)
         let clampedSpeed = min(speed, 4095)
-        trackServoMotion(id: id, target: clampedPosition)
         writeServoCommand([
             0x01,
             id,
@@ -384,7 +443,6 @@ class ESP32BLEManager: NSObject {
     func moveDiscoveredServos(position: UInt16, speed: UInt16, acceleration: UInt8 = 50) {
         let clampedPosition = min(position, 4095)
         let clampedSpeed = min(speed, 4095)
-        latestServoIDs.forEach { trackServoMotion(id: $0, target: clampedPosition) }
         writeServoCommand([
             0x07,
             UInt8(clampedPosition & 0xFF),
@@ -396,13 +454,6 @@ class ESP32BLEManager: NSObject {
     }
 
     func setServoTorque(id: UInt8, enabled: Bool) {
-        if enabled {
-            servoTorqueOffPollIDs.remove(id)
-        } else {
-            servoTorqueOffPollIDs.insert(id)
-            servoMotionTargets.removeValue(forKey: id)
-        }
-        updateServoPollTimer()
         writeServoCommand([0x02, id, enabled ? 1 : 0, 0, 0, 0])
     }
 
@@ -414,18 +465,12 @@ class ESP32BLEManager: NSObject {
         writeServoCommand([0x03, currentID, newID, 0, 0, 0])
     }
 
-    func calibrateServoZero(id: UInt8) {
+    func calibrateServoCenter(id: UInt8) {
         writeServoCommand([0x08, id, 0, 0, 0, 0])
     }
 
     func driveServoWheel(id: UInt8, speed: Int16, acceleration: UInt8 = 50) {
         let clampedSpeed = max(Int16(-4095), min(Int16(4095), speed))
-        if clampedSpeed == 0 {
-            servoWheelPollIDs.remove(id)
-        } else {
-            servoWheelPollIDs.insert(id)
-        }
-        updateServoPollTimer()
         let rawSpeed = UInt16(bitPattern: clampedSpeed)
         writeServoCommand([
             0x09,
@@ -438,14 +483,78 @@ class ESP32BLEManager: NSObject {
     }
 
     func setServoPositionMode(id: UInt8) {
-        servoWheelPollIDs.remove(id)
-        updateServoPollTimer()
         writeServoCommand([0x0A, id, 0, 0, 0, 0])
     }
 
     func refreshServoState(id: UInt8) {
         pendingServoStateReadIDs.append(id)
         writeServoCommand([0x05, id, 0, 0, 0, 0])
+    }
+
+    // MARK: - Multi-turn axis control
+    //
+    // Software multi-turn tracking on the firmware: positions span many
+    // revolutions. Marks and turn counts are RAM-only on the ESP32 (reset on reboot).
+
+    /// Start (or refresh) multi-turn tracking at the current position.
+    func trackServoAxis(id: UInt8) {
+        writeServoCommand([0x0B, id, 0, 0, 0, 0])
+    }
+
+    /// Relative multi-turn move by signed degrees (may span revolutions).
+    func jogServo(id: UInt8, degrees: Double) {
+        let decideg = Int32((degrees * 10).rounded())
+        let b = withUnsafeBytes(of: decideg.littleEndian) { Array($0) }
+        writeServoCommand([0x0C, id, b[0], b[1], b[2], b[3]])
+    }
+
+    /// Continuous jog until `stopServoMotion` or a marked travel limit.
+    /// Speed 0 uses the firmware default.
+    func beginServoJog(id: UInt8, direction: ServoJogDirection, speed: UInt16 = 0) {
+        let clampedSpeed = min(speed, 3000)
+        writeServoCommand([
+            0x12,
+            id,
+            UInt8(bitPattern: direction.rawValue),
+            UInt8(clampedSpeed & 0xFF),
+            UInt8(clampedSpeed >> 8),
+            0,
+        ])
+    }
+
+    /// Abort any multi-turn move or continuous jog.
+    func stopServoMotion(id: UInt8) {
+        writeServoCommand([0x11, id, 0, 0, 0, 0])
+    }
+
+    /// Mark the current physical position as a travel endpoint.
+    func markServoTravel(id: UInt8, _ mark: ServoTravelMark) {
+        writeServoCommand([0x0D, id, mark.rawValue, 0, 0, 0])
+    }
+
+    /// Go to a percent (0–100) of the marked travel range.
+    func moveServoToPercent(id: UInt8, percent: Double, speed: UInt16 = 0) {
+        let pctX10 = UInt16(min(1000, max(0, Int((percent * 10).rounded()))))
+        writeServoCommand([
+            0x0F,
+            id,
+            UInt8(pctX10 & 0xFF),
+            UInt8(pctX10 >> 8),
+            UInt8(speed & 0xFF),
+            UInt8(speed >> 8),
+        ])
+    }
+
+    /// Go to a signed angle in degrees relative to hardware center.
+    func moveServoToAngle(id: UInt8, degrees: Double) {
+        let decideg = Int32((degrees * 10).rounded())
+        let b = withUnsafeBytes(of: decideg.littleEndian) { Array($0) }
+        writeServoCommand([0x10, id, b[0], b[1], b[2], b[3]])
+    }
+
+    /// Request a fresh multi-turn status push (telemetry frame 0x02).
+    func refreshServoAxisStatus(id: UInt8) {
+        writeServoCommand([0x13, id, 0, 0, 0, 0])
     }
 
     func readServoList() {
@@ -463,52 +572,68 @@ class ESP32BLEManager: NSObject {
         p.writeValue(Data(bytes), for: char, type: .withResponse)
     }
 
-    private func trackServoMotion(id: UInt8, target: UInt16) {
-        servoMotionTargets[id] = target
-        updateServoPollTimer()
+    // MARK: - Telemetry frame parsing
+
+    private func handleServoStateFrame(_ data: Data) {
+        guard data.count >= 8 else { return }
+        let state = ServoState(
+            id: data[0],
+            error: data[1],
+            position: UInt16(data[2]) | (UInt16(data[3]) << 8),
+            load: UInt16(data[4]) | (UInt16(data[5]) << 8),
+            voltage: data[6],
+            temperature: data[7],
+            torqueEnabled: data[1] != 0xFF && data.count >= 9 && data[8] <= 1 ? data[8] == 1 : nil
+        )
+        onServoStateUpdated?(state)
+        servoStateObservers.values.forEach { $0(state) }
     }
 
-    private func updateServoMotion(from state: ServoState) {
-        if !state.isReadFailure, let target = servoMotionTargets[state.id] {
-            let delta = abs(Int(state.position) - Int(target))
-            if delta <= Int(servoSettledTolerance) {
-                servoMotionTargets.removeValue(forKey: state.id)
+    private func handleTelemetryFrame(_ data: Data) {
+        guard let frameType = data.first else { return }
+        switch frameType {
+        case 0x01:
+            guard data.count >= 2 else { return }
+            let count = Int(data[1])
+            var updates: [UInt8: UInt16] = [:]
+            for i in 0..<count {
+                let o = 2 + i * 3
+                guard o + 2 < data.count else { break }
+                let id = data[o]
+                guard id != 0 else { continue }
+                updates[id] = UInt16(data[o + 1]) | (UInt16(data[o + 2]) << 8)
             }
-        }
-        updateServoPollTimer()
-    }
-
-    private func updateServoPollTimer() {
-        let ids = servoIDsNeedingPolling()
-        if ids.isEmpty {
-            stopServoPolling()
-        } else {
-            startServoPolling()
-        }
-    }
-
-    private func servoIDsNeedingPolling() -> [UInt8] {
-        Array(Set(servoMotionTargets.keys).union(servoTorqueOffPollIDs).union(servoWheelPollIDs)).sorted()
-    }
-
-    private func startServoPolling() {
-        guard servoPollTimer == nil else { return }
-        pollTrackedServoStates()
-        servoPollTimer = Timer.scheduledTimer(withTimeInterval: servoPollInterval, repeats: true) { [weak self] _ in
-            self?.pollTrackedServoStates()
-        }
-    }
-
-    private func stopServoPolling() {
-        servoPollTimer?.invalidate()
-        servoPollTimer = nil
-    }
-
-    private func pollTrackedServoStates() {
-        servoIDsNeedingPolling().enumerated().forEach { index, id in
-            DispatchQueue.main.asyncAfter(deadline: .now() + (Double(index) * 0.08)) { [weak self] in
-                self?.refreshServoState(id: id)
-            }
+            guard !updates.isEmpty else { return }
+            latestServoPositions.merge(updates) { _, new in new }
+            onServoPositionsUpdated?(updates)
+            servoPositionsObservers.values.forEach { $0(updates) }
+        case 0x02:
+            guard data.count >= 17 else { return }
+            let flags = data[2]
+            let cum = data.subdata(in: 3..<7).withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }.littleEndian
+            let angle = data.subdata(in: 7..<11).withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }.littleEndian
+            let pct = data.subdata(in: 11..<13).withUnsafeBytes { $0.loadUnaligned(as: Int16.self) }.littleEndian
+            let total = data.subdata(in: 13..<17).withUnsafeBytes { $0.loadUnaligned(as: Int32.self) }.littleEndian
+            let status = ServoAxisStatus(
+                id: data[1],
+                isTracked: flags & 0x01 != 0,
+                hasMin: flags & 0x02 != 0,
+                hasMax: flags & 0x04 != 0,
+                hasZero: flags & 0x08 != 0,
+                isMoving: flags & 0x10 != 0,
+                isError: flags & 0x80 != 0,
+                cumulativeTicks: cum,
+                angleDegrees: flags & 0x08 != 0 ? Double(angle) / 10.0 : nil,
+                percent: (flags & 0x06) == 0x06 ? Double(pct) / 10.0 : nil,
+                totalDegrees: Double(total) / 10.0
+            )
+            onServoAxisStatusUpdated?(status)
+            servoAxisStatusObservers.values.forEach { $0(status) }
+        case 0x03:
+            guard data.count >= 10 else { return }
+            handleServoStateFrame(data.subdata(in: 1..<10))
+        default:
+            print("[BLE] Unknown telemetry frame type 0x\(String(format: "%02X", frameType))")
         }
     }
     
@@ -592,19 +717,17 @@ class ESP32BLEManager: NSObject {
         stListChar = nil
         stCmdChar = nil
         stStateChar = nil
+        stTelemetryChar = nil
         shouldReadServoListAfterCommand = false
         pendingServoStateReadIDs.removeAll()
         latestServoIDs.removeAll()
-        servoMotionTargets.removeAll()
-        servoTorqueOffPollIDs.removeAll()
-        servoWheelPollIDs.removeAll()
+        latestServoPositions.removeAll()
         motorCount = 4
         isMotorWriteInFlight = false
         pendingMotorData = nil
         lastMotorData = nil
         stopHeartbeat()
         stopBatteryPolling()
-        stopServoPolling()
     }
 }
 
@@ -714,6 +837,8 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 stCmdChar = char
             case Self.stStateUUID:
                 stStateChar = char
+            case Self.stTelemetryUUID:
+                stTelemetryChar = char
             default: break
             }
             // Enable notifications
@@ -721,7 +846,7 @@ extension ESP32BLEManager: CBPeripheralDelegate {
                 peripheral.setNotifyValue(true, for: char)
             }
         }
-        print("[BLE] Ready — motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil), motorCount: \(motorCountChar != nil), battery: \(batteryChar != nil), stList: \(stListChar != nil), stCmd: \(stCmdChar != nil), stState: \(stStateChar != nil)")
+        print("[BLE] Ready — motors: \(motorsChar != nil), wifi: \(wifiConfigChar != nil), motorCount: \(motorCountChar != nil), battery: \(batteryChar != nil), stList: \(stListChar != nil), stCmd: \(stCmdChar != nil), stState: \(stStateChar != nil), stTelemetry: \(stTelemetryChar != nil)")
         if batteryChar != nil {
             startBatteryPolling()
         }
@@ -763,21 +888,9 @@ extension ESP32BLEManager: CBPeripheralDelegate {
             onServoListUpdated?(Array(ids))
             servoListObservers.values.forEach { $0(Array(ids)) }
         case Self.stStateUUID:
-            guard data.count >= 8 else { return }
-            let position = UInt16(data[2]) | (UInt16(data[3]) << 8)
-            let load = UInt16(data[4]) | (UInt16(data[5]) << 8)
-            let state = ServoState(
-                id: data[0],
-                error: data[1],
-                position: position,
-                load: load,
-                voltage: data[6],
-                temperature: data[7]
-            )
-            print("[BLE] ST3215 state: id=\(state.id) error=\(state.error) pos=\(state.position) load=\(state.load) voltage=\(state.voltage) temp=\(state.temperature)")
-            updateServoMotion(from: state)
-            onServoStateUpdated?(state)
-            servoStateObservers.values.forEach { $0(state) }
+            handleServoStateFrame(data)
+        case Self.stTelemetryUUID:
+            handleTelemetryFrame(data)
         default:
             break
         }

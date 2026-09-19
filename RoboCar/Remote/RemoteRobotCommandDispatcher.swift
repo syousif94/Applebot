@@ -6,8 +6,9 @@
 import Foundation
 
 enum RemoteRobotCommandDispatcher {
-    static func dispatch(_ message: RemoteMessage) {
+    static func dispatch(_ message: RemoteMessage, authorized: @escaping () -> Bool = { true }) {
         DispatchQueue.main.async {
+            guard authorized() else { return }
             switch message.type {
             case "drive":
                 if PathNavigator.shared.state != .idle {
@@ -89,9 +90,13 @@ enum RemoteRobotCommandDispatcher {
                 guard let id = message.id, let enabled = message.enabled else { return }
                 ESP32BLEManager.shared.setServoTorque(id: id, enabled: enabled)
 
-            case "calibrateServoZero":
+            case "changeServoID":
+                guard let currentID = message.from, let newID = message.to else { return }
+                ESP32BLEManager.shared.changeServoID(currentID: currentID, newID: newID)
+
+            case "calibrateServoCenter":
                 guard let id = message.id else { return }
-                ESP32BLEManager.shared.calibrateServoZero(id: id)
+                ESP32BLEManager.shared.calibrateServoCenter(id: id)
 
             case "driveServoWheel":
                 guard let id = message.id else { return }
@@ -104,6 +109,42 @@ enum RemoteRobotCommandDispatcher {
             case "refreshServoState":
                 guard let id = message.id else { return }
                 ESP32BLEManager.shared.refreshServoState(id: id)
+
+            case "trackServoAxis":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.trackServoAxis(id: id)
+
+            case "jogServo":
+                guard let id = message.id, let degrees = message.degrees else { return }
+                ESP32BLEManager.shared.jogServo(id: id, degrees: degrees)
+
+            case "beginServoJog":
+                guard let id = message.id,
+                      let rawDirection = message.direction,
+                      let direction = ServoJogDirection(rawValue: rawDirection) else { return }
+                ESP32BLEManager.shared.beginServoJog(id: id, direction: direction, speed: message.speed ?? 0)
+
+            case "stopServoMotion":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.stopServoMotion(id: id)
+
+            case "markServoTravel":
+                guard let id = message.id,
+                      let rawMark = message.mark,
+                      let mark = ServoTravelMark(rawValue: rawMark) else { return }
+                ESP32BLEManager.shared.markServoTravel(id: id, mark)
+
+            case "moveServoToPercent":
+                guard let id = message.id, let percent = message.percent else { return }
+                ESP32BLEManager.shared.moveServoToPercent(id: id, percent: percent, speed: message.speed ?? 0)
+
+            case "moveServoToAngle":
+                guard let id = message.id, let degrees = message.degrees else { return }
+                ESP32BLEManager.shared.moveServoToAngle(id: id, degrees: degrees)
+
+            case "refreshServoAxisStatus":
+                guard let id = message.id else { return }
+                ESP32BLEManager.shared.refreshServoAxisStatus(id: id)
 
             default:
                 break

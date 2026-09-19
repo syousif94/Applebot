@@ -298,6 +298,28 @@ class OccupancyGrid {
         }
         return MeshClassification(rawValue: classifications[gridX][gridY]) ?? .none
     }
+
+    /// Compute the mean world position of all cells with the given classification.
+    /// Copies each row briefly under the lock to avoid a long hold. Call from a background thread.
+    func centroid(ofClassification classification: MeshClassification) -> (x: Float, y: Float)? {
+        let target = classification.rawValue
+        var sumX: Float = 0
+        var sumY: Float = 0
+        var count: Float = 0
+        for gx in 0..<gridSize {
+            // Copy one row under a short lock
+            lock.lock()
+            let row = classifications[gx]
+            lock.unlock()
+            for gy in 0..<gridSize where row[gy] == target {
+                sumX += (Float(gx - gridRadius) + 0.5) * cellSize + originOffset.x
+                sumY += (Float(gy - gridRadius) + 0.5) * cellSize + originOffset.z
+                count += 1
+            }
+        }
+        guard count > 0 else { return nil }
+        return (sumX / count, sumY / count)
+    }
     
     /// Set the state of a cell at world coordinates
     func setState(worldX: Float, worldY: Float, state: CellState) {

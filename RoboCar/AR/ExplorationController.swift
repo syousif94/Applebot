@@ -13,10 +13,16 @@ import simd
 ///
 /// Algorithm:
 ///   1. Find frontier clusters (unknown cells adjacent to free cells)
-///   2. Pick the nearest reachable frontier
-///   3. Turn to face it, drive toward it
-///   4. Repeat until no frontiers remain (area fully mapped)
-///   5. The obstacle detector prevents collisions throughout
+///   2. For each frontier, snap its centroid to the nearest free cell —
+///      the edge waypoint that sits in explored space with no wall between
+///      it and the unknown region
+///   3. Use A* (free cells only) to build a navigable path to the edge
+///      waypoint; fall back to greedy A* (unknown cells traversable) when
+///      no strictly free path exists
+///   4. Follow each path waypoint: turn-to-face then drive
+///   5. After reaching the waypoint set, pause for LiDAR to update the
+///      map and replan from the new frontiers
+///   6. Stop when no frontiers remain or the time limit is reached
 class ExplorationController {
     
     // MARK: - Singleton
@@ -97,61 +103,56 @@ class ExplorationController {
             // Check cancellation
             try Task.checkCancellation()
             
-            // Find frontiers
+            // Find frontiers (unknown cells adjacent to free cells)
             let frontiers = grid.findFrontierClusters(maxClusters: 10, minClusterSize: 2)
-            
+
             if frontiers.isEmpty {
                 log("✅ No more frontiers — area fully mapped!")
                 break
             }
-            
-            log("🔍 Found \(frontiers.count) frontier(s), nearest has \(frontiers[0].size) cells")
-            
-            // Pick the best target — nearest one with a clear path, or just nearest
+
+            log("🔍 Found \(frontiers.count) frontier(s), largest has \(frontiers[0].size) cells")
+
             let pos = grid.devicePosition
-            var target: (x: Float, y: Float)? = nil
-            
-            for frontier in frontiers {
-                // Aim for a point slightly in front of the frontier (on the free side)
-                let dx = frontier.x - pos.x
-                let dy = frontier.y - pos.y
+            var navPath: [(x: Float, y: Float)] = []
+            var navTarget: (x: Float, y: Float)? = nil
+
+            // Try each frontier (sorted nearest-first by findFrontierClusters)
+            for frontier in frontiers.prefix(5) {
+                // The frontier centroid is in unknown space. Snap it to the nearest
+                // free cell — this is the edge waypoint that lies in explored,
+                // wall-free space right at the boundary of the unknown region.
+                guard let edgePoint = grid.nearestFreeWorldPoint(x: frontier.x, y: frontier.y) else { continue }
+
+                let dx = edgePoint.x - pos.x
+                let dy = edgePoint.y - pos.y
                 let dist = sqrtf(dx * dx + dy * dy)
-                
-                if dist < arrivalThreshold {
-                    // Already at this frontier — skip it, the LiDAR should be filling it in
-                    continue
+                if dist < arrivalThreshold { continue }
+
+                // Prefer a path through known free cells only
+                let strictPath = grid.findPath(fromX: pos.x, fromY: pos.y,
+                                               toX: edgePoint.x, toY: edgePoint.y)
+                if !strictPath.isEmpty {
+                    navPath = strictPath
+                    navTarget = (edgePoint.x, edgePoint.y)
+                    log("🗺️ A* path: \(strictPath.count) waypoints, \(String(format: "%.1f", dist))m to frontier edge")
+                    break
                 }
-                
-                // Target a point 0.3m before the frontier centroid (stay in free space)
-                let approachDist = max(0, dist - 0.3)
-                let targetX = pos.x + (dx / dist) * approachDist
-                let targetY = pos.y + (dy / dist) * approachDist
-                
-                if grid.isPathClear(fromX: pos.x, fromY: pos.y, toX: targetX, toY: targetY) {
-                    target = (targetX, targetY)
+
+                // Fall back: greedy path that may cross unknown cells to reach
+                // the frontier centroid directly
+                let greedyPath = grid.findPathGreedy(fromX: pos.x, fromY: pos.y,
+                                                     toX: frontier.x, toY: frontier.y)
+                if !greedyPath.isEmpty {
+                    navPath = greedyPath
+                    navTarget = (frontier.x, frontier.y)
+                    log("🗺️ Greedy path: \(greedyPath.count) waypoints toward frontier")
                     break
                 }
             }
-            
-            // If no clear-path target, just aim at the nearest frontier directly
-            if target == nil {
-                if let nearest = frontiers.first {
-                    let dx = nearest.x - pos.x
-                    let dy = nearest.y - pos.y
-                    let dist = sqrtf(dx * dx + dy * dy)
-                    if dist >= arrivalThreshold {
-                        let approachDist = max(0, dist - 0.3)
-                        target = (
-                            pos.x + (dx / dist) * approachDist,
-                            pos.y + (dy / dist) * approachDist
-                        )
-                    }
-                }
-            }
-            
-            guard let goal = target else {
-                // All frontiers are too close — scan in place
-                log("📡 Frontiers nearby, scanning…")
+
+            guard navTarget != nil else {
+                log("📡 No reachable frontier, scanning…")
                 try await performScan()
                 stuckCount += 1
                 if stuckCount >= maxStuck {
@@ -160,18 +161,30 @@ class ExplorationController {
                 }
                 continue
             }
-            
+
             stuckCount = 0
-            
-            // Turn to face the target
-            let turned = try await turnToward(x: goal.x, y: goal.y, grid: grid)
-            if turned { totalTurns += 1 }
-            
-            // Drive toward the target
-            let drove = try await driveToward(x: goal.x, y: goal.y, grid: grid)
-            if drove { totalDriveSegments += 1 }
-            
-            // Brief pause to let LiDAR update the map
+
+            // Follow each path waypoint: turn then drive
+            for waypoint in navPath {
+                try Task.checkCancellation()
+
+                // Skip waypoints we've already passed
+                let wp = grid.devicePosition
+                let wdx = waypoint.x - wp.x
+                let wdy = waypoint.y - wp.y
+                if sqrtf(wdx * wdx + wdy * wdy) < arrivalThreshold { continue }
+
+                let turned = try await turnToward(x: waypoint.x, y: waypoint.y, grid: grid)
+                if turned { totalTurns += 1 }
+
+                let drove = try await driveToward(x: waypoint.x, y: waypoint.y, grid: grid)
+                if drove { totalDriveSegments += 1 }
+
+                // Obstacle blocked this path — replan from current position
+                if ObstacleDetector.shared.obstacleDetected { break }
+            }
+
+            // Pause for LiDAR to update the map before replanning
             try await Task.sleep(for: .seconds(scanPause))
         }
         

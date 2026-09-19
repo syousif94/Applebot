@@ -4,73 +4,54 @@
 //
 
 import Foundation
-import Network
-import WebRTC
+import UIKit
 
-final class RemoteControlClientService {
+final class RemoteControlClientService: NSObject {
     var onStatusChanged: ((String) -> Void)?
     var onMessage: ((RemoteMessage) -> Void)?
-    var onVideoTrack: ((RTCVideoTrack) -> Void)?
     var onVideoFrameImage: ((UIImage) -> Void)?
     var onVideoFrameSize: ((CGSize) -> Void)?
     var onConnected: (() -> Void)?
     var onDisconnected: (() -> Void)?
 
-    private let queue = DispatchQueue(label: "com.robocar.remote.client", qos: .userInitiated)
-    private let encoder = JSONEncoder()
-    private let decoder = JSONDecoder()
-    private var connection: NWConnection?
-    private var receiveBuffer = ""
-    private var seq: UInt64 = 0
-    private var webRTCSession: RemoteControlWebRTCSession?
-    private var isTCPConnected = false
+        private let transport = RemoteControlIrohSession.shared
+        private let video = RemoteVideoCodec()
+        private var sequence: UInt64 = 0
+        var isConnected: Bool { transport.role == .controller && transport.isConnected }
 
-    var isConnected: Bool { isTCPConnected }
-
-    func connect(to endpoint: NWEndpoint) {
-        disconnect(sendStop: false)
-        let parameters = NWParameters.tcp
-        parameters.includePeerToPeer = true
-        let connection = NWConnection(to: endpoint, using: parameters)
-        self.connection = connection
-        connection.stateUpdateHandler = { [weak self, weak connection] state in
-            guard let self, connection === self.connection else { return }
-            switch state {
-            case .ready:
-                self.isTCPConnected = true
-                self.publishStatus("WebRTC signaling connected")
-                self.startWebRTC()
-                self.receive()
-                DispatchQueue.main.async { self.onConnected?() }
-            case .waiting(let error):
-                self.publishStatus("Waiting: \(error.localizedDescription)")
-            case .failed(let error):
-                self.publishStatus("Connection failed: \(error.localizedDescription)")
-                self.handleConnectionLost()
-            case .cancelled:
-                self.publishStatus("Disconnected")
-            default:
-                break
-            }
-        }
-        connection.start(queue: queue)
+    override init() {
+        super.init()
+        NotificationCenter.default.addObserver(self, selector: #selector(statusChanged), name: .remotePeersChanged, object: nil)
     }
 
-    func connect(host: String, port: UInt16 = RemoteControlProtocol.defaultPort) {
-        guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
-        connect(to: .hostPort(host: NWEndpoint.Host(host), port: nwPort))
+    func start(videoView: RemoteVideoView) {
+        transport.start(role: .controller)
+        video.view = videoView
+        video.onFrame = { [weak self] size in self?.onVideoFrameSize?(size) }
+        transport.onMessage = { [weak self] data in
+            guard let message = try? JSONDecoder().decode(RemoteMessage.self, from: data) else { return }
+            self?.onMessage?(message)
+        }
+        transport.onVideo = { [weak self] data in self?.video.display(data) }
+        transport.onConnected = { [weak self] in self?.onConnected?() }
+        transport.onDisconnected = { [weak self] in self?.video.reset(); self?.onDisconnected?() }
+        transport.onNeedsKeyframe = nil
+    }
+
+    func connect(to peer: RemotePeer) { transport.connectToPeer(peer.id) }
+
+    func connectSelectedHost() {
+        Task {
+            do {
+                _ = try await transport.ready()
+                if let id = transport.store?.selectedHostID, !transport.isConnected { transport.connectToPeer(id) }
+            } catch { onStatusChanged?(error.localizedDescription) }
+        }
     }
 
     func disconnect(sendStop: Bool = true) {
-        if sendStop {
-            send(RemoteMessage(type: "stopDrive"))
-        }
-        connection?.cancel()
-        connection = nil
-        isTCPConnected = false
-        receiveBuffer = ""
-        webRTCSession?.stop()
-        webRTCSession = nil
+        transport.disconnect()
+        video.reset()
     }
 
     func sendDrive(x: Float, y: Float) {
@@ -94,109 +75,21 @@ final class RemoteControlClientService {
         send(RemoteMessage(type: "stopNLCommand"))
     }
 
-    /// Recovers a stalled video feed without dropping the TCP connection by
-    /// rebuilding the local receiver and asking the host to send a fresh offer
-    /// (which forces a new keyframe).
     func restartVideo() {
-        queue.async { [weak self] in
-            guard let self, self.isTCPConnected else { return }
-            self.publishStatus("WebRTC restarting video")
-            self.webRTCSession?.stop()
-            self.startWebRTC()
-            self.sendSignal(RemoteMessage(type: "restartVideo"))
-        }
+        guard isConnected else { return }
+        video.reset()
+        send(RemoteMessage(type: "restartVideo"))
     }
 
     func send(_ message: RemoteMessage) {
-        guard let connection else { return }
-        queue.async { [weak self] in
-            guard let self else { return }
-            var outbound = message
-            outbound.seq = self.seq
-            outbound.ts = Date().timeIntervalSince1970
-            self.seq += 1
-            guard let data = try? self.encoder.encode(outbound) else { return }
-            var framed = data
-            framed.append(0x0A)
-            connection.send(content: framed, completion: .contentProcessed { _ in })
-        }
+        guard isConnected else { return }
+        var outbound = message
+        outbound.seq = sequence
+        outbound.ts = Date().timeIntervalSince1970
+        sequence += 1
+        guard let data = try? JSONEncoder().encode(outbound) else { return }
+        transport.sendMessage(data)
     }
 
-    private func handleConnectionLost() {
-        let wasConnected = isTCPConnected
-        disconnect(sendStop: false)
-        if wasConnected {
-            DispatchQueue.main.async { [weak self] in self?.onDisconnected?() }
-        }
-    }
-
-    private func startWebRTC() {
-        let session = RemoteControlWebRTCSession(role: .client)
-        session.onSignal = { [weak self] message in
-            self?.sendSignal(message)
-        }
-        session.onVideoTrack = { [weak self] track in
-            self?.onVideoTrack?(track)
-        }
-        session.onRemoteFrameRendered = { [weak self] size, count in
-            self?.onVideoFrameSize?(size)
-            guard count == 1 || count % 30 == 0 else { return }
-            self?.publishStatus("WebRTC received view frame #\(count) (\(Int(size.width))x\(Int(size.height)))")
-        }
-        session.onRemoteFrameImage = { [weak self] image in
-            self?.onVideoFrameImage?(image)
-        }
-        session.onStatusChanged = { [weak self] status in
-            self?.publishStatus(status)
-        }
-        webRTCSession = session
-        session.start()
-    }
-
-    private func sendSignal(_ message: RemoteMessage) {
-        queue.async { [weak self] in
-            guard let self, let connection else { return }
-            guard let data = try? self.encoder.encode(message) else { return }
-            var framed = data
-            framed.append(0x0A)
-            connection.send(content: framed, completion: .contentProcessed { _ in })
-        }
-    }
-
-    private func receive() {
-        connection?.receive(minimumIncompleteLength: 1, maximumLength: 256 * 1024) { [weak self] data, _, isComplete, error in
-            guard let self else { return }
-            if let data, !data.isEmpty, let chunk = String(data: data, encoding: .utf8) {
-                self.handle(chunk: chunk)
-            }
-            if isComplete || error != nil {
-                self.handleConnectionLost()
-                return
-            }
-            self.receive()
-        }
-    }
-
-    private func handle(chunk: String) {
-        receiveBuffer += chunk
-        while let newline = receiveBuffer.firstIndex(of: "\n") {
-            let line = String(receiveBuffer[..<newline])
-            receiveBuffer.removeSubrange(...newline)
-            guard let data = line.data(using: .utf8), let message = try? decoder.decode(RemoteMessage.self, from: data) else { continue }
-            if message.type == "webrtcSignal" {
-                webRTCSession?.handleSignal(message)
-                continue
-            }
-            DispatchQueue.main.async { [weak self] in
-                self?.onMessage?(message)
-            }
-        }
-    }
-
-    private func publishStatus(_ status: String) {
-        print("[RemoteClient] \(status)")
-        DispatchQueue.main.async { [weak self] in
-            self?.onStatusChanged?(status)
-        }
-    }
+    @objc private func statusChanged() { onStatusChanged?(transport.status) }
 }

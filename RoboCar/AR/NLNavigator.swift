@@ -11,6 +11,29 @@ import UIKit
 
 // MARK: - Navigation Tools
 
+/// Saves a discovered object/place to the shared landmark store.
+struct StoreLandmarkTool: Tool {
+    let name = "storeLandmark"
+    let description = "Save a named object or place at its world coordinates so it can be navigated to later by name (e.g. 'fridge', 'couch', 'front door')."
+
+    @Generable
+    struct Arguments {
+        @Guide(description: "Name of the object or place (e.g. 'fridge', 'couch', 'front door')")
+        var name: String
+
+        @Guide(description: "World X coordinate of the object in meters")
+        var x: Double
+
+        @Guide(description: "World Y coordinate of the object in meters")
+        var y: Double
+    }
+
+    func call(arguments: Arguments) async throws -> String {
+        SceneLandmarkStore.shared.add(name: arguments.name, x: Float(arguments.x), y: Float(arguments.y))
+        return "Stored '\(arguments.name)' at (\(String(format: "%.1f", arguments.x)), \(String(format: "%.1f", arguments.y)))."
+    }
+}
+
 /// Moves the robot toward a world coordinate chosen by the model.
 struct NavigateToGridPointTool: Tool {
     let name = "navigateToGridPoint"
@@ -114,7 +137,7 @@ final class NLNavigator {
 
     private func runLoop(goal: String) async {
         let session = LanguageModelSession(
-            tools: [NavigateToGridPointTool(), DeclareArrivedTool()],
+            tools: [NavigateToGridPointTool(), DeclareArrivedTool(), StoreLandmarkTool()],
             instructions: """
             You are the navigation brain of a robotic car equipped with a LiDAR/camera iPhone. \
             Your job is to navigate the car to the described destination by issuing a series of \
@@ -124,14 +147,18 @@ final class NLNavigator {
             - The navigation goal (natural language description)
             - Your current world position (x, y in meters) and heading (degrees, 0 = +Y, 90 = +X)
             - A summary of the occupancy grid near you
+            - Known landmarks already mapped in the scene
             - The current camera view labeled "camera"
 
             Rules:
             - Call navigateToGridPoint with a point 1–3 meters ahead, in the direction of the goal.
             - Use the camera image to identify the destination (furniture, doors, rooms, etc.).
+            - If a known landmark matches the goal, navigate toward its stored coordinates.
+            - When you can clearly identify an object (fridge, couch, door, etc.) call storeLandmark \
+              with its approximate world coordinates so it can be reused later.
             - After each move you will be re-evaluated with a fresh camera image.
-            - When the camera view shows you are at the destination, call declareArrived.
-            - If unsure, make a reasonable forward progress toward where you think the goal is.
+            - When the camera view confirms you are at or very near the destination, call declareArrived.
+            - If unsure, make reasonable forward progress toward where you think the goal is.
             """
         )
 
@@ -144,12 +171,14 @@ final class NLNavigator {
             let gridDesc = buildGridDescription(grid: grid)
             let cameraImage = captureCurrentCameraFrame()
 
+            let landmarks = SceneLandmarkStore.shared.summary()
             let promptText = """
             Goal: \(goal)
             Step: \(step + 1) of \(maxSteps)
             Position: x=\(String(format: "%.2f", pos.x))m, y=\(String(format: "%.2f", pos.y))m
             Heading: \(String(format: "%.0f", pos.heading * 180 / .pi))°
             \(gridDesc)
+            Known landmarks: \(landmarks)
 
             Look at the camera image and decide your next navigation action.
             """

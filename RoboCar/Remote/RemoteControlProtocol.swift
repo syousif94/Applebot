@@ -5,11 +5,6 @@
 
 import Foundation
 
-enum RemoteControlProtocol {
-    static let serviceType = "_robocar-remote._tcp"
-    static let defaultPort: UInt16 = 8787
-}
-
 struct RemotePoint: Codable {
     let x: Float
     let y: Float
@@ -75,6 +70,7 @@ struct RemoteServoState: Codable {
     let load: UInt16
     let voltage: UInt8
     let temperature: UInt8
+    let torqueEnabled: Bool?
 
     init(_ state: ServoState) {
         id = state.id
@@ -83,6 +79,62 @@ struct RemoteServoState: Codable {
         load = state.load
         voltage = state.voltage
         temperature = state.temperature
+        torqueEnabled = state.torqueEnabled
+    }
+
+    var asServoState: ServoState {
+        ServoState(id: id, error: error, position: position, load: load, voltage: voltage, temperature: temperature, torqueEnabled: torqueEnabled)
+    }
+}
+
+/// A single live servo position sample (host → controller).
+struct RemoteServoPosition: Codable {
+    let id: UInt8
+    let position: UInt16
+}
+
+/// Multi-turn axis status mirror of `ServoAxisStatus` (host → controller).
+struct RemoteServoAxisStatus: Codable {
+    let id: UInt8
+    let isTracked: Bool
+    let hasMin: Bool
+    let hasMax: Bool
+    let hasZero: Bool
+    let isMoving: Bool
+    let isError: Bool
+    let cumulativeTicks: Int32
+    let angleDegrees: Double?
+    let percent: Double?
+    let totalDegrees: Double
+
+    init(_ status: ServoAxisStatus) {
+        id = status.id
+        isTracked = status.isTracked
+        hasMin = status.hasMin
+        hasMax = status.hasMax
+        hasZero = status.hasZero
+        isMoving = status.isMoving
+        isError = status.isError
+        cumulativeTicks = status.cumulativeTicks
+        angleDegrees = status.angleDegrees
+        percent = status.percent
+        totalDegrees = status.totalDegrees
+    }
+
+    var asServoAxisStatus: ServoAxisStatus {
+        ServoAxisStatus(
+            id: id,
+            isTracked: isTracked,
+            hasMin: hasMin,
+            hasMax: hasMax,
+            hasZero: hasZero,
+            isMoving: isMoving,
+            isError: isError,
+            cumulativeTicks: cumulativeTicks,
+            angleDegrees: angleDegrees,
+            percent: percent,
+            totalDegrees: totalDegrees
+        )
     }
 }
 
@@ -104,6 +156,10 @@ struct RemoteMessage: Codable {
     var message: String?
     var servoIDs: [UInt8]?
     var servoState: RemoteServoState?
+    /// Live servo positions streamed from the robot (host → controller).
+    var servoPositions: [RemoteServoPosition]?
+    /// Multi-turn axis status pushed from the robot (host → controller).
+    var servoAxisStatus: RemoteServoAxisStatus?
     var id: UInt8?
     var from: UInt8?
     var to: UInt8?
@@ -112,6 +168,14 @@ struct RemoteMessage: Codable {
     var wheelSpeed: Int16?
     var acceleration: UInt8?
     var enabled: Bool?
+    /// Jog/goto angle in degrees (controller → host).
+    var degrees: Double?
+    /// Jog direction: -1 counterclockwise, 1 clockwise (controller → host).
+    var direction: Int8?
+    /// Travel percent 0-100 (controller → host).
+    var percent: Double?
+    /// Travel mark: 0 = min, 1 = max (controller → host).
+    var mark: UInt8?
     var signalType: String?
     var sdp: String?
     var candidate: String?

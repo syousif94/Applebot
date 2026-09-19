@@ -4,23 +4,70 @@
 //
 //  Persists named people as OSNet ReID embeddings on disk so the robot can
 //  recognise and follow a person by name across app launches. A person is
-//  named by tapping their bounding box and entering a name; their current
-//  embedding is stored. Matching uses cosine similarity (embeddings are
-//  L2-normalised, so a dot product suffices).
+//  named by tapping their bounding box and entering a name; their appearance
+//  is stored as a gallery of up to maxGallerySize embeddings. Matching uses
+//  the maximum cosine similarity across the gallery so pose/lighting variation
+//  is covered by multiple samples rather than a single averaged embedding.
 //
 
 import Foundation
 
-/// A single saved person: a stable identity name plus one or more ReID
-/// embeddings captured over time (averaged for robustness).
+/// A single saved person: a stable identity name plus a gallery of ReID
+/// embeddings captured over time. Matching takes the max similarity across
+/// all gallery entries.
 struct NamedPerson: Codable {
     var name: String
-    /// L2-normalised 512-dim OSNet embedding representing this person.
-    var embedding: [Float]
-    /// When this entry was created.
+    /// Gallery of L2-normalised 512-dim OSNet embeddings (newest at the end).
+    var embeddings: [[Float]]
     var createdAt: Date
-    /// When the embedding was last refreshed.
     var updatedAt: Date
+
+    static let maxGallerySize = 8
+
+    mutating func addEmbedding(_ embedding: [Float]) {
+        embeddings.append(embedding)
+        if embeddings.count > Self.maxGallerySize {
+            embeddings.removeFirst()
+        }
+    }
+
+    func bestSimilarity(to query: [Float]) -> Float {
+        embeddings.map { NamedPersonStore.cosineSimilarity($0, query) }.max() ?? 0
+    }
+
+    // Backward-compat decoder: old format stored a single `embedding` key.
+    enum CodingKeys: String, CodingKey {
+        case name, embeddings, embedding, createdAt, updatedAt
+    }
+
+    init(name: String, embeddings: [[Float]], createdAt: Date, updatedAt: Date) {
+        self.name = name
+        self.embeddings = embeddings
+        self.createdAt = createdAt
+        self.updatedAt = updatedAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        name = try c.decode(String.self, forKey: .name)
+        createdAt = try c.decode(Date.self, forKey: .createdAt)
+        updatedAt = try c.decode(Date.self, forKey: .updatedAt)
+        if let embs = try? c.decode([[Float]].self, forKey: .embeddings), !embs.isEmpty {
+            embeddings = embs
+        } else if let emb = try? c.decode([Float].self, forKey: .embedding), !emb.isEmpty {
+            embeddings = [emb]
+        } else {
+            embeddings = []
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.container(keyedBy: CodingKeys.self)
+        try c.encode(name, forKey: .name)
+        try c.encode(embeddings, forKey: .embeddings)
+        try c.encode(createdAt, forKey: .createdAt)
+        try c.encode(updatedAt, forKey: .updatedAt)
+    }
 }
 
 /// Disk-backed store of named people. Thread-safe via a serial queue.
@@ -29,7 +76,7 @@ final class NamedPersonStore {
     static let shared = NamedPersonStore()
 
     /// Minimum cosine similarity required to consider an embedding a match.
-    var matchThreshold: Float = 0.55
+    var matchThreshold: Float = 0.60
 
     private let queue = DispatchQueue(label: "com.robocar.namedpersonstore")
     private var people: [NamedPerson] = []
@@ -52,7 +99,7 @@ final class NamedPersonStore {
         queue.sync { people }
     }
 
-    /// Returns the saved name whose stored embedding best matches `embedding`,
+    /// Returns the saved name whose gallery best matches `embedding`,
     /// or `nil` if no entry exceeds `matchThreshold`.
     func name(matching embedding: [Float]) -> String? {
         bestMatch(for: embedding)?.name
@@ -63,7 +110,7 @@ final class NamedPersonStore {
         queue.sync {
             var best: (name: String, similarity: Float)?
             for person in people {
-                let sim = Self.cosineSimilarity(person.embedding, embedding)
+                let sim = person.bestSimilarity(to: embedding)
                 if sim >= matchThreshold && (best == nil || sim > best!.similarity) {
                     best = (person.name, sim)
                 }
@@ -72,19 +119,20 @@ final class NamedPersonStore {
         }
     }
 
-    /// Saves or renames a person. If a person with `name` already exists, their
-    /// embedding is refreshed; otherwise a new entry is created.
+    /// Saves or updates a person. If a person with `name` already exists, the new
+    /// embedding is added to their gallery (up to maxGallerySize); otherwise a new
+    /// entry is created.
     func save(name: String, embedding: [Float]) {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, !embedding.isEmpty else { return }
         queue.sync {
             let now = Date()
             if let idx = people.firstIndex(where: { $0.name.caseInsensitiveCompare(trimmed) == .orderedSame }) {
-                people[idx].embedding = embedding
+                people[idx].addEmbedding(embedding)
                 people[idx].name = trimmed
                 people[idx].updatedAt = now
             } else {
-                people.append(NamedPerson(name: trimmed, embedding: embedding, createdAt: now, updatedAt: now))
+                people.append(NamedPerson(name: trimmed, embeddings: [embedding], createdAt: now, updatedAt: now))
             }
             persist()
         }
@@ -98,10 +146,24 @@ final class NamedPersonStore {
         }
     }
 
-    /// Returns the stored embedding for a named person, if any.
+    /// Returns a representative (centroid) embedding for a named person, or `nil`
+    /// if no entry exists. Callers that need a single vector for further matching
+    /// should prefer `bestMatch(for:)` directly.
     func embedding(forName name: String) -> [Float]? {
         queue.sync {
-            people.first { $0.name.caseInsensitiveCompare(name) == .orderedSame }?.embedding
+            guard let person = people.first(where: { $0.name.caseInsensitiveCompare(name) == .orderedSame }),
+                  !person.embeddings.isEmpty else { return nil }
+            let dim = person.embeddings[0].count
+            guard dim > 0 else { return nil }
+            var centroid = [Float](repeating: 0, count: dim)
+            for emb in person.embeddings {
+                for i in 0..<dim { centroid[i] += emb[i] }
+            }
+            let n = Float(person.embeddings.count)
+            centroid = centroid.map { $0 / n }
+            let norm = sqrtf(centroid.reduce(0) { $0 + $1 * $1 })
+            if norm > 1e-6 { centroid = centroid.map { $0 / norm } }
+            return centroid
         }
     }
 

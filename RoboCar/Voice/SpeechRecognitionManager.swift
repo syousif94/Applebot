@@ -124,6 +124,7 @@ class SpeechRecognitionManager: NSObject {
         } catch {
             print("[Speech] Failed to start recognition: \(error)")
             status = .idle
+            stopRecognition()
         }
     }
     
@@ -147,6 +148,12 @@ class SpeechRecognitionManager: NSObject {
         try audioSession.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker, .allowBluetooth])
         try audioSession.setActive(true, options: .notifyOthersOnDeactivation)
         
+        let inputNode = audioEngine.inputNode
+        let recordingFormat = inputNode.inputFormat(forBus: 0)
+        guard recordingFormat.sampleRate > 0, recordingFormat.channelCount > 0 else {
+            throw NSError(domain: "SpeechRecognition", code: -2, userInfo: [NSLocalizedDescriptionKey: "Microphone input is unavailable"])
+        }
+
         recognitionRequest = SFSpeechAudioBufferRecognitionRequest()
         guard let recognitionRequest = recognitionRequest else {
             throw NSError(domain: "SpeechRecognition", code: -1, userInfo: [NSLocalizedDescriptionKey: "Could not create recognition request"])
@@ -175,9 +182,6 @@ class SpeechRecognitionManager: NSObject {
                 }
             }
         }
-        
-        let inputNode = audioEngine.inputNode
-        let recordingFormat = inputNode.outputFormat(forBus: 0)
         
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: recordingFormat) { [weak self] buffer, _ in
             self?.recognitionRequest?.append(buffer)
@@ -264,6 +268,7 @@ class SpeechRecognitionManager: NSObject {
             } catch {
                 print("[Speech] Failed to restart: \(error)")
                 self.status = .idle
+                self.stopRecognition()
             }
         }
     }

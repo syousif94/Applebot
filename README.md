@@ -2,6 +2,14 @@
 
 RoboCar is an iOS app that turns an iPhone with LiDAR into the brain of a small robot car. The phone mounts on the car facing backward, connects to an ESP32 motor controller over BLE, and uses ARKit scene reconstruction to build a real-time occupancy grid of the environment. Users can tap a point on the map to navigate there autonomously, or let the car explore on its own.
 
+## Native Controller Connections
+
+Scanning an active pairing QR remembers the peer by its Iroh public identity, not its name. The controller connects after pairing and saves the last successfully connected robot in device-local Keychain storage. Startup and foreground entry resume that connection; offline and busy robots are retried indefinitely with backoff capped at 15 seconds and bounded dial attempts. iOS suspends networking in the background. Local disconnect, deletion, and rejected/revoked pairing stop retries.
+
+Open Paired Devices and use the trash button or swipe Remove Pairing to delete a remembered device. Deleting the reconnect target also cancels its pending connection attempts and clears the saved target.
+
+Device labels use `UIDevice.current.name` and refresh on authenticated reconnection. On iOS 16 and later, obtaining the system-given name requires Apple's `com.apple.developer.device-information.user-assigned-device-name` entitlement. Both entitlement files request it. Request approval at https://developer.apple.com/contact/request/user-assigned-device-name/ and regenerate the provisioning profiles before signing. Without approval, signing can fail or the system can return a generic name. RoboCar does not substitute a custom app nickname.
+
 ## Architecture Overview
 
 ```

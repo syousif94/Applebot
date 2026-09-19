@@ -19,8 +19,8 @@ class LiDARViewController: UIViewController {
     private var arView: ARView!
     private var gridMapView: GridMapView!
     private var statusLabel: UILabel!
+    private let lidarUnavailableView = UIStackView()
     private var positionLabel: UILabel!
-    private var resetButton: UIButton!
     private var settingsButton: UIButton!
     private var micButton: UIButton!
     private var voiceStatusLabel: UILabel!
@@ -104,8 +104,12 @@ class LiDARViewController: UIViewController {
 
     /// Always-on person detection results with stable ReID-based IDs
     private var alwaysOnPersonBoxes: [PersonBoxInfo] = []
-    /// Known person embeddings keyed by stable UUID
-    private var knownPersonEmbeddings: [UUID: [Float]] = [:]
+    /// Gallery of appearance embeddings per stable UUID (up to alwaysOnGalleryMaxSize diverse samples)
+    private var knownPersonGalleries: [UUID: [[Float]]] = [:]
+    /// Names explicitly assigned this session, keyed by stable UUID. Takes priority over
+    /// NamedPersonStore embedding lookups so a name set by the user is never clobbered
+    /// by a scan cycle that produces a slightly different embedding.
+    private var knownPersonNames: [UUID: String] = [:]
     /// Last always-on person bounding box keyed by stable UUID
     private var knownPersonBoundingBoxes: [UUID: CGRect] = [:]
     /// Last time each always-on person was seen
@@ -115,12 +119,13 @@ class LiDARViewController: UIViewController {
     private var knownPersonFirstSeen: [UUID: Date] = [:]
     /// Whether a background detection request is in flight
     private var personDetectionInFlight = false
-    /// ReID match threshold for always-on scanner (true cosine on normalised embeddings)
-    private let alwaysOnReidThreshold: Float = 0.5
-    /// IoU threshold for keeping an always-on ID stable across adjacent frames
-    private let alwaysOnIouThreshold: CGFloat = 0.18
+    /// IoU threshold for keeping an always-on ID stable across adjacent frames.
+    /// Higher = less likely to merge two nearby people; lower = tolerates more movement.
+    private let alwaysOnIouThreshold: CGFloat = 0.30
     /// How long to retain always-on ID memory while a person is briefly missed
     private let alwaysOnPersonMemoryTimeout: TimeInterval = 6.0
+    /// Max gallery size per person in the always-on scanner
+    private let alwaysOnGalleryMaxSize = 6
     
     /// Index of the current route waypoint being navigated to
     private var currentRouteWaypointIndex = 0
@@ -136,6 +141,9 @@ class LiDARViewController: UIViewController {
     private var isRemoteSnapshotInFlight = false
     private var remoteServoListObserverID: UUID?
     private var remoteServoStateObserverID: UUID?
+    private var remoteServoPositionsObserverID: UUID?
+    private var remoteServoAxisStatusObserverID: UUID?
+    private var lastRemoteServoPositionsBroadcast = Date.distantPast
 
     // MARK: - Compass
     private let locationManager = CLLocationManager()
@@ -150,7 +158,7 @@ class LiDARViewController: UIViewController {
         setupARView()
         setupGridMapView()
         setupStatusLabels()
-        setupResetButton()
+        setupLiDARUnavailableView()
         setupSettingsButton()
         setupMicButton()
         setupVoiceAssistant()
@@ -188,6 +196,10 @@ class LiDARViewController: UIViewController {
     
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
+        if presentedViewController != nil {
+            ESP32BLEManager.shared.stopAll()
+            return
+        }
         UIApplication.shared.isIdleTimerDisabled = false
         arView.session.pause()
         displayLink?.invalidate()
@@ -261,6 +273,16 @@ class LiDARViewController: UIViewController {
         remoteServoStateObserverID = ESP32BLEManager.shared.addServoStateObserver { state in
             RemoteControlHostService.shared.broadcastServoState(state)
         }
+        remoteServoPositionsObserverID = ESP32BLEManager.shared.addServoPositionsObserver { [weak self] _ in
+            guard let self else { return }
+            let now = Date()
+            guard now.timeIntervalSince(self.lastRemoteServoPositionsBroadcast) >= 0.2 else { return }
+            self.lastRemoteServoPositionsBroadcast = now
+            RemoteControlHostService.shared.broadcastServoPositions(ESP32BLEManager.shared.latestServoPositions)
+        }
+        remoteServoAxisStatusObserverID = ESP32BLEManager.shared.addServoAxisStatusObserver { status in
+            RemoteControlHostService.shared.broadcastServoAxisStatus(status)
+        }
     }
 
     private func setupNLNavigator() {
@@ -277,6 +299,8 @@ class LiDARViewController: UIViewController {
             }
         }
     }
+
+    private let controllerConnectionLabel = UILabel()
 
     private func setupStatusLabels() {
         // Status label (top left)
@@ -317,24 +341,88 @@ class LiDARViewController: UIViewController {
             positionLabel.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 8),
             positionLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -12)
         ])
+
+        controllerConnectionLabel.translatesAutoresizingMaskIntoConstraints = false
+        controllerConnectionLabel.font = .systemFont(ofSize: 12, weight: .semibold)
+        controllerConnectionLabel.textColor = .systemGreen
+        controllerConnectionLabel.textAlignment = .right
+        controllerConnectionLabel.numberOfLines = 2
+        controllerConnectionLabel.lineBreakMode = .byTruncatingTail
+        controllerConnectionLabel.layer.shadowColor = UIColor.black.cgColor
+        controllerConnectionLabel.layer.shadowOffset = .zero
+        controllerConnectionLabel.layer.shadowRadius = 2
+        controllerConnectionLabel.layer.shadowOpacity = 1
+        view.addSubview(controllerConnectionLabel)
+        NSLayoutConstraint.activate([
+            controllerConnectionLabel.topAnchor.constraint(equalTo: positionLabel.bottomAnchor, constant: 8),
+            controllerConnectionLabel.trailingAnchor.constraint(equalTo: positionLabel.trailingAnchor),
+            controllerConnectionLabel.widthAnchor.constraint(lessThanOrEqualTo: view.widthAnchor, multiplier: 0.45)
+        ])
+        NotificationCenter.default.addObserver(self, selector: #selector(updateControllerConnectionLabel), name: .remotePeersChanged, object: nil)
+        updateControllerConnectionLabel()
+    }
+
+    @objc private func updateControllerConnectionLabel() {
+        let peer = RemoteControlIrohSession.shared.connectedPeer
+        controllerConnectionLabel.text = peer.map { "Controller connected: \($0.name)" }
+        controllerConnectionLabel.isHidden = peer == nil
     }
     
-    private func setupResetButton() {
-        resetButton = UIButton(type: .system)
-        resetButton.translatesAutoresizingMaskIntoConstraints = false
-        let resetConfig = UIImage.SymbolConfiguration(pointSize: 18, weight: .bold)
-        resetButton.setImage(UIImage(systemName: "xmark", withConfiguration: resetConfig), for: .normal)
-        resetButton.tintColor = .white
-        resetButton.backgroundColor = UIColor(red: 0.8, green: 0.2, blue: 0.2, alpha: 0.9)
-        resetButton.layer.cornerRadius = 22
-        resetButton.addTarget(self, action: #selector(resetButtonTapped), for: .touchUpInside)
-        // Added to the bottom glass control bar in setupBottomControlBar()
+    private func setupLiDARUnavailableView() {
+        let symbol = UIImageView(image: UIImage(
+            systemName: "viewfinder",
+            withConfiguration: UIImage.SymbolConfiguration(pointSize: 44, weight: .light)
+        ))
+        symbol.tintColor = UIColor.white.withAlphaComponent(0.65)
+        symbol.contentMode = .scaleAspectFit
+        symbol.isAccessibilityElement = false
+
+        let title = UILabel()
+        title.text = "LiDAR not available"
+        #if targetEnvironment(macCatalyst)
+        title.font = UIFontMetrics.default.scaledFont(for: .systemFont(ofSize: 20))
+        #else
+        title.font = .preferredFont(forTextStyle: .title3)
+        #endif
+        title.adjustsFontForContentSizeCategory = true
+        title.textColor = .white
+        title.textAlignment = .center
+        title.numberOfLines = 0
+
+        let detail = UILabel()
+        detail.text = "This device doesn't support LiDAR scanning."
+        #if targetEnvironment(macCatalyst)
+        detail.font = UIFontMetrics.default.scaledFont(for: .systemFont(ofSize: 15))
+        #else
+        detail.font = .preferredFont(forTextStyle: .subheadline)
+        #endif
+        detail.adjustsFontForContentSizeCategory = true
+        detail.textColor = UIColor.white.withAlphaComponent(0.6)
+        detail.textAlignment = .center
+        detail.numberOfLines = 0
+
+        lidarUnavailableView.axis = .vertical
+        lidarUnavailableView.alignment = .center
+        lidarUnavailableView.spacing = 8
+        lidarUnavailableView.addArrangedSubview(symbol)
+        lidarUnavailableView.addArrangedSubview(title)
+        lidarUnavailableView.addArrangedSubview(detail)
+        lidarUnavailableView.setCustomSpacing(20, after: symbol)
+        lidarUnavailableView.translatesAutoresizingMaskIntoConstraints = false
+        lidarUnavailableView.isUserInteractionEnabled = false
+        lidarUnavailableView.isHidden = true
+        arView.addSubview(lidarUnavailableView)
+
         NSLayoutConstraint.activate([
-            resetButton.widthAnchor.constraint(equalToConstant: 44),
-            resetButton.heightAnchor.constraint(equalToConstant: 44),
+            lidarUnavailableView.centerXAnchor.constraint(equalTo: arView.centerXAnchor),
+            lidarUnavailableView.centerYAnchor.constraint(equalTo: arView.centerYAnchor),
+            lidarUnavailableView.widthAnchor.constraint(lessThanOrEqualTo: arView.widthAnchor, constant: -48),
+            lidarUnavailableView.widthAnchor.constraint(lessThanOrEqualToConstant: 340),
+            symbol.widthAnchor.constraint(equalToConstant: 52),
+            symbol.heightAnchor.constraint(equalToConstant: 52)
         ])
     }
-    
+
     private func setupSettingsButton() {
         settingsButton = UIButton(type: .system)
         settingsButton.translatesAutoresizingMaskIntoConstraints = false
@@ -461,6 +549,17 @@ class LiDARViewController: UIViewController {
     
     @objc private func settingsButtonTapped() {
         let controlPanel = ControlPanelViewController()
+        controlPanel.onPairDevices = { [weak self, weak controlPanel] in
+            guard let controlPanel else { return }
+            self?.showRemotePairing(from: controlPanel)
+        }
+        controlPanel.onResetMap = { [weak self] in
+            self?.performReset()
+        }
+        #if targetEnvironment(macCatalyst)
+        guard let scene = view.window?.windowScene else { return }
+        PanelWindows.shared.open(.settings, from: scene) { controlPanel }
+        #else
         if let sheet = controlPanel.sheetPresentationController {
             sheet.detents = [.medium(), .large()]
             if #available(iOS 16.0, *) {
@@ -468,24 +567,22 @@ class LiDARViewController: UIViewController {
             }
             sheet.preferredCornerRadius = 20
         }
+        PanelPresentation.prepare(controlPanel)
         present(controlPanel, animated: true)
+        #endif
     }
     
-    @objc private func resetButtonTapped() {
-        let alert = UIAlertController(
-            title: "Reset Map",
-            message: "This will clear the grid and reset the starting position. Are you sure?",
-            preferredStyle: .alert
-        )
-        
-        alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
-        alert.addAction(UIAlertAction(title: "Reset", style: .destructive) { [weak self] _ in
-            self?.performReset()
+    private func showRemotePairing(from owner: UIViewController) {
+        ESP32BLEManager.shared.stopAll()
+        #if targetEnvironment(macCatalyst)
+        RemotePairingViewController.show(from: owner)
+        #else
+        RemotePairingViewController.show(from: owner, frameProvider: { [weak self] in
+            self?.arView.session.currentFrame?.capturedImage
         })
-        
-        present(alert, animated: true)
+        #endif
     }
-    
+
     private func performReset() {
         // Pause mesh processing during reset
         isResetting = true
@@ -581,10 +678,10 @@ class LiDARViewController: UIViewController {
         // bottom-bar cancel button instead.
         guard personTracker.state == .idle else { return }
         guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }) else { return }
-        let embedding = knownPersonEmbeddings[id] ?? []
+        let gallery = knownPersonGalleries[id] ?? []
         startFollowModeForPerson(
             id: id,
-            embedding: embedding,
+            gallery: gallery,
             boundingBox: box.boundingBox,
             worldPosition: box.worldPosition
         )
@@ -593,7 +690,10 @@ class LiDARViewController: UIViewController {
     /// Prompt to name or rename the tapped person, saving their current embedding.
     private func handleHostPersonRename(id: UUID) {
         guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }) else { return }
-        guard let embedding = knownPersonEmbeddings[id], !embedding.isEmpty else {
+        let gallery = knownPersonGalleries[id]
+            ?? personTracker.detectedPeople.first(where: { $0.id == id })?.gallery
+            ?? []
+        guard !gallery.isEmpty else {
             SpeechSynthesisManager.shared.speak("Can't read that person yet")
             return
         }
@@ -614,13 +714,16 @@ class LiDARViewController: UIViewController {
             guard let self = self else { return }
             let newName = alert.textFields?.first?.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             guard !newName.isEmpty else { return }
-            // If renaming, remove the old saved entry first.
             if let old = existingName, old.caseInsensitiveCompare(newName) != .orderedSame {
                 NamedPersonStore.shared.delete(name: old)
             }
-            // Use the freshest embedding available for this id.
-            let freshEmbedding = self.knownPersonEmbeddings[id] ?? embedding
-            NamedPersonStore.shared.save(name: newName, embedding: freshEmbedding)
+            // Save all gallery samples from whichever source has them
+            let latestGallery = self.knownPersonGalleries[id]
+                ?? self.personTracker.detectedPeople.first(where: { $0.id == id })?.gallery
+                ?? gallery
+            for emb in latestGallery { NamedPersonStore.shared.save(name: newName, embedding: emb) }
+            // Immediately reflect the new name in the overlay
+            self.applyNameToOverlay(id: id, name: newName)
             SpeechSynthesisManager.shared.speak("Saved \(newName)")
         })
         present(alert, animated: true)
@@ -631,6 +734,7 @@ class LiDARViewController: UIViewController {
         guard let box = personBoundingBoxOverlay.people.first(where: { $0.id == id }),
               let name = box.name else { return }
         NamedPersonStore.shared.delete(name: name)
+        evictNameFromCache(name)
         SpeechSynthesisManager.shared.speak("Removed \(name)")
     }
 
@@ -692,14 +796,39 @@ class LiDARViewController: UIViewController {
         if let old = existingName, old.caseInsensitiveCompare(name) != .orderedSame {
             NamedPersonStore.shared.delete(name: old)
         }
-        guard let embedding = knownPersonEmbeddings[id], !embedding.isEmpty else { return }
-        NamedPersonStore.shared.save(name: name, embedding: embedding)
+        // Gallery may be in always-on store or in PersonTracker depending on current state
+        let gallery = knownPersonGalleries[id]
+            ?? personTracker.detectedPeople.first(where: { $0.id == id })?.gallery
+            ?? []
+        guard !gallery.isEmpty else { return }
+        for emb in gallery { NamedPersonStore.shared.save(name: name, embedding: emb) }
+        applyNameToOverlay(id: id, name: name)
     }
 
     /// Controller asked to delete a saved person by name.
     @objc private func handleRemoteDeleteNamedPerson(_ notification: Notification) {
         guard let name = notification.userInfo?["personName"] as? String else { return }
         NamedPersonStore.shared.delete(name: name)
+        evictNameFromCache(name)
+    }
+
+    /// Immediately applies a saved name to the session cache, in-memory person boxes,
+    /// and overlay so the next broadcast reflects the new name without waiting for the
+    /// next scan cycle. The session cache ensures subsequent scan rebuilds preserve the name.
+    private func applyNameToOverlay(id: UUID, name: String) {
+        knownPersonNames[id] = name
+        for idx in alwaysOnPersonBoxes.indices where alwaysOnPersonBoxes[idx].id == id {
+            alwaysOnPersonBoxes[idx].name = name
+        }
+        for idx in personBoundingBoxOverlay.people.indices where personBoundingBoxOverlay.people[idx].id == id {
+            personBoundingBoxOverlay.people[idx].name = name
+        }
+        personBoundingBoxOverlay.setNeedsDisplay()
+    }
+
+    /// Remove a name from the session cache when the saved person is deleted.
+    private func evictNameFromCache(_ name: String) {
+        knownPersonNames = knownPersonNames.filter { $0.value.caseInsensitiveCompare(name) != .orderedSame }
     }
 
 
@@ -758,7 +887,7 @@ class LiDARViewController: UIViewController {
         ])
     }
 
-    /// Groups the overlay action buttons (settings, mic, follow, navigate, clear, reset)
+    /// Groups the overlay action buttons (mic, settings, follow, navigate, clear)
     /// into a single glass container pinned to the bottom of the screen. Individual
     /// buttons keep their existing show/hide logic via `isHidden`; the stack collapses
     /// hidden buttons so the group re-centers exactly as before.
@@ -773,12 +902,11 @@ class LiDARViewController: UIViewController {
         bottomControlsBar = container
 
         let stack = UIStackView(arrangedSubviews: [
-            settingsButton,
             micButton,
+            settingsButton,
             followButton,
             navigateButton,
-            clearWaypointsButton,
-            resetButton
+            clearWaypointsButton
         ])
         stack.translatesAutoresizingMaskIntoConstraints = false
         stack.axis = .horizontal
@@ -828,7 +956,7 @@ class LiDARViewController: UIViewController {
     // MARK: - Follow Mode
     
     /// Start follow mode for a specific person identified by the always-on scanner.
-    private func startFollowModeForPerson(id: UUID, embedding: [Float], boundingBox: CGRect, worldPosition: simd_float2?) {
+    private func startFollowModeForPerson(id: UUID, gallery: [[Float]], boundingBox: CGRect, worldPosition: simd_float2?) {
         // Stop any existing navigation
         pathNavigator.stopNavigation()
         
@@ -914,8 +1042,7 @@ class LiDARViewController: UIViewController {
             }
         }
         
-        // Activate the person directly — skip scanning since we already identified them
-        personTracker.activateExternalPerson(id: id, embedding: embedding, boundingBox: boundingBox, worldPosition: worldPosition)
+        personTracker.activateExternalPerson(id: id, gallery: gallery, boundingBox: boundingBox, worldPosition: worldPosition)
         
         // Update button to show stop icon
         updateFollowButtonAppearance(isFollowing: true)
@@ -974,8 +1101,8 @@ class LiDARViewController: UIViewController {
         guard personTracker.state == .idle else { return }
         if let box = alwaysOnPersonBoxes.first(where: {
             $0.name?.caseInsensitiveCompare(name) == .orderedSame
-        }), let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty {
-            startFollowModeForPerson(id: box.id, embedding: embedding,
+        }), let gallery = knownPersonGalleries[box.id], !gallery.isEmpty {
+            startFollowModeForPerson(id: box.id, gallery: gallery,
                                      boundingBox: box.boundingBox, worldPosition: box.worldPosition)
         } else {
             pendingFollow = .named(name)
@@ -988,8 +1115,8 @@ class LiDARViewController: UIViewController {
     private func startFollowingNearest() {
         guard personTracker.state == .idle else { return }
         if let box = nearestVisiblePersonBox(),
-           let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty {
-            startFollowModeForPerson(id: box.id, embedding: embedding,
+           let gallery = knownPersonGalleries[box.id], !gallery.isEmpty {
+            startFollowModeForPerson(id: box.id, gallery: gallery,
                                      boundingBox: box.boundingBox, worldPosition: box.worldPosition)
         } else {
             pendingFollow = .any
@@ -1039,9 +1166,9 @@ class LiDARViewController: UIViewController {
             candidate = nearestVisiblePersonBox()
         }
         guard let box = candidate,
-              let embedding = knownPersonEmbeddings[box.id], !embedding.isEmpty else { return }
+              let gallery = knownPersonGalleries[box.id], !gallery.isEmpty else { return }
         pendingFollow = nil
-        startFollowModeForPerson(id: box.id, embedding: embedding,
+        startFollowModeForPerson(id: box.id, gallery: gallery,
                                  boundingBox: box.boundingBox, worldPosition: box.worldPosition)
     }
 
@@ -1762,11 +1889,10 @@ class LiDARViewController: UIViewController {
     // MARK: - AR Session
     
     private func startARSession() {
-        guard ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) else {
-            statusLabel.text = "⚠️ LiDAR not available"
-            statusLabel.textColor = .red
-            return
-        }
+        let supportsLiDAR = ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification)
+        lidarUnavailableView.isHidden = supportsLiDAR
+        statusLabel.isHidden = !supportsLiDAR
+        guard supportsLiDAR else { return }
         
         let config = ARWorldTrackingConfiguration()
         config.sceneReconstruction = .meshWithClassification
@@ -2158,85 +2284,86 @@ class LiDARViewController: UIViewController {
                 let pixelBuffer = frame.capturedImage
                 let capturedFrame = frame
                 let tracker = self.personTracker
-                let knownEmbeddings = self.knownPersonEmbeddings
+                let knownGalleries = self.knownPersonGalleries
+                let knownNames = self.knownPersonNames
                 let knownBoxes = self.knownPersonBoundingBoxes
                 let knownLastSeen = self.knownPersonLastSeen
                 let knownFirstSeen = self.knownPersonFirstSeen
-                let threshold = self.alwaysOnReidThreshold
                 let iouThreshold = self.alwaysOnIouThreshold
                 let memoryTimeout = self.alwaysOnPersonMemoryTimeout
+                let galleryMax = self.alwaysOnGalleryMaxSize
                 DispatchQueue.global(qos: .userInitiated).async { [weak self] in
                     let request = VNDetectHumanRectanglesRequest()
                     request.revision = VNDetectHumanRectanglesRequestRevision2
                     let handler = VNImageRequestHandler(cvPixelBuffer: pixelBuffer, orientation: .right, options: [:])
                     try? handler.perform([request])
                     let observations = (request.results as? [VNHumanObservation]) ?? []
-                    
-                    // Generate embeddings and match against known people
+
                     var boxes: [PersonBoxInfo] = []
-                    var updatedEmbeddings = knownEmbeddings
+                    var updatedGalleries = knownGalleries
                     var updatedKnownBoxes = knownBoxes
                     var updatedLastSeen = knownLastSeen
                     var updatedFirstSeen = knownFirstSeen
                     var matchedKnownIDs = Set<UUID>()
+                    var newNameMappings: [UUID: String] = [:]
                     let now = Date()
                     let retainedIDs = Set(knownLastSeen.compactMap { id, lastSeen in
                         now.timeIntervalSince(lastSeen) <= memoryTimeout ? id : nil
                     })
-                    
+
                     for obs in observations {
                         let bbox = obs.boundingBox
                         let embedding = tracker.generateEmbedding(pixelBuffer: pixelBuffer, boundingBox: obs.boundingBox)
-                        
-                        // Collect every known ID this observation could belong to —
-                        // via temporal overlap (IoU) and/or appearance (ReID). If more
-                        // than one known ID matches, they are duplicate identities for
-                        // the same person and get merged so the visible ID stays stable
-                        // instead of flip-flopping between an old and a new ID.
-                        var candidateIDs = Set<UUID>()
+
+                        // IoU-only matching: prevents the false-positive identity merges
+                        // that occur when embedding similarity is unreliable. Different people
+                        // may get new UUIDs on re-entry; names persist via NamedPersonStore.
+                        var iouMatches: [(id: UUID, iou: CGFloat)] = []
                         for (knownID, knownBox) in knownBoxes where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
                             let iou = self?.computeIoU(bbox, knownBox) ?? 0
-                            if iou > iouThreshold { candidateIDs.insert(knownID) }
+                            if iou > iouThreshold { iouMatches.append((knownID, iou)) }
                         }
-                        if let embed = embedding {
-                            for (knownID, knownEmbed) in knownEmbeddings where !matchedKnownIDs.contains(knownID) && retainedIDs.contains(knownID) {
-                                let sim = tracker.cosineSimilarity(embed, knownEmbed)
-                                if sim > threshold { candidateIDs.insert(knownID) }
-                            }
-                        }
-                        
+                        iouMatches.sort { $0.iou > $1.iou }
+
                         let personID: UUID
-                        if !candidateIDs.isEmpty {
-                            // Canonical = the oldest matching identity (earliest first-seen).
-                            let canonical = candidateIDs.min { lhs, rhs in
-                                (updatedFirstSeen[lhs] ?? now) < (updatedFirstSeen[rhs] ?? now)
-                            }!
-                            personID = canonical
-                            // Merge away every other duplicate ID this person matched.
-                            for dup in candidateIDs where dup != canonical {
-                                updatedEmbeddings[dup] = nil
-                                updatedKnownBoxes[dup] = nil
-                                updatedLastSeen[dup] = nil
-                                updatedFirstSeen[dup] = nil
+                        if let best = iouMatches.first {
+                            personID = best.id
+                            matchedKnownIDs.insert(best.id)
+                            // If multiple tracked boxes overlap this detection, keep the best
+                            // and discard the rest (dedup stale duplicates only).
+                            for extra in iouMatches.dropFirst() {
+                                updatedGalleries[extra.id] = nil
+                                updatedKnownBoxes[extra.id] = nil
+                                updatedLastSeen[extra.id] = nil
+                                updatedFirstSeen[extra.id] = nil
                             }
-                            matchedKnownIDs.formUnion(candidateIDs)
                             if let embed = embedding {
-                                updatedEmbeddings[personID] = Self.blendEmbedding(updatedEmbeddings[personID], embed)
+                                var g = updatedGalleries[personID] ?? []
+                                let maxSim = g.map { PersonTracker.cosineSimilarity($0, embed) }.max() ?? 0
+                                if maxSim < 0.92 {
+                                    g.append(embed)
+                                    if g.count > galleryMax { g.removeFirst() }
+                                }
+                                updatedGalleries[personID] = g
                             }
                         } else {
-                            // New person
+                            // No spatial overlap — new or re-entering person.
                             personID = UUID()
                             updatedFirstSeen[personID] = now
-                            if let embed = embedding {
-                                updatedEmbeddings[personID] = embed
-                            }
+                            if let embed = embedding { updatedGalleries[personID] = [embed] }
                         }
                         updatedKnownBoxes[personID] = bbox
                         updatedLastSeen[personID] = now
-                        
-                        // Match this person against the saved named-people store.
-                        let savedName = embedding.flatMap { NamedPersonStore.shared.name(matching: $0) }
-                        
+
+                        // Name: session cache first (set by user this session), then
+                        // NamedPersonStore (cross-session recognition by embedding).
+                        let savedName = knownNames[personID]
+                            ?? embedding.flatMap { NamedPersonStore.shared.name(matching: $0) }
+                        if let name = savedName, knownNames[personID] == nil {
+                            // Cache newly recognised names so future cycles skip the lookup.
+                            newNameMappings[personID] = name
+                        }
+
                         boxes.append(PersonBoxInfo(
                             id: personID,
                             boundingBox: bbox,
@@ -2246,21 +2373,22 @@ class LiDARViewController: UIViewController {
                             name: savedName
                         ))
                     }
-                    
-                    // Prune embeddings for people not seen (keep for a few cycles via main thread)
+
                     let seenIDs = Set(boxes.map { $0.id })
-                    updatedEmbeddings = updatedEmbeddings.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
+                    updatedGalleries = updatedGalleries.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     updatedKnownBoxes = updatedKnownBoxes.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     updatedLastSeen = updatedLastSeen.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
                     updatedFirstSeen = updatedFirstSeen.filter { id, _ in retainedIDs.contains(id) || seenIDs.contains(id) }
-                    
+
                     DispatchQueue.main.async {
                         guard let self = self else { return }
                         self.alwaysOnPersonBoxes = boxes
-                        self.knownPersonEmbeddings = updatedEmbeddings
+                        self.knownPersonGalleries = updatedGalleries
                         self.knownPersonBoundingBoxes = updatedKnownBoxes
                         self.knownPersonLastSeen = updatedLastSeen
                         self.knownPersonFirstSeen = updatedFirstSeen
+                        // Populate session name cache from NamedPersonStore recognitions
+                        for (id, name) in newNameMappings { self.knownPersonNames[id] = name }
                         self.personDetectionInFlight = false
                         self.checkPendingFollow()
                     }
@@ -2328,12 +2456,16 @@ class LiDARViewController: UIViewController {
                 // Use PersonTracker's rich data (stable IDs, gestures, active person)
                 let activeID = personTracker.activePersonID
                 let boxes: [PersonBoxInfo] = personTracker.detectedPeople.map { p in
-                    PersonBoxInfo(
+                    // Session cache first, then NamedPersonStore embedding lookup
+                    let savedName = knownPersonNames[p.id]
+                        ?? p.gallery.lazy.compactMap { NamedPersonStore.shared.name(matching: $0) }.first
+                    return PersonBoxInfo(
                         id: p.id,
                         boundingBox: p.boundingBox,
                         isActive: p.id == activeID,
                         label: String(p.id.uuidString.prefix(4)),
-                        worldPosition: p.worldPosition
+                        worldPosition: p.worldPosition,
+                        name: savedName
                     )
                 }
                 // If tracking a single person, include the tracked bbox too
@@ -2504,25 +2636,6 @@ class LiDARViewController: UIViewController {
         return intersectionArea / unionArea
     }
 
-    /// Exponential moving average of a person's reference embedding, kept
-    /// L2-normalised. Smoothing makes the stored identity robust to noisy single
-    /// frames so the same person keeps a stable ID. `previous` may be nil (first
-    /// observation), in which case the new embedding is returned as-is.
-    private static func blendEmbedding(_ previous: [Float]?, _ new: [Float], weight: Float = 0.8) -> [Float] {
-        guard let previous, previous.count == new.count else { return new }
-        var blended = [Float](repeating: 0, count: new.count)
-        var norm: Float = 0
-        for i in 0..<new.count {
-            let v = previous[i] * weight + new[i] * (1 - weight)
-            blended[i] = v
-            norm += v * v
-        }
-        norm = norm.squareRoot()
-        if norm > 1e-6 {
-            for i in 0..<blended.count { blended[i] /= norm }
-        }
-        return blended
-    }
 
     private var remoteNavigationState: String {
         switch pathNavigator.state {

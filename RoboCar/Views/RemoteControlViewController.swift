@@ -4,18 +4,15 @@
 //
 
 import UIKit
-import Network
-import WebRTC
 import Speech
 import AVFoundation
 
-final class RemoteControlViewController: UIViewController {
+final class RemoteControlViewController: PanelViewController {
     private let client = RemoteControlClientService()
-    private let browser = RemoteControlBrowser()
     private let remoteGrid = OccupancyGrid(cellSize: 0.05, gridRadius: 500)
     private let keyboardDriveState = KeyboardDriveState()
 
-    private let cameraVideoView = RTCMTLVideoView()
+    private let cameraVideoView = RemoteVideoView()
     private let videoFallbackImageView = UIImageView()
     private let personBoxOverlay = RemotePersonBoxOverlay()
     private let mapView: GridMapView
@@ -46,15 +43,22 @@ final class RemoteControlViewController: UIViewController {
     private var wideContentConstraints: [NSLayoutConstraint] = []
     private var usesWideContentLayout = false
 
-    private var discoveredHosts: [RemoteControlDiscoveredHost] = []
+    private var discoveredHosts: [RemotePeer] = []
     private weak var settingsViewController: RemoteControlSettingsViewController?
+    private weak var servoViewController: RemoteControlSettingsViewController?
+    private var servoDataController: RemoteControlSettingsViewController? {
+        #if targetEnvironment(macCatalyst)
+        return servoViewController
+        #else
+        return settingsViewController
+        #endif
+    }
+    private var remoteServoIDs: [UInt8] = []
+    private var remoteServoPositions: [UInt8: UInt16] = [:]
+    private var remoteServoStates: [UInt8: ServoState] = [:]
+    private var remoteServoAxisStatuses: [UInt8: ServoAxisStatus] = [:]
 
-    private var isTailscaleConnection = false
-    private var pendingReconnect: DispatchWorkItem?
 
-    // Video stall recovery: the feed travels over WebRTC while telemetry uses TCP,
-    // so the video can freeze (e.g. a dropped keyframe) while everything else keeps
-    // streaming. The watchdog restarts the video when frames stop arriving.
     private var lastVideoFrameAt = Date()
     private var lastVideoRecoveryAt = Date.distantPast
     private var videoWatchdog: Timer?
@@ -65,6 +69,12 @@ final class RemoteControlViewController: UIViewController {
     private var connectionBadgeHiddenConstraint: NSLayoutConstraint!
 
     override var canBecomeFirstResponder: Bool { true }
+
+    override var keyCommands: [UIKeyCommand]? { nil }
+
+    override func panelResignedKey() {
+        stopKeyboardDriveIfNeeded()
+    }
 
     init() {
         mapView = GridMapView(occupancyGrid: remoteGrid)
@@ -80,26 +90,18 @@ final class RemoteControlViewController: UIViewController {
         view.backgroundColor = .black
         setupUI()
         setupNetworking()
-        browser.start()
+        client.start(videoView: cameraVideoView)
         startAutoConnect()
-        NotificationCenter.default.addObserver(
-            self,
-            selector: #selector(handleAppDidBecomeActive),
-            name: UIApplication.didBecomeActiveNotification,
-            object: nil
-        )
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
-        pendingReconnect?.cancel()
-        pendingReconnect = nil
+        if presentedViewController != nil { stopKeyboardDriveIfNeeded(); return }
         stopVideoWatchdog()
         stopKeyboardDriveIfNeeded()
         stopSpeechRecognition()
         client.sendStopNLCommand()
         client.disconnect()
-        browser.stop()
     }
 
     override func viewDidAppear(_ animated: Bool) {
@@ -108,9 +110,11 @@ final class RemoteControlViewController: UIViewController {
         startVideoWatchdog()
     }
 
-    @objc private func handleAppDidBecomeActive() {
-        // Returning to the foreground commonly recovers a frozen WebRTC feed; do it
-        // automatically instead of relying on the user re-entering the app.
+    func resumeRemoteConnection() {
+        loadViewIfNeeded()
+        client.start(videoView: cameraVideoView)
+        startAutoConnect()
+        startVideoWatchdog()
         recoverVideoIfStalled(force: false)
     }
 
@@ -169,7 +173,7 @@ final class RemoteControlViewController: UIViewController {
     private func setupUI() {
         cameraVideoView.translatesAutoresizingMaskIntoConstraints = false
         cameraVideoView.backgroundColor = UIColor(white: 0.06, alpha: 1)
-        cameraVideoView.videoContentMode = .scaleAspectFill
+        cameraVideoView.displayLayer.videoGravity = .resizeAspectFill
         cameraVideoView.clipsToBounds = true
         view.addSubview(cameraVideoView)
 
@@ -335,13 +339,12 @@ final class RemoteControlViewController: UIViewController {
     private func setupNetworking() {
         client.onStatusChanged = { [weak self] status in
             self?.statusLabel.text = status
+            self?.discoveredHosts = RemoteControlIrohSession.shared.store?.peers.filter { $0.role == .robot } ?? []
+            self?.settingsViewController?.updateDiscoveredHosts(self?.discoveredHosts ?? [])
+            self?.updateConnectionBadge()
         }
         client.onMessage = { [weak self] message in
             self?.handleRemoteMessage(message)
-        }
-        client.onVideoTrack = { [weak self] track in
-            guard let self else { return }
-            track.add(self.cameraVideoView)
         }
         client.onVideoFrameImage = { [weak self] image in
             guard let self else { return }
@@ -351,89 +354,54 @@ final class RemoteControlViewController: UIViewController {
         }
         client.onVideoFrameSize = { [weak self] size in
             self?.personBoxOverlay.videoSize = size
+            self?.lastVideoFrameAt = Date()
+            self?.videoFallbackImageView.isHidden = true
         }
         client.onConnected = { [weak self] in
             guard let self else { return }
-            self.pendingReconnect?.cancel()
+            self.resetRemoteMap()
             self.lastVideoFrameAt = Date()
             self.lastVideoRecoveryAt = Date()
             self.updateConnectionBadge()
-            var info = RemoteMessage(type: "connectionInfo")
-            info.isLocalConnection = !self.isTailscaleConnection
-            self.client.send(info)
+            self.servoDataController?.setConnected(true)
         }
         client.onDisconnected = { [weak self] in
-            self?.isTailscaleConnection = false
+            self?.resetRemoteMap()
+            self?.remoteServoIDs.removeAll()
+            self?.remoteServoPositions.removeAll()
+            self?.remoteServoStates.removeAll()
+            self?.remoteServoAxisStatuses.removeAll()
+            self?.servoDataController?.setConnected(false)
             self?.updateConnectionBadge()
-            self?.scheduleReconnect()
-        }
-        browser.onStatusChanged = { [weak self] status in
-            if self?.client.isConnected == false {
-                self?.statusLabel.text = status
-            }
-        }
-        browser.onHostsChanged = { [weak self] hosts in
-            self?.discoveredHosts = hosts
-            self?.settingsViewController?.updateDiscoveredHosts(hosts)
-            self?.onBonjourHostsChanged(hosts)
         }
     }
 
     private func startAutoConnect() {
-        if let ip = UserDefaults.standard.string(forKey: "remoteControlHost"), !ip.isEmpty {
-            isTailscaleConnection = true
-            client.connect(host: ip)
-        }
-        // Bonjour will connect via onBonjourHostsChanged if no Tailscale IP is saved
-    }
-
-    private func onBonjourHostsChanged(_ hosts: [RemoteControlDiscoveredHost]) {
-        guard let host = hosts.first else { return }
-        if isTailscaleConnection, client.isConnected {
-            // Upgrade from Tailscale to local LAN — robot is now visible on local network
-            isTailscaleConnection = false
-            client.connect(to: host.endpoint)
-        } else if !client.isConnected {
-            isTailscaleConnection = false
-            client.connect(to: host.endpoint)
-        }
-    }
-
-    private func scheduleReconnect() {
-        pendingReconnect?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self, !self.client.isConnected else { return }
-            self.autoReconnect()
-        }
-        pendingReconnect = work
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: work)
-    }
-
-    private func autoReconnect() {
-        if let host = discoveredHosts.first {
-            isTailscaleConnection = false
-            client.connect(to: host.endpoint)
-        } else if let ip = UserDefaults.standard.string(forKey: "remoteControlHost"), !ip.isEmpty {
-            isTailscaleConnection = true
-            client.connect(host: ip)
-        }
+        client.connectSelectedHost()
     }
 
     private func updateConnectionBadge() {
         if client.isConnected {
             connectionBadgeHiddenConstraint.isActive = false
             connectionBadgeLabel.isHidden = false
-            if isTailscaleConnection {
-                connectionBadgeLabel.text = "  VPN  "
+            if RemoteControlIrohSession.shared.isRelay {
+                connectionBadgeLabel.text = "  RELAY  "
                 connectionBadgeLabel.backgroundColor = UIColor(red: 0.35, green: 0.45, blue: 0.95, alpha: 1)
             } else {
-                connectionBadgeLabel.text = "  LOCAL  "
+                connectionBadgeLabel.text = "  DIRECT  "
                 connectionBadgeLabel.backgroundColor = UIColor(red: 0.2, green: 0.72, blue: 0.4, alpha: 1)
             }
         } else {
             connectionBadgeLabel.isHidden = true
             connectionBadgeHiddenConstraint.isActive = true
         }
+    }
+
+    private func resetRemoteMap() {
+        remoteGrid.clear()
+        mapView.resetInitialHeading()
+        mapView.setNeedsDisplay()
+        meshVoxelView.refresh()
     }
 
     private func handleRemoteMessage(_ message: RemoteMessage) {
@@ -457,17 +425,36 @@ final class RemoteControlViewController: UIViewController {
         case "gridUpdate":
             applyGridUpdate(message.grid)
         case "gridReset":
-            remoteGrid.clear()
-            mapView.plannedPath = []
-            mapView.setNeedsDisplay()
-            meshVoxelView.refresh()
+            resetRemoteMap()
         case "meshAnchors":
             if let anchors = message.meshAnchors, !anchors.isEmpty {
                 meshVoxelView.updateMeshAnchors(anchors)
             }
         case "personBoxes":
             personBoxOverlay.people = message.personBoxes ?? []
-        case "servoList", "servoState", "status":
+        case "servoList":
+            remoteServoIDs = message.servoIDs ?? []
+            servoDataController?.updateServoIDs(remoteServoIDs)
+        case "servoState":
+            if let remoteState = message.servoState {
+                let state = remoteState.asServoState
+                remoteServoStates[state.id] = state
+                servoDataController?.applyServoState(state)
+            }
+        case "servoPositions":
+            if let samples = message.servoPositions {
+                var positions: [UInt8: UInt16] = [:]
+                samples.forEach { positions[$0.id] = $0.position }
+                remoteServoPositions.merge(positions) { _, new in new }
+                servoDataController?.applyServoPositions(positions)
+            }
+        case "servoAxisStatus":
+            if let remoteStatus = message.servoAxisStatus {
+                let status = remoteStatus.asServoAxisStatus
+                remoteServoAxisStatuses[status.id] = status
+                servoDataController?.applyServoAxisStatus(status)
+            }
+        case "status":
             break
         default:
             break
@@ -575,19 +562,43 @@ final class RemoteControlViewController: UIViewController {
     }
 
     @objc private func settingsTapped() {
-        let settings = RemoteControlSettingsViewController(client: client, discoveredHosts: discoveredHosts)
-        settings.onWillConnect = { [weak self] isTailscale in
-            self?.isTailscaleConnection = isTailscale
+        #if targetEnvironment(macCatalyst)
+        guard let scene = view.window?.windowScene else { return }
+        PanelWindows.shared.open(.settings, from: scene) {
+            let settings = RemoteControlSettingsViewController(client: client, discoveredHosts: discoveredHosts, mode: .settings)
+            settings.onOpenServos = { [weak self] in self?.openServoWindow() }
+            settingsViewController = settings
+            return settings
         }
+        #else
+        let settings = RemoteControlSettingsViewController(client: client, discoveredHosts: discoveredHosts)
         settingsViewController = settings
         settings.preferredContentSize = CGSize(width: 620, height: 760)
-    #if targetEnvironment(macCatalyst)
-        settings.modalPresentationStyle = .formSheet
-    #else
         settings.modalPresentationStyle = .pageSheet
-    #endif
+        PanelPresentation.prepare(settings)
         present(settings, animated: true)
+        settings.seedServoData(
+            ids: remoteServoIDs,
+            positions: remoteServoPositions,
+            states: remoteServoStates,
+            axisStatuses: remoteServoAxisStatuses
+        )
+        settings.setConnected(client.isConnected)
+        #endif
     }
+
+    #if targetEnvironment(macCatalyst)
+    private func openServoWindow() {
+        guard let scene = view.window?.windowScene else { return }
+        PanelWindows.shared.open(.servos, from: scene) {
+            let servos = RemoteControlSettingsViewController(client: client, discoveredHosts: [], mode: .servos)
+            servoViewController = servos
+            servos.seedServoData(ids: remoteServoIDs, positions: remoteServoPositions, states: remoteServoStates, axisStatuses: remoteServoAxisStatuses)
+            servos.setConnected(client.isConnected)
+            return servos
+        }
+    }
+    #endif
 
     private func handleKeyboardDrive(_ vector: KeyboardDriveVector?) -> Bool {
         guard let vector else { return false }
@@ -715,34 +726,40 @@ final class RemoteControlViewController: UIViewController {
     }
 
     private func beginSpeechCapture() {
+        guard audioEngine == nil, !isRecording else { return }
         sfRecognizer = SFSpeechRecognizer()
         guard let recognizer = sfRecognizer, recognizer.isAvailable else { return }
-
-        let request = SFSpeechAudioBufferRecognitionRequest()
-        sfRequest = request
-        request.shouldReportPartialResults = true
-
-        sfTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
-            guard let self else { return }
-            if let result {
-                self.nlCommandField.text = result.bestTranscription.formattedString
-            }
-            if result?.isFinal == true || error != nil {
-                self.stopSpeechRecognition()
-            }
-        }
-
-        let engine = AVAudioEngine()
-        audioEngine = engine
-        let inputNode = engine.inputNode
-        let format = inputNode.outputFormat(forBus: 0)
-        inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            self?.sfRequest?.append(buffer)
-        }
 
         do {
             try AVAudioSession.sharedInstance().setCategory(.record, mode: .measurement, options: .duckOthers)
             try AVAudioSession.sharedInstance().setActive(true, options: .notifyOthersOnDeactivation)
+
+            let engine = AVAudioEngine()
+            audioEngine = engine
+            let inputNode = engine.inputNode
+            let format = inputNode.inputFormat(forBus: 0)
+            guard format.sampleRate > 0, format.channelCount > 0 else {
+                throw NSError(domain: "SpeechRecognition", code: -2, userInfo: [NSLocalizedDescriptionKey: "Microphone input is unavailable"])
+            }
+
+            let request = SFSpeechAudioBufferRecognitionRequest()
+            sfRequest = request
+            request.shouldReportPartialResults = true
+
+            sfTask = recognizer.recognitionTask(with: request) { [weak self] result, error in
+                guard let self else { return }
+                if let result {
+                    self.nlCommandField.text = result.bestTranscription.formattedString
+                }
+                if result?.isFinal == true || error != nil {
+                    self.stopSpeechRecognition()
+                }
+            }
+
+            inputNode.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                self?.sfRequest?.append(buffer)
+            }
+
             engine.prepare()
             try engine.start()
             isRecording = true
@@ -783,22 +800,26 @@ extension RemoteControlViewController: UITextFieldDelegate {
     }
 }
 
-private final class RemoteControlSettingsViewController: UIViewController {
-    var onWillConnect: ((_ isTailscale: Bool) -> Void)?
+private final class RemoteControlSettingsViewController: PanelViewController {
+    enum Mode { case combined, settings, servos }
+    private let mode: Mode
+    var onOpenServos: (() -> Void)?
 
     private let client: RemoteControlClientService
-    private var discoveredHosts: [RemoteControlDiscoveredHost]
+    private var discoveredHosts: [RemotePeer]
     private let keyboardDriveState = KeyboardDriveState()
     private let hostField = UITextField()
     private let connectionStatusLabel = UILabel()
     private let discoveredStack = UIStackView()
     private let joystickView = JoystickView()
     private let motorLabel = UILabel()
-    private let servoIDField = UITextField()
     private let servoFromField = UITextField()
     private let servoToField = UITextField()
     private let servoPositionField = UITextField()
     private let servoSpeedField = UITextField()
+    private let servoStatusLabel = UILabel()
+    private let servoListView = ServoControlListView()
+    private var servoCommander: RemoteServoCommander?
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -809,9 +830,10 @@ private final class RemoteControlSettingsViewController: UIViewController {
         ]
     }
 
-    init(client: RemoteControlClientService, discoveredHosts: [RemoteControlDiscoveredHost]) {
+    init(client: RemoteControlClientService, discoveredHosts: [RemotePeer], mode: Mode = .combined) {
         self.client = client
         self.discoveredHosts = discoveredHosts
+        self.mode = mode
         super.init(nibName: nil, bundle: nil)
     }
 
@@ -824,16 +846,39 @@ private final class RemoteControlSettingsViewController: UIViewController {
         view.backgroundColor = UIColor(white: 0.11, alpha: 1)
         setupUI()
         rebuildDiscoveredHosts()
+        setConnected(client.isConnected)
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
         becomeFirstResponder()
+        servoListView.setScreenActive(mode != .settings)
     }
 
     override func viewWillDisappear(_ animated: Bool) {
         super.viewWillDisappear(animated)
         stopKeyboardDriveIfNeeded()
+        servoListView.setScreenActive(false)
+    }
+
+    override func panelVisibilityChanged(_ visible: Bool) {
+        servoListView.setScreenActive(visible && mode != .settings)
+    }
+
+    override func panelResignedKey() {
+        stopKeyboardDriveIfNeeded()
+        if mode != .servos { client.sendStopDrive() }
+        servoListView.stopAllJogs()
+    }
+
+    func setConnected(_ connected: Bool) {
+        guard isViewLoaded else { return }
+        servoListView.setControlsEnabled(connected)
+        joystickView.isUserInteractionEnabled = connected
+        if !connected {
+            servoListView.setServoIDs([])
+            servoStatusLabel.text = "Disconnected"
+        }
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
@@ -857,17 +902,75 @@ private final class RemoteControlSettingsViewController: UIViewController {
         super.pressesCancelled(presses, with: event)
     }
 
-    func updateDiscoveredHosts(_ hosts: [RemoteControlDiscoveredHost]) {
+    func updateDiscoveredHosts(_ hosts: [RemotePeer]) {
         discoveredHosts = hosts
         if isViewLoaded {
             rebuildDiscoveredHosts()
         }
     }
 
+    // MARK: - Servo data feed (from parent controller)
+
+    func seedServoData(ids: [UInt8], positions: [UInt8: UInt16], states: [UInt8: ServoState], axisStatuses: [UInt8: ServoAxisStatus]) {
+        loadViewIfNeeded()
+        servoListView.setServoIDs(ids)
+        if !positions.isEmpty {
+            servoListView.apply(positions: positions)
+        }
+        states.values.forEach { servoListView.apply(state: $0) }
+        axisStatuses.values.forEach { servoListView.apply(axisStatus: $0) }
+    }
+
+    func updateServoIDs(_ ids: [UInt8]) {
+        guard isViewLoaded else { return }
+        servoListView.setServoIDs(ids)
+        servoStatusLabel.text = ids.isEmpty ? "No servos found" : "\(ids.count) servo\(ids.count == 1 ? "" : "s") scanned"
+    }
+
+    func applyServoPositions(_ positions: [UInt8: UInt16]) {
+        guard isViewLoaded else { return }
+        servoListView.apply(positions: positions)
+    }
+
+    func applyServoState(_ state: ServoState) {
+        guard isViewLoaded else { return }
+        servoListView.apply(state: state)
+    }
+
+    func applyServoAxisStatus(_ status: ServoAxisStatus) {
+        guard isViewLoaded else { return }
+        servoListView.apply(axisStatus: status)
+    }
+
     private func setupUI() {
+        let outerScroll = UIScrollView()
+        outerScroll.translatesAutoresizingMaskIntoConstraints = false
+        outerScroll.keyboardDismissMode = .interactive
+        #if targetEnvironment(macCatalyst)
+        outerScroll.contentInsetAdjustmentBehavior = .never
+        #endif
+        self.view.addSubview(outerScroll)
+        let view = UIView()
+        view.translatesAutoresizingMaskIntoConstraints = false
+        outerScroll.addSubview(view)
+        let preferredContentHeight = view.heightAnchor.constraint(equalTo: outerScroll.frameLayoutGuide.heightAnchor)
+        preferredContentHeight.priority = .defaultLow
+        NSLayoutConstraint.activate([
+            outerScroll.topAnchor.constraint(equalTo: self.view.safeAreaLayoutGuide.topAnchor),
+            outerScroll.leadingAnchor.constraint(equalTo: self.view.leadingAnchor),
+            outerScroll.trailingAnchor.constraint(equalTo: self.view.trailingAnchor),
+            outerScroll.bottomAnchor.constraint(equalTo: self.view.keyboardLayoutGuide.topAnchor),
+            view.topAnchor.constraint(equalTo: outerScroll.contentLayoutGuide.topAnchor),
+            view.leadingAnchor.constraint(equalTo: outerScroll.contentLayoutGuide.leadingAnchor),
+            view.trailingAnchor.constraint(equalTo: outerScroll.contentLayoutGuide.trailingAnchor),
+            view.bottomAnchor.constraint(equalTo: outerScroll.contentLayoutGuide.bottomAnchor),
+            view.widthAnchor.constraint(equalTo: outerScroll.frameLayoutGuide.widthAnchor),
+            preferredContentHeight,
+            view.heightAnchor.constraint(greaterThanOrEqualTo: outerScroll.frameLayoutGuide.heightAnchor)
+        ])
         let title = UILabel()
         title.translatesAutoresizingMaskIntoConstraints = false
-        title.text = "Remote Controls"
+        title.text = mode == .combined ? "Remote Controls" : (mode == .settings ? "Settings" : "ST3215 Servos")
         title.textColor = .white
         title.font = .systemFont(ofSize: 22, weight: .bold)
         view.addSubview(title)
@@ -886,8 +989,8 @@ private final class RemoteControlSettingsViewController: UIViewController {
         view.addSubview(connectionTitle)
 
         hostField.translatesAutoresizingMaskIntoConstraints = false
-        hostField.text = UserDefaults.standard.string(forKey: "remoteControlHost") ?? ""
-        hostField.placeholder = "Phone IP or Tailscale IP"
+        hostField.text = "Paired Devices"
+        hostField.isUserInteractionEnabled = false
         hostField.textColor = .white
         hostField.backgroundColor = UIColor(white: 0.2, alpha: 1)
         hostField.layer.cornerRadius = 8
@@ -899,12 +1002,12 @@ private final class RemoteControlSettingsViewController: UIViewController {
         hostField.leftViewMode = .always
         view.addSubview(hostField)
 
-        let connectButton = makeIconButton("link", action: #selector(connectTapped))
-        connectButton.accessibilityLabel = "Connect"
+        let connectButton = makeIconButton("qrcode.viewfinder", action: #selector(connectTapped))
+        connectButton.accessibilityLabel = "Manage paired devices"
         view.addSubview(connectButton)
 
         connectionStatusLabel.translatesAutoresizingMaskIntoConstraints = false
-        connectionStatusLabel.text = "Bonjour hosts"
+        connectionStatusLabel.text = "Remembered robots"
         connectionStatusLabel.textColor = UIColor.white.withAlphaComponent(0.6)
         connectionStatusLabel.font = .systemFont(ofSize: 13, weight: .medium)
         view.addSubview(connectionStatusLabel)
@@ -939,8 +1042,14 @@ private final class RemoteControlSettingsViewController: UIViewController {
         servoTitle.font = .systemFont(ofSize: 15, weight: .semibold)
         view.addSubview(servoTitle)
 
-        [servoIDField, servoFromField, servoToField, servoPositionField, servoSpeedField].forEach(configureField)
-        servoIDField.placeholder = "ID"
+        servoStatusLabel.translatesAutoresizingMaskIntoConstraints = false
+        servoStatusLabel.text = "Scan to list servos"
+        servoStatusLabel.textColor = UIColor.cyan.withAlphaComponent(0.8)
+        servoStatusLabel.font = .monospacedSystemFont(ofSize: 12, weight: .medium)
+        servoStatusLabel.textAlignment = .right
+        view.addSubview(servoStatusLabel)
+
+        [servoFromField, servoToField, servoPositionField, servoSpeedField].forEach(configureField)
         servoFromField.placeholder = "From"
         servoToField.placeholder = "To"
         servoPositionField.placeholder = "Position"
@@ -951,17 +1060,11 @@ private final class RemoteControlSettingsViewController: UIViewController {
         servoSpeedField.text = "1000"
 
         let scanButton = makeButton("Scan", systemImageName: "dot.radiowaves.left.and.right", action: #selector(scanServosTapped))
-        let moveButton = makeButton("Move", systemImageName: "arrow.up.and.down.and.arrow.left.and.right", action: #selector(moveServoTapped))
         let moveAllButton = makeButton("Move All", systemImageName: "arrow.up.and.down.square", action: #selector(moveAllTapped))
-        let stopButton = makeButton("Stop", systemImageName: "stop.fill", action: #selector(stopServoTapped))
-        let torqueOnButton = makeButton("Torque On", systemImageName: "bolt.fill", action: #selector(torqueOnTapped))
-        let torqueOffButton = makeButton("Torque Off", systemImageName: "bolt.slash.fill", action: #selector(torqueOffTapped))
 
         let scanRow = UIStackView(arrangedSubviews: [servoFromField, servoToField, scanButton])
-        let moveRow = UIStackView(arrangedSubviews: [servoIDField, servoPositionField, servoSpeedField])
-        let buttonRow = UIStackView(arrangedSubviews: [moveButton, moveAllButton, stopButton])
-        let torqueRow = UIStackView(arrangedSubviews: [torqueOnButton, torqueOffButton])
-        [scanRow, moveRow, buttonRow, torqueRow].forEach { row in
+        let moveAllRow = UIStackView(arrangedSubviews: [servoPositionField, servoSpeedField, moveAllButton])
+        [scanRow, moveAllRow].forEach { row in
             row.translatesAutoresizingMaskIntoConstraints = false
             row.axis = .horizontal
             row.spacing = 8
@@ -969,15 +1072,48 @@ private final class RemoteControlSettingsViewController: UIViewController {
             view.addSubview(row)
         }
 
+        let commander = RemoteServoCommander(client: client)
+        servoCommander = commander
+        servoListView.commander = commander
+        servoListView.onStatus = { [weak self] text, isError in
+            self?.servoStatusLabel.text = text
+            self?.servoStatusLabel.textColor = isError
+                ? UIColor(red: 1.0, green: 0.35, blue: 0.35, alpha: 1)
+                : UIColor.cyan.withAlphaComponent(0.8)
+        }
+        servoListView.presentConfirmation = { [weak self] title, message, action in
+            let alert = UIAlertController(title: title, message: message, preferredStyle: .alert)
+            alert.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+            alert.addAction(UIAlertAction(title: "Confirm", style: .destructive) { _ in action() })
+            self?.present(alert, animated: true)
+        }
+
+        let servoScrollView = UIScrollView()
+        servoScrollView.translatesAutoresizingMaskIntoConstraints = false
+        servoScrollView.alwaysBounceVertical = true
+        servoScrollView.keyboardDismissMode = .interactive
+        #if targetEnvironment(macCatalyst)
+        servoScrollView.contentInsetAdjustmentBehavior = .never
+        #endif
+        view.addSubview(servoScrollView)
+        servoScrollView.addSubview(servoListView)
+        servoListView.translatesAutoresizingMaskIntoConstraints = false
+
         NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: view.safeAreaLayoutGuide.topAnchor, constant: 24),
+            title.topAnchor.constraint(equalTo: view.topAnchor, constant: 24),
             title.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
 
             doneButton.centerYAnchor.constraint(equalTo: title.centerYAnchor),
             doneButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
             doneButton.widthAnchor.constraint(equalToConstant: 44),
             doneButton.heightAnchor.constraint(equalToConstant: 38),
+            title.trailingAnchor.constraint(lessThanOrEqualTo: doneButton.leadingAnchor, constant: -8)
+        ])
 
+        let connectionViews: [UIView] = [switchModeButton, connectionTitle, hostField, connectButton, connectionStatusLabel, discoveredStack, motorLabel, joystickView]
+        connectionViews.forEach { $0.isHidden = mode == .servos }
+        if mode != .servos {
+            NSLayoutConstraint.activate([
             switchModeButton.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 20),
             switchModeButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             switchModeButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
@@ -1011,31 +1147,54 @@ private final class RemoteControlSettingsViewController: UIViewController {
             joystickView.topAnchor.constraint(equalTo: motorLabel.bottomAnchor, constant: 12),
             joystickView.centerXAnchor.constraint(equalTo: view.centerXAnchor),
             joystickView.widthAnchor.constraint(equalToConstant: 190),
-            joystickView.heightAnchor.constraint(equalToConstant: 190),
+            joystickView.heightAnchor.constraint(equalToConstant: 190)
+            ])
+        }
 
-            servoTitle.topAnchor.constraint(equalTo: joystickView.bottomAnchor, constant: 28),
+        let servoViews: [UIView] = [servoTitle, servoStatusLabel, scanRow, moveAllRow, servoScrollView]
+        servoViews.forEach { $0.isHidden = mode == .settings }
+        if mode == .settings {
+            let openServosButton = makeButton("Servos", systemImageName: "slider.horizontal.3", action: #selector(openServosTapped))
+            view.addSubview(openServosButton)
+            NSLayoutConstraint.activate([
+                openServosButton.topAnchor.constraint(equalTo: joystickView.bottomAnchor, constant: 24),
+                openServosButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+                openServosButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+                openServosButton.heightAnchor.constraint(equalToConstant: 44),
+                view.bottomAnchor.constraint(greaterThanOrEqualTo: openServosButton.bottomAnchor, constant: 24)
+            ])
+        } else {
+            NSLayoutConstraint.activate([
+            servoTitle.topAnchor.constraint(equalTo: mode == .servos ? title.bottomAnchor : joystickView.bottomAnchor, constant: 28),
             servoTitle.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+
+            servoStatusLabel.centerYAnchor.constraint(equalTo: servoTitle.centerYAnchor),
+            servoStatusLabel.leadingAnchor.constraint(equalTo: servoTitle.trailingAnchor, constant: 12),
+            servoStatusLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
 
             scanRow.topAnchor.constraint(equalTo: servoTitle.bottomAnchor, constant: 12),
             scanRow.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             scanRow.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
             scanRow.heightAnchor.constraint(equalToConstant: 40),
 
-            moveRow.topAnchor.constraint(equalTo: scanRow.bottomAnchor, constant: 10),
-            moveRow.leadingAnchor.constraint(equalTo: scanRow.leadingAnchor),
-            moveRow.trailingAnchor.constraint(equalTo: scanRow.trailingAnchor),
-            moveRow.heightAnchor.constraint(equalTo: scanRow.heightAnchor),
+            moveAllRow.topAnchor.constraint(equalTo: scanRow.bottomAnchor, constant: 10),
+            moveAllRow.leadingAnchor.constraint(equalTo: scanRow.leadingAnchor),
+            moveAllRow.trailingAnchor.constraint(equalTo: scanRow.trailingAnchor),
+            moveAllRow.heightAnchor.constraint(equalTo: scanRow.heightAnchor),
 
-            buttonRow.topAnchor.constraint(equalTo: moveRow.bottomAnchor, constant: 10),
-            buttonRow.leadingAnchor.constraint(equalTo: scanRow.leadingAnchor),
-            buttonRow.trailingAnchor.constraint(equalTo: scanRow.trailingAnchor),
-            buttonRow.heightAnchor.constraint(equalTo: scanRow.heightAnchor),
+            servoScrollView.topAnchor.constraint(equalTo: moveAllRow.bottomAnchor, constant: 12),
+            servoScrollView.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            servoScrollView.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            servoScrollView.bottomAnchor.constraint(equalTo: view.bottomAnchor, constant: -12),
+            servoScrollView.heightAnchor.constraint(greaterThanOrEqualToConstant: 280),
 
-            torqueRow.topAnchor.constraint(equalTo: buttonRow.bottomAnchor, constant: 10),
-            torqueRow.leadingAnchor.constraint(equalTo: scanRow.leadingAnchor),
-            torqueRow.trailingAnchor.constraint(equalTo: scanRow.trailingAnchor),
-            torqueRow.heightAnchor.constraint(equalTo: scanRow.heightAnchor)
+            servoListView.topAnchor.constraint(equalTo: servoScrollView.contentLayoutGuide.topAnchor),
+            servoListView.leadingAnchor.constraint(equalTo: servoScrollView.contentLayoutGuide.leadingAnchor),
+            servoListView.trailingAnchor.constraint(equalTo: servoScrollView.contentLayoutGuide.trailingAnchor),
+            servoListView.bottomAnchor.constraint(equalTo: servoScrollView.contentLayoutGuide.bottomAnchor),
+            servoListView.widthAnchor.constraint(equalTo: servoScrollView.frameLayoutGuide.widthAnchor)
         ])
+        }
     }
 
     private func configureField(_ field: UITextField) {
@@ -1068,10 +1227,10 @@ private final class RemoteControlSettingsViewController: UIViewController {
             view.removeFromSuperview()
         }
         guard !discoveredHosts.isEmpty else {
-            connectionStatusLabel.text = "No Bonjour hosts found"
+            connectionStatusLabel.text = "No paired robots"
             return
         }
-        connectionStatusLabel.text = "Bonjour hosts"
+        connectionStatusLabel.text = "Remembered robots"
         for (index, host) in discoveredHosts.prefix(3).enumerated() {
             let button = makeButton(host.name, systemImageName: "network", action: #selector(discoveredHostTapped(_:)))
             button.tag = index
@@ -1080,73 +1239,39 @@ private final class RemoteControlSettingsViewController: UIViewController {
     }
 
     @objc private func doneTapped() {
-        view.endEditing(true)
-        dismiss(animated: true)
+        PanelPresentation.close(self)
     }
+
+    @objc private func openServosTapped() { onOpenServos?() }
 
     @objc private func switchToRobotTapped() {
         requestAppRoleSwitch(.robot)
     }
 
     @objc private func connectTapped() {
-        let host = hostField.text?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard !host.isEmpty else { return }
-        UserDefaults.standard.set(host, forKey: "remoteControlHost")
-        onWillConnect?(true)
-        client.connect(host: host)
-        hostField.resignFirstResponder()
+        client.sendStopDrive()
+        RemotePairingViewController.show(from: self)
     }
 
     @objc private func discoveredHostTapped(_ sender: UIButton) {
         guard discoveredHosts.indices.contains(sender.tag) else { return }
-        onWillConnect?(false)
-        client.connect(to: discoveredHosts[sender.tag].endpoint)
+        client.connect(to: discoveredHosts[sender.tag])
     }
 
     @objc private func scanServosTapped() {
-        var message = RemoteMessage(type: "scanServos")
-        message.from = UInt8(servoFromField.text ?? "") ?? 1
-        message.to = UInt8(servoToField.text ?? "") ?? 20
-        client.send(message)
-    }
-
-    @objc private func moveServoTapped() {
-        guard let id = UInt8(servoIDField.text ?? "") else { return }
-        var message = RemoteMessage(type: "moveServo")
-        message.id = id
-        message.position = UInt16(servoPositionField.text ?? "") ?? 2048
-        message.speed = UInt16(servoSpeedField.text ?? "") ?? 1000
-        client.send(message)
+        view.endEditing(true)
+        let from = UInt8(servoFromField.text ?? "") ?? 1
+        let to = UInt8(servoToField.text ?? "") ?? 20
+        servoCommander?.rescanServos(from: from, to: to)
+        servoStatusLabel.text = "Scanning \(from)-\(to)"
     }
 
     @objc private func moveAllTapped() {
-        var message = RemoteMessage(type: "moveAllServos")
-        message.position = UInt16(servoPositionField.text ?? "") ?? 2048
-        message.speed = UInt16(servoSpeedField.text ?? "") ?? 1000
-        client.send(message)
-    }
-
-    @objc private func stopServoTapped() {
-        guard let id = UInt8(servoIDField.text ?? "") else { return }
-        var message = RemoteMessage(type: "stopServo")
-        message.id = id
-        client.send(message)
-    }
-
-    @objc private func torqueOnTapped() {
-        sendTorque(enabled: true)
-    }
-
-    @objc private func torqueOffTapped() {
-        sendTorque(enabled: false)
-    }
-
-    private func sendTorque(enabled: Bool) {
-        guard let id = UInt8(servoIDField.text ?? "") else { return }
-        var message = RemoteMessage(type: "setServoTorque")
-        message.id = id
-        message.enabled = enabled
-        client.send(message)
+        view.endEditing(true)
+        let position = UInt16(servoPositionField.text ?? "") ?? 2048
+        let speed = UInt16(servoSpeedField.text ?? "") ?? 1000
+        servoCommander?.moveDiscoveredServos(position: min(position, 4095), speed: min(speed, 4095), acceleration: 50)
+        servoStatusLabel.text = "Moving all to \(min(position, 4095))"
     }
 
     private func handleKeyboardDrive(_ vector: KeyboardDriveVector?) -> Bool {
@@ -1164,6 +1289,39 @@ private final class RemoteControlSettingsViewController: UIViewController {
     private func stopKeyboardDriveIfNeeded() {
         _ = handleKeyboardDrive(keyboardDriveState.reset())
     }
+}
+
+/// Relays `ServoCommanding` operations to the robot host over the remote link.
+private final class RemoteServoCommander: ServoCommanding {
+    private let client: RemoteControlClientService
+
+    init(client: RemoteControlClientService) {
+        self.client = client
+    }
+
+    private func send(_ type: String, _ build: (inout RemoteMessage) -> Void = { _ in }) {
+        var message = RemoteMessage(type: type)
+        build(&message)
+        client.send(message)
+    }
+
+    func rescanServos(from: UInt8, to: UInt8) { send("scanServos") { $0.from = from; $0.to = to } }
+    func moveServo(id: UInt8, position: UInt16, speed: UInt16) { send("moveServo") { $0.id = id; $0.position = position; $0.speed = speed } }
+    func moveDiscoveredServos(position: UInt16, speed: UInt16, acceleration: UInt8) { send("moveAllServos") { $0.position = position; $0.speed = speed; $0.acceleration = acceleration } }
+    func setServoTorque(id: UInt8, enabled: Bool) { send("setServoTorque") { $0.id = id; $0.enabled = enabled } }
+    func changeServoID(currentID: UInt8, newID: UInt8) { send("changeServoID") { $0.from = currentID; $0.to = newID } }
+    func calibrateServoCenter(id: UInt8) { send("calibrateServoCenter") { $0.id = id } }
+    func driveServoWheel(id: UInt8, speed: Int16, acceleration: UInt8) { send("driveServoWheel") { $0.id = id; $0.wheelSpeed = speed; $0.acceleration = acceleration } }
+    func setServoPositionMode(id: UInt8) { send("setServoPositionMode") { $0.id = id } }
+    func refreshServoState(id: UInt8) { send("refreshServoState") { $0.id = id } }
+    func trackServoAxis(id: UInt8) { send("trackServoAxis") { $0.id = id } }
+    func jogServo(id: UInt8, degrees: Double) { send("jogServo") { $0.id = id; $0.degrees = degrees } }
+    func beginServoJog(id: UInt8, direction: ServoJogDirection, speed: UInt16) { send("beginServoJog") { $0.id = id; $0.direction = direction.rawValue; $0.speed = speed } }
+    func stopServoMotion(id: UInt8) { send("stopServoMotion") { $0.id = id } }
+    func markServoTravel(id: UInt8, _ mark: ServoTravelMark) { send("markServoTravel") { $0.id = id; $0.mark = mark.rawValue } }
+    func moveServoToPercent(id: UInt8, percent: Double, speed: UInt16) { send("moveServoToPercent") { $0.id = id; $0.percent = percent; $0.speed = speed } }
+    func moveServoToAngle(id: UInt8, degrees: Double) { send("moveServoToAngle") { $0.id = id; $0.degrees = degrees } }
+    func refreshServoAxisStatus(id: UInt8) { send("refreshServoAxisStatus") { $0.id = id } }
 }
 
 fileprivate func configureGlassButton(_ button: UIButton, title: String, systemImageName: String) {
