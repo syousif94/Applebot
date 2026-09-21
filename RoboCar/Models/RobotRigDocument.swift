@@ -6,9 +6,13 @@ struct RobotRigDocument: Codable, Equatable {
     var assetHash: String
     var groups: [RobotRigGroup] = []
     var millimetersPerModelUnit: Float?
+    var collisionExcludedPartIDs: Set<String>?
 
     func validate(partIDs: Set<String>) throws {
         guard (1...2).contains(version) else { throw RobotRigError.invalid("Unsupported rig version") }
+        guard (collisionExcludedPartIDs ?? []).isSubset(of: partIDs) else {
+            throw RobotRigError.invalid("Collision exclusions reference missing parts")
+        }
         if let scale = millimetersPerModelUnit {
             guard scale.isFinite, scale > 0, (1 / scale).isFinite else { throw RobotRigError.invalid("Model scale must be finite and positive") }
         }
@@ -68,6 +72,17 @@ struct RobotRigDocument: Codable, Equatable {
                 parent = ancestor.parentID
             }
         }
+    }
+
+    func checksCollision(for partID: String) -> Bool {
+        collisionExcludedPartIDs?.contains(partID) != true
+    }
+
+    mutating func setCollisionChecking(_ enabled: Bool, for partIDs: Set<String>) {
+        var excluded = collisionExcludedPartIDs ?? []
+        if enabled { excluded.subtract(partIDs) }
+        else { excluded.formUnion(partIDs) }
+        collisionExcludedPartIDs = excluded.isEmpty ? nil : excluded
     }
 
     func motionSource(for group: RobotRigGroup) -> RobotRigGroup {

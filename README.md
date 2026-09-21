@@ -30,6 +30,14 @@ Import limits: embedded GLB 2.0 resources, rigid triangle meshes, 100 MB file, 1
 
 Choose **Move Axis** after confirming an axis to reposition its pivot with red **X**, green **Y**, and blue **Z** cone-tipped handles. Drag a handle in the viewport; movement is constrained to that model-rest coordinate and leaves the axis direction unchanged. Each released drag is saved as one undoable edit. **Done Moving Axis** returns to normal selection and rotation preview. Moving the pivot resets preview rotations to the rest pose and is unavailable in Live mode. **Edit Axis** remains available for exact origin and direction values.
 
+### Collision Exclusions
+
+Select parts in the viewport or hierarchy, then press **Exclude from Collisions** beside **Deselect All** in the sidebar. When all selected parts are excluded, the button becomes **Include in Collisions**. For a mixed selection, it excludes all selected parts. The button is disabled when nothing is selected. You can also open **Collision Checks** and turn off **Check Selected Parts**. Selecting a group or model branch applies the change to all selected descendant parts. Excluded parts remain visible, selectable and move with their groups, but are omitted entirely from IK collision geometry, including collisions against other groups or ungrouped geometry. Exclusions affect whole selectable parts, not individual faces or specific contact pairs.
+
+The section shows the selection's included/excluded/mixed state and the total excluded count. For a mixed selection, switching off excludes the entire selection; switching on includes it. **Select Excluded** selects all excluded parts so you can inspect or re-enable them. **Include All Parts** clears all exclusions. IK status also reports the excluded count.
+
+Exclusions are saved with the model and support undo/redo. Changes cancel pending IK checks and reset preview; restart IK to prepare the updated collision world. Editing is disabled during Live control. Existing rigs default to checking every part. Excluding all parts removes model collision obstacles from IK; no clearance or physical safety is implied. Manual previews and Live commands remain outside collision checking.
+
 ### Lead Screws and Parallel Grippers
 
 1. Group the translating parts and set their axis using **Select Axis Face** or **Edit Axis**. The axis direction is the travel direction; its origin does not change linear displacement. Keep the stationary motor housing in its parent group.

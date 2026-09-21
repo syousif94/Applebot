@@ -22,6 +22,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private let inspectorScroll = UIScrollView()
     private let axisStateLabel = UILabel()
     private let selectionLabel = UILabel()
+    private let collisionSelectionSwitch = UISwitch()
+    private let collisionSelectionLabel = UILabel()
     private let viewportModeLabel = UILabel()
     private let errorBanner = UIStackView()
     private let errorLabel = UILabel()
@@ -257,9 +259,29 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         ])
         inspector.axis = .vertical
         inspector.spacing = 8
-        let selectionTools = actionGrid([button("Deselect All", "selection.pin.in.out", #selector(deselectAllParts))])
+        let selectionTools = actionGrid([
+            button("Deselect All", "selection.pin.in.out", #selector(deselectAllParts)),
+            button("Exclude from Collisions", "shield.slash", #selector(toggleSelectedCollisionExclusion))
+        ])
         actionButtons[#selector(deselectAllParts)]?.toolTip = "Deselect All (Command-Shift-A)"
         addSidebarSection("Hierarchy", views: [search, table, selectionLabel, selectionTools])
+        let collisionTitle = UILabel()
+        collisionTitle.text = "Check Selected Parts"
+        collisionTitle.font = .systemFont(ofSize: 13, weight: .medium)
+        collisionTitle.numberOfLines = 0
+        collisionSelectionSwitch.accessibilityLabel = "Collision checks for selected parts"
+        collisionSelectionSwitch.addTarget(self, action: #selector(collisionSelectionChanged), for: .valueChanged)
+        let collisionRow = UIStackView(arrangedSubviews: [collisionTitle, collisionSelectionSwitch])
+        collisionRow.alignment = .center
+        collisionRow.spacing = 8
+        collisionRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        collisionSelectionLabel.font = .systemFont(ofSize: 13)
+        collisionSelectionLabel.numberOfLines = 0
+        let collisionTools = actionGrid([
+            button("Select Excluded", "selection.pin.in.out", #selector(selectCollisionExcluded)),
+            button("Include All Parts", "checkmark.shield", #selector(includeAllCollisionParts))
+        ])
+        addSidebarSection("Collision Checks", views: [collisionRow, collisionSelectionLabel, collisionTools])
         addSidebarSection("Parts & Groups", views: [groupButton, groupTools])
         addSidebarSection("Motion Axis", views: [motionKind, axisStateLabel, axisTools, mechanismLabel, mechanismTools])
         addSidebarSection("Inverse Kinematics", views: [ikStateLabel, ikTools])
@@ -488,6 +510,21 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         viewportHost.bringSubviewToFront(viewportModeLabel)
         viewportHost.bringSubviewToFront(errorBanner)
         selectionLabel.text = "\(selected.count) selected parts" + (group.map { " / \($0.parts.count) in group" } ?? "")
+        let excluded = document.collisionExcludedPartIDs ?? []
+        let selectedExcludedCount = selected.intersection(excluded).count
+        let mixedCollisionSelection = selectedExcludedCount > 0 && selectedExcludedCount < selected.count
+        collisionSelectionSwitch.isOn = !selected.isEmpty && selectedExcludedCount < selected.count
+        collisionSelectionSwitch.isEnabled = editable && !selected.isEmpty && !pickingAxis && !movingAxis && !pickingIK
+        let allSelectedExcluded = !selected.isEmpty && selectedExcludedCount == selected.count
+        updateAction(#selector(toggleSelectedCollisionExclusion), enabled: collisionSelectionSwitch.isEnabled,
+                 title: allSelectedExcluded ? "Include in Collisions" : "Exclude from Collisions")
+        actionButtons[#selector(toggleSelectedCollisionExclusion)]?.configuration?.image = UIImage(systemName: allSelectedExcluded ? "checkmark.shield" : "shield.slash")
+        collisionSelectionSwitch.accessibilityValue = mixedCollisionSelection ? "Mixed" : (collisionSelectionSwitch.isOn ? "On" : "Off")
+        let selectionState = selected.isEmpty ? "No parts selected" : (mixedCollisionSelection ? "Mixed: \(selectedExcludedCount) of \(selected.count) selected excluded" : (selectedExcludedCount == 0 ? "Selected parts included" : "Selected parts excluded"))
+        collisionSelectionLabel.text = "\(selectionState)\n\(excluded.count) of \(partIDs.count) model parts excluded"
+        collisionSelectionLabel.textColor = excluded.isEmpty ? .secondaryLabel : .systemOrange
+        updateAction(#selector(selectCollisionExcluded), enabled: editable && !excluded.isEmpty)
+        updateAction(#selector(includeAllCollisionParts), enabled: editable && !excluded.isEmpty)
         if pickingAxis {
             axisStateLabel.text = pendingSurface == nil
                 ? "Selecting face on \(group?.name ?? "group")"
@@ -514,6 +551,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         let helper = group?.ikHelper
         let rootName = document.groups.first { $0.id == helper?.rootID }?.name ?? ""
         ikStateLabel.text = pickingIK ? "Selecting helper point on child" : (ikMessage ?? (helper == nil ? "No IK helper" : "Chain root: \(rootName) / Preview only"))
+        if !excluded.isEmpty { ikStateLabel.text = (ikStateLabel.text ?? "") + " / \(excluded.count) parts excluded" }
         updateAction(#selector(placeIKHelper), enabled: editable && group?.parts.isEmpty == false,
                  title: pickingIK ? "Cancel Helper Pick" : "Place IK Helper")
         updateAction(#selector(editIKHelper), enabled: editable && group != nil)
@@ -555,6 +593,31 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         pickingAxis = false
         isolated = false
         refresh()
+    }
+
+    @objc private func toggleSelectedCollisionExclusion() {
+        guard collisionSelectionSwitch.isEnabled else { return }
+        let parts = selected
+        let include = parts.allSatisfy { !document.checksCollision(for: $0) }
+        edit { $0.setCollisionChecking(include, for: parts) }
+    }
+
+    @objc private func collisionSelectionChanged() {
+        guard collisionSelectionSwitch.isEnabled else { refresh(); return }
+        let parts = selected
+        let enabled = collisionSelectionSwitch.isOn
+        edit { $0.setCollisionChecking(enabled, for: parts) }
+    }
+
+    @objc private func selectCollisionExcluded() {
+        guard !motors.isArmed, !importing else { return }
+        deselectAllParts()
+        selected = document.collisionExcludedPartIDs ?? []
+        refresh()
+    }
+
+    @objc private func includeAllCollisionParts() {
+        edit { $0.collisionExcludedPartIDs = nil }
     }
 
     private func edit(_ body: (inout RobotRigDocument) throws -> Void) {
@@ -1036,7 +1099,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                         moving.insert(item.id.uuidString)
                     }
                 }
-                let parts = viewport.parts.map { part in
+                let parts = viewport.parts.filter { document.checksCollision(for: $0.id) }.map { part in
                     RigCollisionWorld.Part(id: part.id, name: part.name,
                                            owner: document.groups.first { $0.parts.contains(part.id) }?.id.uuidString,
                                            vertices: part.mesh.triangles.flatMap { [$0.first, $0.second, $0.third] })
@@ -1807,6 +1870,52 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                     draft.groups[0].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: root.id)
                 }
                 let ikDocument = editor.document
+                let excludedPart = editor.viewport.parts[0].id
+                let includedPart = editor.viewport.parts[1].id
+                editor.selected = [excludedPart]
+                editor.refresh()
+                precondition(editor.collisionSelectionSwitch.isOn && editor.collisionSelectionSwitch.isEnabled)
+                precondition(editor.actionButtons[#selector(toggleSelectedCollisionExclusion)]?.configuration?.title == "Exclude from Collisions")
+                editor.actionButtons[#selector(toggleSelectedCollisionExclusion)]?.sendActions(for: .touchUpInside)
+                precondition(editor.document.collisionExcludedPartIDs == [excludedPart])
+                precondition(editor.actionButtons[#selector(toggleSelectedCollisionExclusion)]?.configuration?.title == "Include in Collisions")
+                precondition(editor.viewport.parts.count == 2 && !editor.collisionSelectionSwitch.isOn)
+                let excludedDocument = try RobotModelStorage.loadDocument(at: url, hash: "fixture")
+                precondition(excludedDocument == editor.document)
+                editor.undoTapped()
+                precondition(editor.document == ikDocument)
+                editor.redoTapped()
+                precondition(editor.document == excludedDocument)
+                editor.selected = [excludedPart, includedPart]
+                editor.refresh()
+                precondition(editor.collisionSelectionSwitch.accessibilityValue == "Mixed")
+                editor.selectCollisionExcluded()
+                precondition(editor.selected == [excludedPart])
+                editor.toggleIK()
+                let filteredWorld = await editor.collisionPreparation!.value
+                precondition(filteredWorld.triangleCounts[excludedPart] == nil)
+                precondition(filteredWorld.triangleCounts[includedPart] != nil)
+                precondition(editor.ikStateLabel.text?.contains("1 parts excluded") == true)
+                let excludedGeneration = editor.collisionGeneration
+                editor.actionButtons[#selector(toggleSelectedCollisionExclusion)]?.sendActions(for: .touchUpInside)
+                precondition(editor.document == ikDocument && editor.collisionPreparation == nil && editor.ikTarget == nil)
+                precondition(editor.collisionGeneration != excludedGeneration)
+                editor.selected = editor.partIDs
+                editor.refresh()
+                editor.collisionSelectionSwitch.isOn = false
+                editor.collisionSelectionChanged()
+                editor.toggleIK()
+                let emptyWorld = await editor.collisionPreparation!.value
+                precondition(emptyWorld.triangleCounts.isEmpty && editor.viewport.parts.count == 2)
+                editor.includeAllCollisionParts()
+                precondition(editor.document == ikDocument && editor.ikTarget == nil)
+                editor.selected = []
+                editor.refresh()
+                precondition(editor.actionButtons[#selector(toggleSelectedCollisionExclusion)]?.isEnabled == false)
+                editor.toggleSelectedCollisionExclusion()
+                precondition(editor.document == ikDocument)
+                precondition(commander.motion.isEmpty)
+                print("PASS: per-part collision exclusions, mixed selection, filtered and empty collision worlds, unchanged visuals, persistence, undo/redo and IK invalidation")
                 editor.toggleIK()
                 precondition(editor.ikTarget != nil && !editor.mode.isEnabled)
                 editor.moveIK(SIMD3(1.5, 0.5, 0), state: .changed)
@@ -2020,7 +2129,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 editor.setSidebarSection("Inverse Kinematics", collapsed: false)
                 print("PASS: linear editor, paired-jaw source routing, mm telemetry, single motor command, persistence, undo/redo and Stop")
                 print("PASS: actual SceneKit components, multi-material face picking, centroid, persistence, preview isolation, motor conversion, pending-move guard, invalid telemetry and disconnect")
-                var report = "PASS: SceneKit picking, centroid, persistence and guarded motor commands\nPASS: wrong robot and changed session rejected\nPASS: visible action labels, face selection, confirmation and preview enablement\nPASS: linear editor, paired jaws, source-only Move, mm telemetry, persistence and undo/redo\n"
+                var report = "PASS: SceneKit picking, centroid, persistence and guarded motor commands\nPASS: wrong robot and changed session rejected\nPASS: visible action labels, face selection, confirmation and preview enablement\nPASS: linear editor, paired jaws, source-only Move, mm telemetry, persistence and undo/redo\nPASS: per-part collision exclusions, filtered worlds, persistence, undo/redo and IK invalidation\n"
                 let args = ProcessInfo.processInfo.arguments
                 if let index = args.firstIndex(of: "--rig-model"), args.indices.contains(index + 1) {
                     let asset = try GLTFAsset(url: URL(fileURLWithPath: args[index + 1]), options: [:])

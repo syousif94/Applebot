@@ -25,6 +25,21 @@ struct RobotRigChecks {
         precondition(document.transforms(angles: [:])[child.id] == matrix_identity_float4x4)
         let restored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(document))
         precondition(restored == document)
+        precondition(document.checksCollision(for: "upper") && document.checksCollision(for: "lower"))
+        var exclusions = document
+        exclusions.setCollisionChecking(false, for: ["upper", "lower"])
+        try exclusions.validate(partIDs: ["upper", "lower"])
+        precondition(!exclusions.checksCollision(for: "upper") && !exclusions.checksCollision(for: "lower"))
+        precondition(exclusions.transforms(angles: [parent.id: 90, child.id: 90])[child.id] == transforms[child.id])
+        let restoredExclusions = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(exclusions))
+        precondition(restoredExclusions == exclusions)
+        exclusions.setCollisionChecking(true, for: ["upper"])
+        precondition(exclusions.checksCollision(for: "upper") && !exclusions.checksCollision(for: "lower"))
+        exclusions.setCollisionChecking(true, for: ["lower"])
+        precondition(exclusions == document)
+        exclusions.setCollisionChecking(false, for: ["missing"])
+        do { try exclusions.validate(partIDs: ["upper", "lower"]); preconditionFailure("Missing collision part accepted") } catch {}
+        print("PASS: collision exclusion persistence, batch updates, restoration, validation and unchanged transforms")
         let legacyJSON = """
         {"version":1,"assetHash":"legacy","groups":[{"id":"00000000-0000-0000-0000-000000000001","name":"Old hinge","parts":[],"axis":{"origin":[0,0,0],"direction":[0,0,1]}}]}
         """
