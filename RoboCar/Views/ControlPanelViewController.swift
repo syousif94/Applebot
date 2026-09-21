@@ -565,6 +565,11 @@ class ControlPanelViewController: PanelViewController {
         servoStack.addArrangedSubview(makeServoRow([servoScanFromField, servoScanToField, rescanServosButton]))
         servoStack.addArrangedSubview(makeServoRow([servoSpeedField, moveAllServosButton]))
         servoStack.addArrangedSubview(makeServoRow([servoAllTorqueOnButton, servoAllTorqueOffButton]))
+        let robotModelButton = UIButton(type: .system)
+        robotModelButton.translatesAutoresizingMaskIntoConstraints = false
+        configureServoButton(robotModelButton, title: "Model Editor", color: UIColor(white: 0.28, alpha: 1), action: #selector(showRobotModelTapped))
+        robotModelButton.setImage(UIImage(systemName: "cube.transparent"), for: .normal)
+        contentView.addSubview(robotModelButton)
         servoStack.addArrangedSubview(servoListView)
 
         servoControlViews = [
@@ -574,7 +579,11 @@ class ControlPanelViewController: PanelViewController {
         ]
         
         NSLayoutConstraint.activate([
-            servoLabel.topAnchor.constraint(equalTo: batteryBar.bottomAnchor, constant: 24),
+            robotModelButton.topAnchor.constraint(equalTo: batteryBar.bottomAnchor, constant: 24),
+            robotModelButton.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
+            robotModelButton.trailingAnchor.constraint(equalTo: contentView.trailingAnchor, constant: -20),
+
+            servoLabel.topAnchor.constraint(equalTo: robotModelButton.bottomAnchor, constant: 24),
             servoLabel.leadingAnchor.constraint(equalTo: contentView.leadingAnchor, constant: 20),
             
             servoStatusLabel.centerYAnchor.constraint(equalTo: servoLabel.centerYAnchor),
@@ -1090,6 +1099,13 @@ class ControlPanelViewController: PanelViewController {
         PanelPresentation.prepare(settingsViewController)
         present(settingsViewController, animated: true)
         #endif
+    }
+
+    @objc private func showRobotModelTapped() {
+        servoListView.setScreenActive(false)
+        let editor = RobotModelViewController(motors: .local())
+        editor.modalPresentationStyle = .fullScreen
+        present(editor, animated: true)
     }
 
     @objc private func dismissServoSettingsTapped() {

@@ -110,8 +110,13 @@ class ESP32BLEManager: NSObject {
     // MARK: - State
     
     private(set) var connectionState: ESP32ConnectionState = .disconnected {
-        didSet { onStateChanged?(connectionState) }
+        didSet {
+            connectionGeneration = UUID()
+            onStateChanged?(connectionState)
+        }
     }
+    private(set) var connectionGeneration = UUID()
+    var connectedPeripheralID: String? { connectionState == .connected ? peripheral?.identifier.uuidString : nil }
     
     /// Callback when connection state changes
     var onStateChanged: ((ESP32ConnectionState) -> Void)?

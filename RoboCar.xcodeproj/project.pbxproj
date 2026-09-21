@@ -9,6 +9,7 @@
 /* Begin PBXBuildFile section */
 		532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 532AA3D42F09D00000B4C836 /* WebRTC */; };
 		533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */ = {isa = PBXBuildFile; productRef = 533516C33040FE6D0090D4A9 /* IrohLib */; };
+		53A5785B305E19AB00D6B634 /* GLTFKit2 in Frameworks */ = {isa = PBXBuildFile; productRef = 53A5785A305E19AB00D6B634 /* GLTFKit2 */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
@@ -44,6 +45,7 @@
 			files = (
 				533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */,
 				532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */,
+				53A5785B305E19AB00D6B634 /* GLTFKit2 in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -88,6 +90,7 @@
 			packageProductDependencies = (
 				532AA3D42F09D00000B4C836 /* WebRTC */,
 				533516C33040FE6D0090D4A9 /* IrohLib */,
+				53A5785A305E19AB00D6B634 /* GLTFKit2 */,
 			);
 			productName = RoboCar;
 			productReference = 532AA3BB2F09C4CB00B4C836 /* RoboCar.app */;
@@ -120,6 +123,7 @@
 			packageReferences = (
 				532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */,
 				533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */,
+				53A57859305E19AB00D6B634 /* XCRemoteSwiftPackageReference "GLTFKit2" */,
 			);
 			preferredProjectObjectVersion = 77;
 			productRefGroup = 532AA3BC2F09C4CB00B4C836 /* Products */;
@@ -415,6 +419,14 @@
 				minimumVersion = 1.1.0;
 			};
 		};
+		53A57859305E19AB00D6B634 /* XCRemoteSwiftPackageReference "GLTFKit2" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/warrenm/GLTFKit2";
+			requirement = {
+				kind = upToNextMajorVersion;
+				minimumVersion = 0.5.15;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -427,6 +439,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = 533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */;
 			productName = IrohLib;
+		};
+		53A5785A305E19AB00D6B634 /* GLTFKit2 */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = 53A57859305E19AB00D6B634 /* XCRemoteSwiftPackageReference "GLTFKit2" */;
+			productName = GLTFKit2;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

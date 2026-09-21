@@ -10,6 +10,38 @@ Open Paired Devices and use the trash button or swipe Remove Pairing to delete a
 
 Device labels use `UIDevice.current.name` and refresh on authenticated reconnection. On iOS 16 and later, obtaining the system-given name requires Apple's `com.apple.developer.device-information.user-assigned-device-name` entitlement. Both entitlement files request it. Request approval at https://developer.apple.com/contact/request/user-assigned-device-name/ and regenerate the provisioning profiles before signing. Without approval, signing can fail or the system can return a generic name. RoboCar does not substitute a custom app nickname.
 
+## Robot Model Editor
+
+Open **Settings > Model Editor** on the robot host or remote controller. The editor is available even when Bluetooth or the remote robot is disconnected. Use Import to choose a GLB from Files. Orbit, pan and pinch in the viewport; tap parts or rows to toggle selection. The eye button isolates the selection. Disconnected mesh components become individually selectable parts, with original materials retained.
+
+Select parts and choose **Create Group**. **Add Parts** and **Remove Parts** change membership; moving parts between groups requires confirmation. **Group Settings** provides rename, parent selection and deletion. The group picker displays the active group's name. A parent moves all its descendant groups. Undo/redo applies to document edits only. Changes are saved atomically beside a copied GLB under Application Support/RobotModels, keyed by SHA-256. The last imported model reopens automatically; selecting an earlier GLB restores that model's saved rig.
+
+Creating a group automatically enters **Select Axis Face** mode. For an existing group, choose it in the group picker and press **Select Axis Face**. Click/tap a flat surface on one of that group's parts in the 3D viewport. The highlighted region consists of connected coplanar triangles, including triangles separated by material/UV seams. Press **Use Selected Face** to save the axis: the pivot is the region's area-weighted center and the direction is its geometric normal. **Cancel Face Selection** returns to part selection without changing the saved axis. **Flip Axis** reverses direction; **Edit Axis** edits origin/direction in original model-rest coordinates. Curved surfaces are not treated as a single flat face. Once the axis is confirmed, the angle slider previews hierarchy motion; tap its numeric label to enter an exact preview angle. The inspector scrolls on smaller screens, and all actions have visible labels.
+
+The link button configures an ST3215 binding: servo ID, direction (+1/-1), motor-to-joint ratio, motor angle at the model's rest pose, and joint limits. Multi-turn angles are signed hardware-center degrees, not modulo encoder position. Position-mode mapping uses raw encoder degrees (0 through 4095 * 360 / 4096). Bindings saved while connected are scoped to that robot's BLE or Iroh identity; changing transport requires rebinding. Preview never sends motion, torque, calibration, or tracking commands.
+
+**Live control currently supports tracked multi-turn axes only.** Configure tracking, zero, both travel marks and torque in the existing servo controls first. Live requires fresh healthy telemetry and explicit confirmation of calibration. The play button sends a target; the displayed actual angle comes from telemetry. The stop button stops editor-owned motion and returns to Preview. Backgrounding, hiding the editor, stale/error telemetry, and connection changes disarm control. Multi-turn target speed uses the existing firmware default. Physical hardware validation remains required before normal use.
+
+Ordinary position-mode Live moves are intentionally disabled: the current firmware's multi-turn stop does not abort native position moves. A lost transport cannot guarantee a physical stop. This editor does not provide collision avoidance, IK, or an emergency-stop guarantee. Never rely on the model preview to establish mechanically safe travel.
+
+Import limits: embedded GLB 2.0 resources, rigid triangle meshes, 100 MB file, 1,000,000 triangles after mesh instances are expanded, 2,000 components, and bounded decoded geometry buffers. Meshopt compression, quantized geometry and WebP textures have been exercised with the repository's MangoBot asset. Draco, KTX2, skinning/morph targets, external resources and other required extensions are rejected. Source animations are not played. Fused surfaces cannot be manually cut; re-export separate parts for those models. The importer is asynchronous, but document copying and geometry/component preparation currently run on the UI thread and can pause interaction for large assets. Models and calibration are local to each app installation; peer synchronization and a model-library browser are not included. Import failures remain visible rather than being replaced by motor telemetry status.
+
+Choose **Move Axis** after confirming an axis to reposition its pivot with red **X**, green **Y**, and blue **Z** cone-tipped handles. Drag a handle in the viewport; movement is constrained to that model-rest coordinate and leaves the axis direction unchanged. Each released drag is saved as one undoable edit. **Done Moving Axis** returns to normal selection and rotation preview. Moving the pivot resets preview rotations to the rest pose and is unavailable in Live mode. **Edit Axis** remains available for exact origin and direction values.
+
+### Editor Checks
+
+From the workspace root:
+
+```sh
+DEVELOPER_DIR=/Applications/Xcode-beta.app/Contents/Developer xcrun swiftc \
+  RoboCar/RoboCar/Models/RobotRigDocument.swift \
+  RoboCar/RoboCar/Models/RobotRigGeometry.swift \
+  RoboCar/Tests/RobotRigChecks.swift -o /tmp/robocar-rig-checks
+/tmp/robocar-rig-checks
+```
+
+Debug builds support the launch argument `--robot-rig-checks` to open isolated runtime checks with synthetic geometry and a mock motor transport. Optional `--rig-model /absolute/path/to/model.glb` also tests the real GLTFKit2 bridge and rendering. On Simulator, provide a host-readable file path. This checks multi-material face picking, persistence, Preview command isolation, motor conversion, pending-command rejection, wrong-robot/session rejection, invalid telemetry and disconnect behavior. Results and a viewport snapshot are written to the app's temporary `RigChecks` directory. The harness is excluded from Release builds.
+
 ## Architecture Overview
 
 ```

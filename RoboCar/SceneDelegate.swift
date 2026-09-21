@@ -30,6 +30,12 @@ class SceneDelegate: UIResponder, UIWindowSceneDelegate {
     }
 
     private func installInitialRootViewController() {
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("--robot-rig-checks") {
+            window?.rootViewController = RobotModelViewController.makeRuntimeChecks()
+            return
+        }
+        #endif
         if let rawRole = UserDefaults.standard.string(forKey: RoboCarAppRole.userDefaultsKey),
            let role = RoboCarAppRole(rawValue: rawRole) {
             setRoot(for: role)

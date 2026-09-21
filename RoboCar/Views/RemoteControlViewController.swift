@@ -46,11 +46,11 @@ final class RemoteControlViewController: PanelViewController {
     private var discoveredHosts: [RemotePeer] = []
     private weak var settingsViewController: RemoteControlSettingsViewController?
     private weak var servoViewController: RemoteControlSettingsViewController?
-    private var servoDataController: RemoteControlSettingsViewController? {
+    private var servoDataControllers: [RemoteControlSettingsViewController] {
         #if targetEnvironment(macCatalyst)
-        return servoViewController
+        return [settingsViewController, servoViewController].compactMap { $0 }
         #else
-        return settingsViewController
+        return [settingsViewController].compactMap { $0 }
         #endif
     }
     private var remoteServoIDs: [UInt8] = []
@@ -363,7 +363,7 @@ final class RemoteControlViewController: PanelViewController {
             self.lastVideoFrameAt = Date()
             self.lastVideoRecoveryAt = Date()
             self.updateConnectionBadge()
-            self.servoDataController?.setConnected(true)
+            self.servoDataControllers.forEach { $0.setConnected(true) }
         }
         client.onDisconnected = { [weak self] in
             self?.resetRemoteMap()
@@ -371,7 +371,7 @@ final class RemoteControlViewController: PanelViewController {
             self?.remoteServoPositions.removeAll()
             self?.remoteServoStates.removeAll()
             self?.remoteServoAxisStatuses.removeAll()
-            self?.servoDataController?.setConnected(false)
+            self?.servoDataControllers.forEach { $0.setConnected(false) }
             self?.updateConnectionBadge()
         }
     }
@@ -434,25 +434,25 @@ final class RemoteControlViewController: PanelViewController {
             personBoxOverlay.people = message.personBoxes ?? []
         case "servoList":
             remoteServoIDs = message.servoIDs ?? []
-            servoDataController?.updateServoIDs(remoteServoIDs)
+            servoDataControllers.forEach { $0.updateServoIDs(remoteServoIDs) }
         case "servoState":
             if let remoteState = message.servoState {
                 let state = remoteState.asServoState
                 remoteServoStates[state.id] = state
-                servoDataController?.applyServoState(state)
+                servoDataControllers.forEach { $0.applyServoState(state) }
             }
         case "servoPositions":
             if let samples = message.servoPositions {
                 var positions: [UInt8: UInt16] = [:]
                 samples.forEach { positions[$0.id] = $0.position }
                 remoteServoPositions.merge(positions) { _, new in new }
-                servoDataController?.applyServoPositions(positions)
+                servoDataControllers.forEach { $0.applyServoPositions(positions) }
             }
         case "servoAxisStatus":
             if let remoteStatus = message.servoAxisStatus {
                 let status = remoteStatus.asServoAxisStatus
                 remoteServoAxisStatuses[status.id] = status
-                servoDataController?.applyServoAxisStatus(status)
+                servoDataControllers.forEach { $0.applyServoAxisStatus(status) }
             }
         case "status":
             break
@@ -568,6 +568,7 @@ final class RemoteControlViewController: PanelViewController {
             let settings = RemoteControlSettingsViewController(client: client, discoveredHosts: discoveredHosts, mode: .settings)
             settings.onOpenServos = { [weak self] in self?.openServoWindow() }
             settingsViewController = settings
+            settings.seedServoData(ids: remoteServoIDs, positions: remoteServoPositions, states: remoteServoStates, axisStatuses: remoteServoAxisStatuses)
             return settings
         }
         #else
@@ -820,6 +821,8 @@ private final class RemoteControlSettingsViewController: PanelViewController {
     private let servoStatusLabel = UILabel()
     private let servoListView = ServoControlListView()
     private var servoCommander: RemoteServoCommander?
+    private weak var robotModelEditor: RobotModelViewController?
+    private var modelServoIDs: [UInt8] = []
 
     override var canBecomeFirstResponder: Bool { true }
 
@@ -873,6 +876,7 @@ private final class RemoteControlSettingsViewController: PanelViewController {
 
     func setConnected(_ connected: Bool) {
         guard isViewLoaded else { return }
+        robotModelEditor?.motors.connectionChanged()
         servoListView.setControlsEnabled(connected)
         joystickView.isUserInteractionEnabled = connected
         if !connected {
@@ -913,6 +917,7 @@ private final class RemoteControlSettingsViewController: PanelViewController {
 
     func seedServoData(ids: [UInt8], positions: [UInt8: UInt16], states: [UInt8: ServoState], axisStatuses: [UInt8: ServoAxisStatus]) {
         loadViewIfNeeded()
+        modelServoIDs = ids
         servoListView.setServoIDs(ids)
         if !positions.isEmpty {
             servoListView.apply(positions: positions)
@@ -923,6 +928,8 @@ private final class RemoteControlSettingsViewController: PanelViewController {
 
     func updateServoIDs(_ ids: [UInt8]) {
         guard isViewLoaded else { return }
+        modelServoIDs = ids
+        robotModelEditor?.motors.updateIDs(ids)
         servoListView.setServoIDs(ids)
         servoStatusLabel.text = ids.isEmpty ? "No servos found" : "\(ids.count) servo\(ids.count == 1 ? "" : "s") scanned"
     }
@@ -934,11 +941,13 @@ private final class RemoteControlSettingsViewController: PanelViewController {
 
     func applyServoState(_ state: ServoState) {
         guard isViewLoaded else { return }
+        robotModelEditor?.motors.receive(state)
         servoListView.apply(state: state)
     }
 
     func applyServoAxisStatus(_ status: ServoAxisStatus) {
         guard isViewLoaded else { return }
+        robotModelEditor?.motors.receive(status)
         servoListView.apply(axisStatus: status)
     }
 
@@ -980,6 +989,9 @@ private final class RemoteControlSettingsViewController: PanelViewController {
 
         let switchModeButton = makeButton("Switch to Robot Host", systemImageName: "arrow.triangle.2.circlepath", action: #selector(switchToRobotTapped))
         view.addSubview(switchModeButton)
+
+        let robotModelButton = makeButton("Model Editor", systemImageName: "cube.transparent", action: #selector(openRobotModelTapped))
+        view.addSubview(robotModelButton)
 
         let connectionTitle = UILabel()
         connectionTitle.translatesAutoresizingMaskIntoConstraints = false
@@ -1110,11 +1122,16 @@ private final class RemoteControlSettingsViewController: PanelViewController {
             title.trailingAnchor.constraint(lessThanOrEqualTo: doneButton.leadingAnchor, constant: -8)
         ])
 
-        let connectionViews: [UIView] = [switchModeButton, connectionTitle, hostField, connectButton, connectionStatusLabel, discoveredStack, motorLabel, joystickView]
+        let connectionViews: [UIView] = [robotModelButton, switchModeButton, connectionTitle, hostField, connectButton, connectionStatusLabel, discoveredStack, motorLabel, joystickView]
         connectionViews.forEach { $0.isHidden = mode == .servos }
         if mode != .servos {
             NSLayoutConstraint.activate([
-            switchModeButton.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 20),
+            robotModelButton.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 20),
+            robotModelButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
+            robotModelButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
+            robotModelButton.heightAnchor.constraint(equalToConstant: 44),
+
+            switchModeButton.topAnchor.constraint(equalTo: robotModelButton.bottomAnchor, constant: 12),
             switchModeButton.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 24),
             switchModeButton.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -24),
             switchModeButton.heightAnchor.constraint(equalToConstant: 40),
@@ -1243,6 +1260,19 @@ private final class RemoteControlSettingsViewController: PanelViewController {
     }
 
     @objc private func openServosTapped() { onOpenServos?() }
+
+    @objc private func openRobotModelTapped() {
+        guard let commander = servoCommander else { return }
+        servoListView.setScreenActive(false)
+        let motors = RobotRigMotorController(commander: commander, connectionAvailable: { [weak client] in client?.isConnected == true },
+                             robotIdentity: { RemoteControlIrohSession.shared.connectedPeer.map { "iroh:\($0.id)" } },
+                             connectionIdentity: { RemoteControlIrohSession.shared.sessionID.uuidString })
+        motors.updateIDs(modelServoIDs)
+        let editor = RobotModelViewController(motors: motors)
+        robotModelEditor = editor
+        editor.modalPresentationStyle = .fullScreen
+        present(editor, animated: true)
+    }
 
     @objc private func switchToRobotTapped() {
         requestAppRoleSwitch(.robot)
