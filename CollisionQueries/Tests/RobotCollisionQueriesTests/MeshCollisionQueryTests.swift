@@ -150,6 +150,48 @@ final class MeshCollisionQueryTests: XCTestCase {
         XCTAssertEqual(Set(distantPivot.check(poses: [[:], ["hinge": bend]], timeLimit: 1, measureOverlap: false).blockedParts), ["upper", "lower"])
     }
 
+    func testLinearJointDoesNotReceiveHingeContactAllowance() {
+        let upper = Mesh.cube(center: Vector(-1, 0, 0), size: Vector(2.1, 0.2, 0.2))
+        let lower = Mesh.cube(center: Vector(1, 0, 0), size: Vector(2.1, 0.2, 0.2))
+        let parts = [part("upper", owner: "base", mesh: upper), part("lower", owner: "slide", mesh: lower)]
+        let world = RigCollisionWorld(parts: parts,
+                                     joints: [.init(id: "slide", parent: "base", pivot: .zero, direction: SIMD3(1, 0, 0), isLinear: true)], moving: ["slide"])
+        let unrestricted = RigCollisionWorld(parts: parts, joints: [], moving: ["slide"])
+        var deeper = matrix_identity_float4x4
+        deeper.columns.3.x = -0.04
+        for measureOverlap in [true, false] {
+            let outcome = world.check(poses: [[:], ["slide": deeper]], timeLimit: 2, measureOverlap: measureOverlap)
+            let expected = unrestricted.check(poses: [[:], ["slide": deeper]], timeLimit: 2, measureOverlap: measureOverlap)
+            XCTAssertEqual(outcome.accepted, 0)
+            XCTAssertEqual(Set(outcome.blockedParts), ["upper", "lower"])
+            XCTAssertEqual(outcome.blockedParts, expected.blockedParts)
+        }
+        var away = matrix_identity_float4x4
+        away.columns.3.x = 1
+        XCTAssertEqual(world.check(poses: [[:], ["slide": away]], timeLimit: 2, measureOverlap: false).accepted, 1)
+    }
+
+    func testOpposingJawTranslationChecksBothBranches() {
+        let world = RigCollisionWorld(parts: [
+            part("source", owner: "source", mesh: .cube(center: Vector(2, 0, 0), size: 1)),
+            part("follower", owner: "follower", mesh: .cube(center: Vector(-2, 0, 0), size: 1)),
+            part("obstacle", owner: nil, mesh: .cube(center: Vector(-4, 0, 0), size: 1))
+        ], joints: [], moving: ["source", "follower"])
+        var source = matrix_identity_float4x4
+        source.columns.3.x = 0.5
+        var follower = matrix_identity_float4x4
+        follower.columns.3.x = -0.5
+        let clear = ["source": source, "follower": follower]
+        source.columns.3.x = 1.5
+        follower.columns.3.x = -1.5
+        let blocked = ["source": source, "follower": follower]
+        for measureOverlap in [true, false] {
+            let outcome = world.check(poses: [[:], clear, blocked], timeLimit: 2, measureOverlap: measureOverlap)
+            XCTAssertEqual(outcome.accepted, 1)
+            XCTAssertEqual(Set(outcome.blockedParts), ["follower", "obstacle"])
+        }
+    }
+
     func testWideJointContactWithSurfacePivotAllowsBendButBlocksFold() {
         let upper = Mesh.cube(center: Vector(-1, 0, 0), size: Vector(2.1, 0.2, 0.8))
         let lower = Mesh.cube(center: Vector(1, 0, 0), size: Vector(2.1, 0.2, 0.8))

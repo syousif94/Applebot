@@ -15,6 +15,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private let angleLabel = UILabel()
     private let groupButton = UIButton(type: .system)
     private let mode = UISegmentedControl(items: ["Preview", "Live"])
+    private let motionKind = UISegmentedControl(items: ["Rotation", "Linear"])
+    private let mechanismLabel = UILabel()
     private let split = UIStackView()
     private let inspector = UIStackView()
     private let inspectorScroll = UIScrollView()
@@ -238,6 +240,15 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         mode.heightAnchor.constraint(equalToConstant: 32).isActive = true
         angle.heightAnchor.constraint(equalToConstant: 32).isActive = true
         mode.addTarget(self, action: #selector(modeChanged), for: .valueChanged)
+        motionKind.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        motionKind.addTarget(self, action: #selector(motionKindChanged), for: .valueChanged)
+        mechanismLabel.font = .systemFont(ofSize: 13, weight: .medium)
+        mechanismLabel.numberOfLines = 0
+        let mechanismTools = actionGrid([
+            button("Travel Limits", "arrow.left.and.right", #selector(editTravel)),
+            button("Opposing Jaw", "link", #selector(chooseOpposingJaw)),
+            button("Model Units", "ruler", #selector(editModelUnits))
+        ])
         let motorTools = actionGrid([
             button("Motor Binding", "link", #selector(bindMotor)),
             button("Move to Target", "play.fill", #selector(moveMotor)),
@@ -250,9 +261,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         actionButtons[#selector(deselectAllParts)]?.toolTip = "Deselect All (Command-Shift-A)"
         addSidebarSection("Hierarchy", views: [search, table, selectionLabel, selectionTools])
         addSidebarSection("Parts & Groups", views: [groupButton, groupTools])
-        addSidebarSection("Rotation Axis", views: [axisStateLabel, axisTools])
+        addSidebarSection("Motion Axis", views: [motionKind, axisStateLabel, axisTools, mechanismLabel, mechanismTools])
         addSidebarSection("Inverse Kinematics", views: [ikStateLabel, ikTools])
-        addSidebarSection("Rotation & Motor", views: [mode, angleLabel, angle, motorTools])
+        addSidebarSection("Position & Motor", views: [mode, angleLabel, angle, motorTools])
         groupButton.heightAnchor.constraint(equalToConstant: 44).isActive = true
         search.heightAnchor.constraint(equalToConstant: 44).isActive = true
         table.heightAnchor.constraint(equalToConstant: 320).isActive = true
@@ -326,6 +337,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private var activeGroup: RobotRigGroup? { document.groups.first { $0.id == activeGroupID } }
+    private var activeMotionSource: RobotRigGroup? { activeGroup.map { document.motionSource(for: $0) } }
+    private var activeMotorBinding: RobotRigMotorBinding? { activeGroup.flatMap { document.motorBinding(for: $0) } }
     private var partIDs: Set<String> { Set(viewport.parts.map(\.id)) }
     private var canEditTree: Bool {
         assetURL != nil && !motors.isArmed && !importing && !pickingAxis && !movingAxis && !pickingIK && ikTarget == nil
@@ -444,16 +457,28 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             let transform = activeGroupID.flatMap { document.transforms(angles: angles)[$0] } ?? matrix_identity_float4x4
             viewport.showAxis(activeGroup?.axis, transform: transform, movable: movingAxis)
         }
-        let binding = activeGroup?.motor
-        angle.minimumValue = Float(binding?.minimum ?? -180)
-        angle.maximumValue = Float(binding?.maximum ?? 180)
+        let limits = activeGroup.map { document.limits(for: $0) } ?? -180...180
+        angle.minimumValue = limits.lowerBound
+        angle.maximumValue = limits.upperBound
         angle.isEnabled = activeGroup?.axis != nil && !importing
-        let measured = activeGroupID.flatMap { angles[$0] } ?? 0
+        let measured = activeMotionSource.flatMap { angles[$0.id] } ?? 0
         if !motors.isArmed { angle.value = measured }
-        angleLabel.text = motors.isArmed ? String(format: "Actual %.1f / Target %.1f deg", measured, angle.value) : String(format: "%.1f deg", measured)
+        let unit = activeGroup?.linear == nil ? "deg" : "mm"
+        angleLabel.text = motors.isArmed ? String(format: "Actual %.2f / Target %.2f %@", measured, angle.value, unit) : String(format: "%.2f %@", measured, unit)
+        angleLabel.accessibilityLabel = "Joint position in \(unit), tap to enter a value"
         mode.selectedSegmentIndex = motors.isArmed ? 1 : 0
         let editable = !motors.isArmed && !importing && assetURL != nil
         let group = activeGroup
+        motionKind.selectedSegmentIndex = group?.linear == nil ? 0 : 1
+        motionKind.isEnabled = editable && group != nil && !pickingAxis
+        let source = activeMotionSource
+        let opposing = source.flatMap { source in document.groups.first { $0.linear?.sourceID == source.id } }
+        mechanismLabel.text = group?.linear == nil ? nil : (group?.linear?.sourceID != nil
+            ? "Driven by: \(source?.name ?? "") / source travel (mm)"
+            : (opposing.map { "Opposing jaw: \($0.name) / travel per jaw (mm)" } ?? "Single-axis travel (mm)"))
+        updateAction(#selector(editTravel), enabled: editable && group?.linear != nil)
+        updateAction(#selector(chooseOpposingJaw), enabled: editable && group?.linear != nil)
+        updateAction(#selector(editModelUnits), enabled: editable)
         viewportModeLabel.text = pickingAxis
             ? (pendingSurface == nil ? "  Select Axis Face: \(group?.name ?? "")  " : "  Selected Face: Confirm or Select Another  ")
             : (motors.isArmed ? "  Live Motor Control  " : "  Select Parts  ")
@@ -469,7 +494,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 : "Face selected: \(pendingSurface!.1.triangles.count) flat triangles. Axis awaiting confirmation."
             axisStateLabel.textColor = .systemOrange
         } else {
-            axisStateLabel.text = group == nil ? "No active group" : (group?.axis == nil ? "Rotation axis not set" : "Rotation axis set")
+            let axisName = group?.linear == nil ? "Rotation axis" : "Travel axis"
+            axisStateLabel.text = group == nil ? "No active group" : (group?.axis == nil ? "\(axisName) not set" : "\(axisName) set")
             axisStateLabel.textColor = group?.axis == nil ? .secondaryLabel : .systemGreen
         }
         updateAction(#selector(createGroup), enabled: editable && !selected.isEmpty && !pickingAxis)
@@ -659,7 +685,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 self.activeGroupID = group.id
                 self.pickingAxis = true
                 self.refresh()
-                self.setSidebarSection("Rotation Axis", collapsed: false)
+                self.setSidebarSection("Motion Axis", collapsed: false)
                 self.inspectorScroll.scrollRectToVisible(self.axisStateLabel.convert(self.axisStateLabel.bounds, to: self.inspector), animated: true)
             }
         }
@@ -698,6 +724,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         menu.addAction(UIAlertAction(title: "Parent Group", style: .default) { [weak self] _ in self?.chooseParent() })
         menu.addAction(UIAlertAction(title: "Delete Group", style: .destructive) { [weak self] _ in
             self?.edit { draft in
+                Self.unlinkJaws(from: group, in: &draft)
                 draft.groups.removeAll { $0.id == group.id }
                 for index in draft.groups.indices where draft.groups[index].parentID == group.id { draft.groups[index].parentID = group.parentID }
                 for index in draft.groups.indices where draft.groups[index].ikHelper?.rootID == group.id {
@@ -798,9 +825,108 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     @objc private func angleChanged() {
-        guard let id = activeGroupID else { return }
+        guard let id = activeMotionSource?.id else { return }
         if !motors.isArmed { angles[id] = angle.value }
         refresh()
+    }
+
+    private static func unlinkJaws(from source: RobotRigGroup, in draft: inout RobotRigDocument) {
+        for index in draft.groups.indices where draft.groups[index].linear?.sourceID == source.id {
+            draft.groups[index].linear = RobotRigLinearMotion(minimum: source.linear?.minimum ?? 0, maximum: source.linear?.maximum ?? 10)
+        }
+    }
+
+    @objc private func motionKindChanged() {
+        guard let group = activeGroup, !motors.isArmed else { refresh(); return }
+        let linear = motionKind.selectedSegmentIndex == 1
+        refresh()
+        guard linear != (group.linear != nil) else { return }
+        if linear {
+            guard group.axis != nil else { showError("Set a travel axis before selecting Linear"); return }
+            if document.millimetersPerModelUnit == nil {
+                chooseModelUnits { [weak self] scale in self?.configureLinear(group, scale: scale) }
+            } else { configureLinear(group, scale: document.millimetersPerModelUnit!) }
+        } else {
+            confirm("Use Rotation", message: "This clears this group's motor calibration and unlinks any opposing jaw. Preview returns to rest.") { [weak self] in
+                self?.edit { draft in
+                    Self.unlinkJaws(from: group, in: &draft)
+                    guard let index = draft.groups.firstIndex(where: { $0.id == group.id }) else { return }
+                    draft.groups[index].linear = nil
+                    draft.groups[index].motor = nil
+                }
+            }
+        }
+    }
+
+    private func configureLinear(_ group: RobotRigGroup, scale: Float) {
+        prompt(title: "Linear Travel (Clears Motor Binding)", fields: [("Minimum mm", "0"), ("Maximum mm", "10")]) { [weak self] values in
+            guard let minimum = Double(values[0]), let maximum = Double(values[1]) else { self?.showError("Enter travel limits in millimeters"); return }
+            self?.edit { draft in
+                guard let index = draft.groups.firstIndex(where: { $0.id == group.id }) else { return }
+                draft.version = 2
+                draft.millimetersPerModelUnit = scale
+                draft.groups[index].linear = RobotRigLinearMotion(minimum: minimum, maximum: maximum)
+                draft.groups[index].motor = nil
+            }
+        }
+    }
+
+    @objc private func editTravel() {
+        guard let source = activeMotionSource, let linear = source.linear else { return }
+        prompt(title: "\(source.name): Travel Limits", fields: [("Minimum mm", "\(linear.minimum)"), ("Maximum mm", "\(linear.maximum)")]) { [weak self] values in
+            guard let minimum = Double(values[0]), let maximum = Double(values[1]) else { self?.showError("Enter travel limits in millimeters"); return }
+            self?.edit { draft in
+                guard let index = draft.groups.firstIndex(where: { $0.id == source.id }) else { return }
+                draft.groups[index].linear?.minimum = minimum
+                draft.groups[index].linear?.maximum = maximum
+            }
+        }
+    }
+
+    @objc private func editModelUnits() {
+        chooseModelUnits { [weak self] scale in
+            self?.edit { $0.version = 2; $0.millimetersPerModelUnit = scale }
+        }
+    }
+
+    private func chooseModelUnits(_ completion: @escaping (Float) -> Void) {
+        let menu = UIAlertController(title: "Model Units", message: document.millimetersPerModelUnit.map { "Current: \($0) mm per model unit" }, preferredStyle: .actionSheet)
+        menu.addAction(UIAlertAction(title: "Meters (GLB Standard)", style: .default) { _ in completion(1000) })
+        menu.addAction(UIAlertAction(title: "Millimeters", style: .default) { _ in completion(1) })
+        menu.addAction(UIAlertAction(title: "Custom Scale", style: .default) { [weak self] _ in
+            self?.prompt(title: "Model Scale", fields: [("Millimeters per model unit", "\(self?.document.millimetersPerModelUnit ?? 1)")]) { values in
+                guard let scale = Float(values[0]), scale.isFinite, scale > 0 else { self?.showError("Enter a positive finite scale"); return }
+                completion(scale)
+            }
+        })
+        menu.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        showSheet(menu)
+    }
+
+    @objc private func chooseOpposingJaw() {
+        guard let source = activeMotionSource, let linear = source.linear else { return }
+        let menu = UIAlertController(title: "\(source.name): Opposing Jaw", message: nil, preferredStyle: .actionSheet)
+        menu.addAction(UIAlertAction(title: "None (Single Moving Group)", style: .default) { [weak self] _ in
+            self?.edit { Self.unlinkJaws(from: source, in: &$0) }
+        })
+        for candidate in document.groups where candidate.id != source.id && candidate.parentID == source.parentID {
+            guard let axis = candidate.axis, let sourceAxis = source.axis,
+                  abs(simd_dot(axis.direction, sourceAxis.direction)) > 0.9999,
+                  candidate.linear?.sourceID == nil || candidate.linear?.sourceID == source.id,
+                  !document.groups.contains(where: { $0.linear?.sourceID == candidate.id }) else { continue }
+            menu.addAction(UIAlertAction(title: candidate.name, style: .default) { [weak self] _ in
+                self?.confirm("Link Opposing Jaw", message: "\(candidate.name) will move opposite \(source.name), using its motor and limits. Its separate motor binding will be removed.") {
+                    self?.edit { draft in
+                        Self.unlinkJaws(from: source, in: &draft)
+                        guard let index = draft.groups.firstIndex(where: { $0.id == candidate.id }) else { return }
+                        draft.groups[index].linear = RobotRigLinearMotion(minimum: linear.minimum, maximum: linear.maximum, sourceID: source.id)
+                        draft.groups[index].motor = nil
+                    }
+                }
+            })
+        }
+        menu.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        showSheet(menu)
     }
 
     private func stopIK() {
@@ -903,10 +1029,10 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         if !wasActive {
             do {
                 let chain = try document.ikChain(for: group.id)
-                guard chain.contains(where: { $0.axis != nil }) else { throw RobotRigError.invalid("Set rotation axes on the IK chain first") }
-                var moving = Set(chain.filter { $0.axis != nil }.map { $0.id.uuidString })
+                guard chain.contains(where: { $0.axis != nil }) else { throw RobotRigError.invalid("Set motion axes on the IK chain first") }
+                var moving = Set(chain.filter { $0.axis != nil }.map { document.motionSource(for: $0).id.uuidString })
                 for _ in document.groups.indices {
-                    for item in document.groups where item.parentID.map({ moving.contains($0.uuidString) }) == true {
+                    for item in document.groups where item.parentID.map({ moving.contains($0.uuidString) }) == true || item.linear?.sourceID.map({ moving.contains($0.uuidString) }) == true {
                         moving.insert(item.id.uuidString)
                     }
                 }
@@ -916,7 +1042,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                                            vertices: part.mesh.triangles.flatMap { [$0.first, $0.second, $0.third] })
                 }
                 let joints = document.groups.compactMap { item in
-                    item.axis.map { RigCollisionWorld.Joint(id: item.id.uuidString, parent: item.parentID?.uuidString, pivot: $0.origin, direction: $0.direction) }
+                    item.axis.map { RigCollisionWorld.Joint(id: item.id.uuidString, parent: item.parentID?.uuidString, pivot: $0.origin, direction: $0.direction, isLinear: item.linear != nil) }
                 }
                 let movingIDs = moving
                 collisionPreparation = Task.detached(priority: .userInitiated) {
@@ -980,8 +1106,10 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 collisionGeneration = generation
                 let initial = angles
                 let ids = Set(initial.keys).union(result.angles.keys)
-                let travel = ids.reduce(Float(0)) { $0 + abs((result.angles[$1] ?? 0) - (initial[$1] ?? 0)) }
-                let stepCount = min(8, max(1, Int(ceil(travel / 5))))
+                let travel = document.groups.filter { $0.linear?.sourceID == nil }.reduce(Float(0)) { total, joint in
+                    total + abs((result.angles[joint.id] ?? 0) - (initial[joint.id] ?? 0)) / (joint.linear == nil ? 5 : 1)
+                }
+                let stepCount = Int(min(8, max(1, ceil(travel))))
                 let samples = (0...stepCount).map { step in
                     Dictionary(uniqueKeysWithValues: ids.map { id in
                         (id, (initial[id] ?? 0) + ((result.angles[id] ?? 0) - (initial[id] ?? 0)) * Float(step) / Float(stepCount))
@@ -1024,9 +1152,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     @objc private func enterAngle() {
         guard activeGroup?.axis != nil, !motors.isArmed, !movingAxis, !pickingIK, ikTarget == nil else { return }
-        prompt(title: "Preview Angle", fields: [("Degrees", "\(angle.value)")]) { [weak self] values in
+        prompt(title: "Preview Position", fields: [(activeGroup?.linear == nil ? "Degrees" : "Source travel mm", "\(angle.value)")]) { [weak self] values in
             guard let self, let degrees = Float(values[0]), degrees.isFinite,
-                  degrees >= self.angle.minimumValue, degrees <= self.angle.maximumValue else { self?.showError("Angle exceeds joint limits"); return }
+                  degrees >= self.angle.minimumValue, degrees <= self.angle.maximumValue else { self?.showError("Position exceeds joint limits"); return }
             self.angle.value = degrees
             self.angleChanged()
         }
@@ -1046,8 +1174,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     @objc private func modeChanged() {
         guard mode.selectedSegmentIndex == 1 else { motors.disarm(); refresh(); return }
         mode.selectedSegmentIndex = 0
-        guard let group = activeGroup, group.axis != nil, let binding = group.motor else { showError("Set an axis and bind a motor first"); return }
-        confirm("Enable Live Control", message: "Confirm this model's motor ID, zero offset, direction, gearing and limits match the connected robot. Clear its travel and keep a physical stop accessible.") { [weak self] in
+        guard let group = activeGroup, group.axis != nil, let binding = activeMotorBinding else { showError("Set an axis and bind a motor first"); return }
+        confirm("Enable Live Control", message: "Confirm the motor ID, rest offset, direction, calibration and limits match the robot. For linear motion, verify model units and mm per motor revolution. Live motion is not collision checked. Clear its travel and keep a physical stop accessible.") { [weak self] in
             guard let self else { return }
             do {
                 try self.motors.arm(binding)
@@ -1060,7 +1188,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     @objc private func bindMotor() {
-        guard let group = activeGroup, !motors.isArmed else { return }
+        guard let group = activeMotionSource, !motors.isArmed else { return }
         let menu = UIAlertController(title: "Motor Binding", message: nil, preferredStyle: .actionSheet)
         for motorMode in RobotRigMotorBinding.Mode.allCases {
             menu.addAction(UIAlertAction(title: motorMode == .multiTurn ? "Tracked Multi-Turn" : "Position (Preview Only)", style: .default) { [weak self] _ in self?.editBinding(group: group, motorMode: motorMode) })
@@ -1073,23 +1201,29 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private func editBinding(group: RobotRigGroup, motorMode: RobotRigMotorBinding.Mode) {
-        let binding = group.motor ?? RobotRigMotorBinding(servoID: Int(motors.servoIDs.first ?? 1), mode: motorMode, offset: motorMode == .position ? 180 : 0)
+        let binding = document.motorBinding(for: group) ?? RobotRigMotorBinding(servoID: Int(motors.servoIDs.first ?? 1), mode: motorMode, ratio: group.linear == nil ? 1 : 180, offset: motorMode == .position ? 180 : 0)
+        let linear = group.linear
+        let limits = document.limits(for: group)
         prompt(title: "Motor Calibration", fields: [
             ("Servo ID", "\(binding.servoID)"), ("Direction (+1 or -1)", binding.reversed ? "-1" : "1"),
-            ("Motor / joint ratio", "\(binding.ratio)"), ("Motor degrees at rest", "\(binding.offset)"),
-            ("Joint minimum degrees", "\(binding.minimum)"), ("Joint maximum degrees", "\(binding.maximum)")
+            (linear == nil ? "Motor / joint ratio" : "mm per motor revolution", "\(linear == nil ? binding.ratio : 360 / binding.ratio)"), ("Motor degrees at rest", "\(binding.offset)"),
+            (linear == nil ? "Joint minimum degrees" : "Minimum travel mm", "\(limits.lowerBound)"), (linear == nil ? "Joint maximum degrees" : "Maximum travel mm", "\(limits.upperBound)")
         ]) { [weak self] values in
             guard let id = Int(values[0]), let sign = Int(values[1]), [-1, 1].contains(sign),
                   let ratio = Double(values[2]), let offset = Double(values[3]), let lower = Double(values[4]), let upper = Double(values[5]) else {
                 self?.showError("Invalid motor calibration values"); return
             }
-            let updated = RobotRigMotorBinding(servoID: id, mode: motorMode, reversed: sign == -1, ratio: ratio, offset: offset, minimum: lower, maximum: upper, robotID: self?.motors.robotIdentity())
-            self?.edit { draft in if let index = draft.groups.firstIndex(where: { $0.id == group.id }) { draft.groups[index].motor = updated } }
+            let updated = RobotRigMotorBinding(servoID: id, mode: motorMode, reversed: sign == -1, ratio: linear == nil ? ratio : 360 / ratio, offset: offset, minimum: lower, maximum: upper, robotID: self?.motors.robotIdentity())
+            self?.edit { draft in if let index = draft.groups.firstIndex(where: { $0.id == group.id }) {
+                draft.groups[index].motor = updated
+                draft.groups[index].linear?.minimum = lower
+                draft.groups[index].linear?.maximum = upper
+            } }
         }
     }
 
     @objc private func moveMotor() {
-        guard let binding = activeGroup?.motor else { return }
+        guard let binding = activeMotorBinding else { return }
         do { try motors.move(binding, to: Double(angle.value)); status.text = "Target sent" }
         catch { showError(error.localizedDescription) }
     }
@@ -1098,8 +1232,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     private func motorUpdate() {
         if motors.isArmed {
-            for group in document.groups {
-                if let binding = group.motor, let measured = motors.measuredAngle(binding) { angles[group.id] = Float(measured) }
+            for group in document.groups where group.linear?.sourceID == nil {
+                if let binding = document.motorBinding(for: group), let measured = motors.measuredAngle(binding) { angles[group.id] = Float(measured) }
             }
         }
         if !importing, importError == nil, let message = motors.status { status.text = message == "Preview" ? nil : message }
@@ -1820,8 +1954,73 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 connected = true
                 motors.setActive(false)
                 precondition(commander.motion.count == 1)
+                let previousRig = editor.document
+                let sourceJaw = RobotRigGroup(name: "Linear source", parts: [editor.viewport.parts[0].id],
+                                             axis: RobotRigAxis(origin: .zero, direction: SIMD3(1, 0, 0)),
+                                             motor: RobotRigMotorBinding(servoID: 1, ratio: 180, robotID: "test"),
+                                             ikHelper: RobotRigIKHelper(point: .zero, rootID: UUID()),
+                                             linear: RobotRigLinearMotion())
+                let opposingJaw = RobotRigGroup(name: "Linear follower", parts: [editor.viewport.parts[1].id],
+                                               axis: sourceJaw.axis, linear: RobotRigLinearMotion(sourceID: sourceJaw.id))
+                var gripper = RobotRigDocument(version: 2, assetHash: previousRig.assetHash,
+                                               groups: [sourceJaw, opposingJaw], millimetersPerModelUnit: 1)
+                gripper.groups[0].ikHelper?.rootID = sourceJaw.id
+                editor.edit { $0 = gripper }
+                precondition(editor.document == gripper)
+                editor.selectGroup(opposingJaw.id)
+                precondition(editor.activeMotorBinding == gripper.motorBinding(for: sourceJaw))
+                editor.angle.value = 3
+                editor.angleChanged()
+                precondition(editor.angles[sourceJaw.id] == 3 && editor.angles[opposingJaw.id] == nil)
+                precondition(editor.angleLabel.text?.contains("mm") == true)
+                let jawTransforms = gripper.transforms(angles: editor.angles)
+                precondition(jawTransforms[sourceJaw.id]!.columns.3.x == 3 && jawTransforms[opposingJaw.id]!.columns.3.x == -3)
+                precondition(commander.motion.count == 1)
+                editor.undoTapped()
+                precondition(editor.document == previousRig)
+                editor.redoTapped()
+                precondition(editor.document == gripper)
+                let savedGripper = try RobotModelStorage.loadDocument(at: editor.assetURL!, hash: gripper.assetHash)
+                precondition(savedGripper == gripper)
+                editor.selectGroup(opposingJaw.id)
+                editor.angles[sourceJaw.id] = 3
+                editor.refresh()
+                editor.setSidebarSection("Hierarchy", collapsed: true)
+                editor.setSidebarSection("Parts & Groups", collapsed: true)
+                editor.setSidebarSection("Inverse Kinematics", collapsed: true)
+                editor.inspectorScroll.setContentOffset(.zero, animated: false)
+                editor.view.layoutIfNeeded()
+                SCNTransaction.flush()
+                let gripperImage = editor.viewport.snapshot()
+                precondition(gripperImage.size.width > 0 && gripperImage.size.height > 0)
+                let gripperFolder = FileManager.default.temporaryDirectory.appendingPathComponent("RigChecks")
+                try FileManager.default.createDirectory(at: gripperFolder, withIntermediateDirectories: true)
+                try gripperImage.pngData()?.write(to: gripperFolder.appendingPathComponent("linear-gripper.png"))
+                let gripperEditorImage = UIGraphicsImageRenderer(bounds: editor.view.bounds).image { context in
+                    editor.view.layer.render(in: context.cgContext)
+                    gripperImage.draw(in: editor.viewport.convert(editor.viewport.bounds, to: editor.view))
+                }
+                try gripperEditorImage.pngData()?.write(to: gripperFolder.appendingPathComponent("linear-editor.png"))
+                motors.setActive(true)
+                feed()
+                let effectiveBinding = editor.activeMotorBinding!
+                try motors.arm(effectiveBinding)
+                editor.motorUpdate()
+                precondition(editor.angles[sourceJaw.id] == 4 && editor.angles[opposingJaw.id] == nil)
+                editor.angle.value = 10
+                editor.moveMotor()
+                precondition(commander.motion == [660, 1800])
+                editor.stopMotor()
+                precondition(commander.stops == 2 && !motors.isArmed)
+                motors.setActive(false)
+                editor.undoTapped()
+                precondition(editor.document == previousRig)
+                editor.setSidebarSection("Hierarchy", collapsed: false)
+                editor.setSidebarSection("Parts & Groups", collapsed: false)
+                editor.setSidebarSection("Inverse Kinematics", collapsed: false)
+                print("PASS: linear editor, paired-jaw source routing, mm telemetry, single motor command, persistence, undo/redo and Stop")
                 print("PASS: actual SceneKit components, multi-material face picking, centroid, persistence, preview isolation, motor conversion, pending-move guard, invalid telemetry and disconnect")
-                var report = "PASS: SceneKit picking, centroid, persistence and guarded motor commands\nPASS: wrong robot and changed session rejected\nPASS: visible action labels, face selection, confirmation and preview enablement\n"
+                var report = "PASS: SceneKit picking, centroid, persistence and guarded motor commands\nPASS: wrong robot and changed session rejected\nPASS: visible action labels, face selection, confirmation and preview enablement\nPASS: linear editor, paired jaws, source-only Move, mm telemetry, persistence and undo/redo\n"
                 let args = ProcessInfo.processInfo.arguments
                 if let index = args.firstIndex(of: "--rig-model"), args.indices.contains(index + 1) {
                     let asset = try GLTFAsset(url: URL(fileURLWithPath: args[index + 1]), options: [:])
@@ -1859,7 +2058,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                                                        owner: saved.groups.first { $0.parts.contains(part.id) }?.id.uuidString, vertices: part.vertices)
                             }
                             let joints = saved.groups.compactMap { group in
-                                group.axis.map { RigCollisionWorld.Joint(id: group.id.uuidString, parent: group.parentID?.uuidString, pivot: $0.origin, direction: $0.direction) }
+                                group.axis.map { RigCollisionWorld.Joint(id: group.id.uuidString, parent: group.parentID?.uuidString, pivot: $0.origin, direction: $0.direction, isLinear: group.linear != nil) }
                             }
                             let moving = Set(saved.groups.map { $0.id.uuidString })
                             let poses = (0...2).map { step in

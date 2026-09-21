@@ -18,8 +18,10 @@ public struct RigCollisionWorld: Sendable {
         public let parent: String?
         public let pivot: SIMD3<Float>
         public let direction: SIMD3<Float>?
-        public init(id: String, parent: String?, pivot: SIMD3<Float>, direction: SIMD3<Float>? = nil) {
+        public let isLinear: Bool
+        public init(id: String, parent: String?, pivot: SIMD3<Float>, direction: SIMD3<Float>? = nil, isLinear: Bool = false) {
             self.id = id; self.parent = parent; self.pivot = pivot; self.direction = direction
+            self.isLinear = isLinear
         }
     }
 
@@ -147,7 +149,7 @@ public struct RigCollisionWorld: Sendable {
                         && solids[first].mesh.polygons.count + solids[second].mesh.polygons.count <= 1_000
                     if measureOverlap, prepared.insert(key).inserted,
                        let joint = joints.first(where: {
-                           ($0.id == firstOwner && $0.parent == secondOwner) || ($0.id == secondOwner && $0.parent == firstOwner)
+                           !$0.isLinear && (($0.id == firstOwner && $0.parent == secondOwner) || ($0.id == secondOwner && $0.parent == firstOwner))
                        }) {
                         let pivot = joint.pivot * scale
                         if useVolume, let region = MeshCollisionQuery.jointRegion(solids[first].mesh, solids[second].mesh,
@@ -249,7 +251,7 @@ public struct RigCollisionWorld: Sendable {
                           bounds[first].intersects(bounds[second]) else { continue }
                     var pair = MetalCollisionQuery.Pair(first: first, second: second, firstToSecond: inverses[second] * transforms[first])
                     if let firstOwner, let secondOwner, let joint = joints.first(where: {
-                        ($0.id == firstOwner && $0.parent == secondOwner) || ($0.id == secondOwner && $0.parent == firstOwner)
+                        !$0.isLinear && (($0.id == firstOwner && $0.parent == secondOwner) || ($0.id == secondOwner && $0.parent == firstOwner))
                     }) {
                         let pivot = joint.pivot * scale
                         if let contact = Self.jointContactSphere(solids[first].bounds, solids[second].bounds, pivot: pivot, direction: joint.direction) {

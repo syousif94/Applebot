@@ -25,6 +25,97 @@ struct RobotRigChecks {
         precondition(document.transforms(angles: [:])[child.id] == matrix_identity_float4x4)
         let restored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(document))
         precondition(restored == document)
+        let legacyJSON = """
+        {"version":1,"assetHash":"legacy","groups":[{"id":"00000000-0000-0000-0000-000000000001","name":"Old hinge","parts":[],"axis":{"origin":[0,0,0],"direction":[0,0,1]}}]}
+        """
+        let legacy = try JSONDecoder().decode(RobotRigDocument.self, from: Data(legacyJSON.utf8))
+        try legacy.validate(partIDs: [])
+        precondition(legacy.groups[0].linear == nil && legacy.millimetersPerModelUnit == nil)
+        let legacyTip = legacy.transforms(angles: [legacy.groups[0].id: 90])[legacy.groups[0].id]! * SIMD4<Float>(1, 0, 0, 1)
+        precondition(simd_distance(legacyTip, SIMD4(0, 1, 0, 1)) < 0.0001)
+        let slide = RobotRigGroup(name: "Slide", parts: ["slide"], parentID: parent.id,
+                      axis: RobotRigAxis(origin: SIMD3(8, 9, 10), direction: SIMD3(1, 0, 0)),
+                      motor: RobotRigMotorBinding(servoID: 3, ratio: 180), linear: RobotRigLinearMotion())
+        let jaw = RobotRigGroup(name: "Opposing jaw", parts: ["jaw"], parentID: parent.id,
+                       axis: slide.axis, linear: RobotRigLinearMotion(sourceID: slide.id))
+        var linearRig = RobotRigDocument(version: 2, assetHash: "linear", groups: [parent, slide, jaw], millimetersPerModelUnit: 1000)
+        try linearRig.validate(partIDs: ["upper", "slide", "jaw"])
+        let linearPose = linearRig.transforms(angles: [parent.id: 90, slide.id: 10, jaw.id: 99])
+        precondition(simd_distance(linearPose[slide.id]!.columns.3, SIMD4(0, 0.01, 0, 1)) < 0.0001)
+        precondition(simd_distance(linearPose[jaw.id]!.columns.3, SIMD4(0, -0.01, 0, 1)) < 0.0001)
+        precondition(linearPose[slide.id]!.columns.0 == linearPose[parent.id]!.columns.0)
+        let linearBinding = linearRig.motorBinding(for: jaw)!
+        precondition(linearBinding.motorAngle(for: 10) == 1800 && linearBinding.jointAngle(for: 1800) == 10)
+        precondition(linearBinding.minimum == 0 && linearBinding.maximum == 10)
+        let linearRestored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(linearRig))
+        precondition(linearRestored == linearRig)
+        var reversedLinearBinding = linearBinding
+        reversedLinearBinding.reversed = true
+        reversedLinearBinding.offset = 720
+        precondition(reversedLinearBinding.motorAngle(for: 3) == 180)
+        precondition(reversedLinearBinding.jointAngle(for: 180) == 3)
+        let followerChild = RobotRigGroup(name: "Jaw tip", parts: [], parentID: jaw.id)
+        var withChild = linearRig
+        withChild.groups.append(followerChild)
+        precondition(withChild.transforms(angles: [slide.id: 3])[followerChild.id] == withChild.transforms(angles: [slide.id: 3])[jaw.id])
+        func rejects(_ mutate: (inout RobotRigDocument) -> Void) {
+            var invalid = linearRig
+            mutate(&invalid)
+            do { try invalid.validate(partIDs: ["upper", "slide", "jaw"]); preconditionFailure("Invalid linear rig accepted") } catch {}
+        }
+        rejects { $0.version = 1 }
+        rejects { $0.millimetersPerModelUnit = nil }
+        rejects { $0.groups[2].linear?.sourceID = UUID() }
+        rejects { $0.groups[2].linear?.sourceID = jaw.id }
+        rejects { $0.groups[1].linear?.sourceID = jaw.id }
+        rejects { $0.groups[2].parentID = slide.id }
+        rejects { $0.groups[2].axis?.direction = SIMD3(0, 1, 0) }
+        rejects { $0.groups[1].linear?.minimum = 1 }
+        rejects { $0.groups[1].linear?.maximum = .infinity }
+        rejects { $0.groups[1].linear?.maximum = Double.leastNonzeroMagnitude }
+        rejects { $0.groups[1].motor?.ratio = 0 }
+        rejects { $0.groups[1].motor?.mode = .position }
+        rejects { draft in
+            draft.groups.append(RobotRigGroup(name: "Extra follower", parts: [], parentID: parent.id, axis: slide.axis, linear: RobotRigLinearMotion(sourceID: slide.id)))
+        }
+        linearRig.millimetersPerModelUnit = 1
+        precondition(linearRig.transforms(angles: [slide.id: 3])[jaw.id]!.columns.3 == SIMD4(-3, 0, 0, 1))
+        linearRig.groups[2].axis?.direction *= -1
+        precondition(linearRig.transforms(angles: [slide.id: 3])[jaw.id]!.columns.3 == SIMD4(-3, 0, 0, 1))
+        linearRig.millimetersPerModelUnit = 2
+        precondition(linearRig.transforms(angles: [slide.id: 3])[slide.id]!.columns.3 == SIMD4(1.5, 0, 0, 1))
+        linearRig.groups[2].motor = RobotRigMotorBinding(servoID: 4)
+        do { try linearRig.validate(partIDs: ["upper", "slide", "jaw"]); preconditionFailure("Follower motor accepted") } catch {}
+        linearRig.groups[2].motor = nil
+        linearRig.millimetersPerModelUnit = 0
+        do { try linearRig.validate(partIDs: ["upper", "slide", "jaw"]); preconditionFailure("Zero scale accepted") } catch {}
+        linearRig.millimetersPerModelUnit = 1
+        linearRig.groups[1].ikHelper = RobotRigIKHelper(point: .zero, rootID: slide.id)
+        let slideSolution = try linearRig.solveIK(for: slide.id, target: SIMD3(7, 0, 0), angles: [:])
+        precondition(slideSolution.reached && abs(slideSolution.angles[slide.id]! - 7) < 0.02)
+        let slideLimited = try linearRig.solveIK(for: slide.id, target: SIMD3(20, 0, 0), angles: [:])
+        precondition(!slideLimited.reached && slideLimited.angles[slide.id] == 10)
+        linearRig.groups[2].ikHelper = RobotRigIKHelper(point: .zero, rootID: jaw.id)
+        let jawSolution = try linearRig.solveIK(for: jaw.id, target: SIMD3(0, -6, 0), angles: [parent.id: 90])
+        precondition(jawSolution.reached && abs(jawSolution.angles[slide.id]! - 6) < 0.02)
+        precondition(jawSolution.angles[parent.id] == 90 && jawSolution.angles[jaw.id] == nil)
+        linearRig.groups[1].ikHelper?.rootID = parent.id
+        let mixedTarget = linearRig.ikEndpoint(for: slide.id, angles: [parent.id: 40, slide.id: 8])!
+        let mixedSolution = try linearRig.solveIK(for: slide.id, target: mixedTarget, angles: [:])
+        precondition(mixedSolution.reached)
+        linearRig.millimetersPerModelUnit = 1000
+        let scaledSolution = try linearRig.solveIK(for: slide.id, target: mixedTarget / 1000, angles: [:])
+        precondition(scaledSolution.reached && abs(scaledSolution.angles[slide.id]! - mixedSolution.angles[slide.id]!) < 0.02)
+        linearRig.groups[2].ikHelper?.rootID = parent.id
+        let coupledTarget = linearRig.ikEndpoint(for: jaw.id, angles: [parent.id: 35, slide.id: 7])!
+        let coupledSolution = try linearRig.solveIK(for: jaw.id, target: coupledTarget, angles: [:])
+        precondition(coupledSolution.reached)
+        linearRig.groups[1].linear?.minimum = -10
+        linearRig.groups[1].ikHelper?.rootID = slide.id
+        let negativeSolution = try linearRig.solveIK(for: slide.id, target: SIMD3(-0.005, 0, 0), angles: [:])
+        precondition(negativeSolution.reached && abs(negativeSolution.angles[slide.id]! + 5) < 0.02)
+        print("PASS: linear and mixed IK, coupled source dependency, limits, fixed ancestors and physical scale")
+        print("PASS: linear transforms, parent rotation, paired jaws, physical units, calibration and persistence")
         var rig = document
         rig.groups[1].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: parent.id)
         try rig.validate(partIDs: ["upper", "lower"])
