@@ -23,6 +23,10 @@ struct RobotRigDocument: Codable, Equatable {
                 }
             }
             if let axis = group.axis { try axis.validate() }
+            if let helper = group.ikHelper {
+                guard helper.point.isFinite else { throw RobotRigError.invalid("IK helper must be finite") }
+                _ = try ikChain(for: group.id)
+            }
             if let binding = group.motor {
                 try binding.validate()
                 guard motors.insert(binding.servoID).inserted else { throw RobotRigError.invalid("A servo can drive only one group") }
@@ -62,6 +66,123 @@ struct RobotRigGroup: Codable, Equatable, Identifiable {
     var parentID: UUID?
     var axis: RobotRigAxis?
     var motor: RobotRigMotorBinding?
+    var ikHelper: RobotRigIKHelper?
+}
+
+struct RobotRigIKHelper: Codable, Equatable {
+    var point: SIMD3<Float>
+    var rootID: UUID
+}
+
+struct RobotRigIKResult {
+    var angles: [UUID: Float]
+    var endpoint: SIMD3<Float>
+    var error: Float
+    var reached: Bool
+}
+
+extension RobotRigDocument {
+    func ikChain(for groupID: UUID) throws -> [RobotRigGroup] {
+        guard let group = groups.first(where: { $0.id == groupID }), let helper = group.ikHelper else {
+            throw RobotRigError.invalid("Add an IK helper first")
+        }
+        var chain: [RobotRigGroup] = []
+        var visited = Set<UUID>()
+        var current: RobotRigGroup? = group
+        while let joint = current, visited.insert(joint.id).inserted {
+            chain.append(joint)
+            guard chain.count <= 32 else { throw RobotRigError.invalid("IK chains support up to 32 groups") }
+            if joint.id == helper.rootID { return chain }
+            current = groups.first { $0.id == joint.parentID }
+        }
+        throw RobotRigError.invalid("IK chain root must be the child or one of its ancestors")
+    }
+
+    func ikEndpoint(for groupID: UUID, angles: [UUID: Float]) -> SIMD3<Float>? {
+        guard let helper = groups.first(where: { $0.id == groupID })?.ikHelper,
+              let transform = transforms(angles: angles)[groupID] else { return nil }
+        let point = transform * SIMD4(helper.point, 1)
+        return SIMD3(point.x, point.y, point.z)
+    }
+
+    func solveIK(for groupID: UUID, target: SIMD3<Float>, angles initial: [UUID: Float]) throws -> RobotRigIKResult {
+        guard target.isFinite, initial.values.allSatisfy(\.isFinite) else { throw RobotRigError.invalid("IK target and angles must be finite") }
+        let chain = try ikChain(for: groupID)
+        let joints = chain.filter { $0.axis != nil }
+        guard !joints.isEmpty, let helper = chain.first?.ikHelper else { throw RobotRigError.invalid("Set a rotation axis on at least one group in the IK chain") }
+        let lookup = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0) })
+        var ancestry = chain
+        var visited = Set(chain.map(\.id))
+        var parentID = chain.last?.parentID
+        while let id = parentID {
+            guard visited.insert(id).inserted, let parent = lookup[id] else { throw RobotRigError.invalid("Invalid IK ancestry") }
+            ancestry.append(parent)
+            parentID = parent.parentID
+        }
+        func chainTransforms(_ angles: [UUID: Float]) -> [UUID: simd_float4x4] {
+            var result: [UUID: simd_float4x4] = [:]
+            var inherited = matrix_identity_float4x4
+            for joint in ancestry.reversed() {
+                inherited *= joint.axis.map { $0.rotation(degrees: angles[joint.id] ?? 0) } ?? matrix_identity_float4x4
+                result[joint.id] = inherited
+            }
+            return result
+        }
+        let scale = max(joints.reduce(Float(0)) { max($0, simd_distance($1.axis!.origin, helper.point)) }, 0.0001)
+        let tolerance = scale * 0.001
+        var best = initial
+        for joint in joints {
+            best[joint.id] = min(max(best[joint.id] ?? 0, Float(joint.motor?.minimum ?? -180)), Float(joint.motor?.maximum ?? 180))
+        }
+        let initialPoint = chainTransforms(best)[groupID]! * SIMD4(helper.point, 1)
+        var bestPoint = SIMD3(initialPoint.x, initialPoint.y, initialPoint.z)
+        var bestError = simd_distance(bestPoint, target)
+        let seed = best
+        for attempt in 0..<3 {
+            var angles = best
+            if attempt > 0 {
+                for (index, joint) in joints.enumerated() {
+                    let perturbation: Float = (index % 2 == 0 ? 12 : -12) * (attempt == 1 ? 1 : -1)
+                    angles[joint.id] = min(max((seed[joint.id] ?? 0) + perturbation, Float(joint.motor?.minimum ?? -180)), Float(joint.motor?.maximum ?? 180))
+                }
+            }
+            for _ in 0..<100 {
+                let transforms = chainTransforms(angles)
+                let endpoint4 = transforms[groupID]! * SIMD4(helper.point, 1)
+                let endpoint = SIMD3(endpoint4.x, endpoint4.y, endpoint4.z)
+                let error = simd_distance(endpoint, target)
+                if error < bestError {
+                    best = angles
+                    bestPoint = endpoint
+                    bestError = error
+                }
+                if bestError <= tolerance { break }
+                let columns: [SIMD3<Float>] = joints.map { joint in
+                    let inherited = joint.parentID.flatMap { transforms[$0] } ?? matrix_identity_float4x4
+                    let origin = inherited * SIMD4(joint.axis!.origin, 1)
+                    let direction = inherited * SIMD4(joint.axis!.direction, 0)
+                    return simd_cross(SIMD3(direction.x, direction.y, direction.z), (endpoint - SIMD3(origin.x, origin.y, origin.z)) / scale)
+                }
+                var normal = matrix_identity_float3x3 * Float(0.0025)
+                for column in columns {
+                    normal += simd_float3x3(columns: (column * column.x, column * column.y, column * column.z))
+                }
+                let correction = simd_inverse(normal) * ((target - endpoint) / scale)
+                guard correction.isFinite else { break }
+                var changed = false
+                for (joint, column) in zip(joints, columns) {
+                    let delta = min(max(simd_dot(column, correction) * 180 / .pi, -10), 10)
+                    let old = angles[joint.id] ?? 0
+                    let next = min(max(old + delta, Float(joint.motor?.minimum ?? -180)), Float(joint.motor?.maximum ?? 180))
+                    changed = changed || abs(next - old) > 0.00001
+                    angles[joint.id] = next
+                }
+                if !changed { break }
+            }
+            if bestError <= tolerance { break }
+        }
+        return RobotRigIKResult(angles: best, endpoint: bestPoint, error: bestError, reached: bestError <= tolerance)
+    }
 }
 
 struct RobotRigAxis: Codable, Equatable {

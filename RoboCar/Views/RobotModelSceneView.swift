@@ -17,6 +17,10 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     private let modelRoot = SCNNode()
     private let overlayRoot = SCNNode()
     private let gizmoRoot = SCNNode()
+    private let ikRoot = SCNNode()
+    private var ikTarget: SIMD3<Float>?
+    private var ikParts = Set<String>()
+    private var ikPlaneDrag: (target: SIMD3<Float>, screen: CGPoint, depth: Float)?
     private var movableAxis: RobotRigAxis?
     private var axisDrag: (axis: RobotRigAxis, direction: SIMD3<Float>, parameter: Float)?
     private lazy var axisPan = UIPanGestureRecognizer(target: self, action: #selector(dragAxis(_:)))
@@ -25,6 +29,9 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     private var modelCenter = SIMD3<Float>.zero
     var onPick: ((String, Int) -> Void)?
     var onAxisMove: ((RobotRigAxis, UIGestureRecognizer.State) -> Void)?
+    var onHelperPick: ((String, SIMD3<Float>) -> Void)?
+    var onIKDragBegan: (() -> Void)?
+    var onIKMove: ((SIMD3<Float>, UIGestureRecognizer.State) -> Void)?
 
     init() {
         super.init(frame: .zero, options: nil)
@@ -32,6 +39,7 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         scene?.rootNode.addChildNode(modelRoot)
         scene?.rootNode.addChildNode(overlayRoot)
         scene?.rootNode.addChildNode(gizmoRoot)
+        scene?.rootNode.addChildNode(ikRoot)
         scene?.rootNode.addChildNode(cameraNode)
         cameraNode.camera = SCNCamera()
         pointOfView = cameraNode
@@ -155,7 +163,10 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     }
 
     func showAxis(_ axis: RobotRigAxis?, surface: RobotRigSurface? = nil, partID: String? = nil, transform: simd_float4x4 = matrix_identity_float4x4, movable: Bool = false) {
-        guard axisDrag == nil else { return }
+        guard axisDrag == nil, ikPlaneDrag == nil else { return }
+        ikTarget = nil
+        ikParts.removeAll()
+        ikRoot.childNodes.forEach { $0.removeFromParentNode() }
         overlayRoot.childNodes.forEach { $0.removeFromParentNode() }
         gizmoRoot.childNodes.forEach { $0.removeFromParentNode() }
         movableAxis = movable ? axis : nil
@@ -233,9 +244,45 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         return beginAxisDrag(at: CGPoint(x: location.x - translation.x, y: location.y - translation.y))
     }
 
+    func showIK(target: SIMD3<Float>, endpoint: SIMD3<Float>, parts: Set<String>) {
+        ikTarget = target
+        ikParts = parts
+        movableAxis = RobotRigAxis(origin: target, direction: SIMD3(0, 1, 0))
+        overlayRoot.childNodes.forEach { $0.removeFromParentNode() }
+        gizmoRoot.childNodes.forEach { $0.removeFromParentNode() }
+        ikRoot.childNodes.forEach { $0.removeFromParentNode() }
+        showMoveHandles(movableAxis!)
+        for (point, color, name) in [(target, UIColor.systemPink, "IK Target"), (endpoint, UIColor.systemCyan, "IK Helper")] {
+            let node = SCNNode(geometry: SCNSphere(radius: CGFloat(radius * 0.035)))
+            node.simdPosition = point
+            node.name = name
+            node.geometry?.firstMaterial?.lightingModel = .constant
+            node.geometry?.firstMaterial?.diffuse.contents = color
+            node.geometry?.firstMaterial?.readsFromDepthBuffer = false
+            node.renderingOrder = 101
+            ikRoot.addChildNode(node)
+        }
+        let line = SCNGeometry(sources: [SCNGeometrySource(vertices: [SCNVector3(endpoint), SCNVector3(target)])],
+                               elements: [SCNGeometryElement(indices: [Int32(0), 1], primitiveType: .line)])
+        line.firstMaterial?.lightingModel = .constant
+        line.firstMaterial?.diffuse.contents = UIColor.systemPink
+        line.firstMaterial?.readsFromDepthBuffer = false
+        let node = SCNNode(geometry: line)
+        node.renderingOrder = 100
+        ikRoot.addChildNode(node)
+    }
+
     func beginAxisDrag(at point: CGPoint) -> Bool {
-        guard let axis = movableAxis, axisDrag == nil,
-              let hit = hitTest(point, options: [.rootNode: gizmoRoot, .searchMode: SCNHitTestSearchMode.all.rawValue]).first(where: { ["X", "Y", "Z"].contains($0.node.name ?? "") }) else { return false }
+        guard let axis = movableAxis, axisDrag == nil, ikPlaneDrag == nil else { return false }
+        guard let hit = hitTest(point, options: [.rootNode: gizmoRoot, .searchMode: SCNHitTestSearchMode.all.rawValue]).first(where: { ["X", "Y", "Z"].contains($0.node.name ?? "") }) else {
+            guard let target = ikTarget else { return false }
+            let markerHit = !hitTest(point, options: [.rootNode: ikRoot]).filter { $0.node.geometry is SCNSphere }.isEmpty
+            let modelHit = hitTest(point, options: [.rootNode: modelRoot, .searchMode: SCNHitTestSearchMode.closest.rawValue]).first
+            guard markerHit || modelHit.map({ ikParts.contains($0.node.name ?? "") }) == true else { return false }
+            ikPlaneDrag = (target, point, projectPoint(SCNVector3(target)).z)
+            onIKDragBegan?()
+            return true
+        }
         let direction: SIMD3<Float>
         switch hit.node.name {
         case "X": direction = SIMD3(1, 0, 0)
@@ -244,6 +291,7 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         }
         guard let parameter = axisParameter(at: point, origin: axis.origin, direction: direction) else { return false }
         axisDrag = (axis, direction, parameter)
+        if ikTarget != nil { onIKDragBegan?() }
         return true
     }
 
@@ -264,6 +312,15 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     }
 
     func moveAxisDrag(to point: CGPoint, state: UIGestureRecognizer.State) {
+        if let drag = ikPlaneDrag {
+            let finished = state == .ended || state == .cancelled || state == .failed
+            let start = SIMD3<Float>(unprojectPoint(SCNVector3(Float(drag.screen.x), Float(drag.screen.y), drag.depth)))
+            let end = SIMD3<Float>(unprojectPoint(SCNVector3(Float(point.x), Float(point.y), drag.depth)))
+            let target = state == .cancelled || state == .failed ? drag.target : drag.target + end - start
+            if finished { ikPlaneDrag = nil }
+            onIKMove?(target, state)
+            return
+        }
         guard let drag = axisDrag else { return }
         var axis = drag.axis
         if state != .cancelled && state != .failed,
@@ -271,6 +328,11 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
             axis.origin += drag.direction * (parameter - drag.parameter)
         }
         let finished = state == .ended || state == .cancelled || state == .failed
+        if ikTarget != nil {
+            if finished { axisDrag = nil }
+            onIKMove?(axis.origin, state)
+            return
+        }
         axisDrag = nil
         showAxis(axis, movable: true)
         if !finished { axisDrag = drag }
@@ -278,8 +340,17 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     }
 
     func cancelAxisDrag() {
+        if let drag = ikPlaneDrag {
+            ikPlaneDrag = nil
+            onIKMove?(drag.target, .cancelled)
+            return
+        }
         guard let drag = axisDrag else { return }
         axisDrag = nil
+        if ikTarget != nil {
+            onIKMove?(drag.axis.origin, .cancelled)
+            return
+        }
         showAxis(drag.axis, movable: true)
         onAxisMove?(drag.axis, .cancelled)
     }
@@ -293,6 +364,12 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         guard let hit = hitTest(point, options: [.rootNode: modelRoot, .searchMode: SCNHitTestSearchMode.closest.rawValue]).first,
               let part = parts.first(where: { $0.node === hit.node }),
               let triangle = part.mesh.triangles.firstIndex(where: { $0.element == hit.geometryIndex && $0.face == hit.faceIndex }) else { return }
+        if let onHelperPick {
+            let local = part.node.simdConvertPosition(SIMD3<Float>(hit.worldCoordinates), from: nil)
+            let rest = part.rest * SIMD4(local, 1)
+            onHelperPick(part.id, SIMD3(rest.x, rest.y, rest.z))
+            return
+        }
         onPick?(part.id, triangle)
     }
 

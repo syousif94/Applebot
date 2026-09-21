@@ -25,6 +25,38 @@ struct RobotRigChecks {
         precondition(document.transforms(angles: [:])[child.id] == matrix_identity_float4x4)
         let restored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(document))
         precondition(restored == document)
+        var rig = document
+        rig.groups[1].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: parent.id)
+        try rig.validate(partIDs: ["upper", "lower"])
+        let solution = try rig.solveIK(for: child.id, target: SIMD3(1, 1, 0), angles: [:])
+        precondition(solution.reached && solution.error < 0.003)
+        precondition(abs(solution.angles[parent.id] ?? 0) > 1 || abs(solution.angles[child.id] ?? 0) > 1)
+        let folded = try rig.solveIK(for: child.id, target: SIMD3(1, 0, 0), angles: [:])
+        precondition(folded.reached)
+        let unreachable = try rig.solveIK(for: child.id, target: SIMD3(5, 0, 2), angles: solution.angles)
+        precondition(!unreachable.reached && unreachable.error.isFinite)
+        rig.groups[0].motor = RobotRigMotorBinding(servoID: 1, minimum: -20, maximum: 20)
+        rig.groups[1].motor = RobotRigMotorBinding(servoID: 2, minimum: -30, maximum: 30)
+        let limited = try rig.solveIK(for: child.id, target: SIMD3(-1, 1, 0), angles: [:])
+        precondition(abs(limited.angles[parent.id]!) <= 20 && abs(limited.angles[child.id]!) <= 30)
+        rig.groups[1].ikHelper?.rootID = child.id
+        let fixedParent = try rig.solveIK(for: child.id, target: SIMD3(0, 2, 0), angles: [parent.id: 90])
+        precondition(fixedParent.angles[parent.id] == 90)
+        let ikRestored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(rig))
+        precondition(ikRestored == rig)
+        var spatial = document
+        spatial.groups[1].axis?.direction = SIMD3(0, 1, 0)
+        spatial.groups[1].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: parent.id)
+        let spatialTarget = spatial.ikEndpoint(for: child.id, angles: [parent.id: 35, child.id: 50])!
+        let spatialSolution = try spatial.solveIK(for: child.id, target: spatialTarget, angles: [:])
+        precondition(spatialSolution.reached)
+        let unrelatedID = UUID()
+        let unchanged = try spatial.solveIK(for: child.id, target: spatialTarget, angles: [unrelatedID: 17])
+        precondition(unchanged.angles[unrelatedID] == 17)
+        do { _ = try spatial.solveIK(for: child.id, target: SIMD3(.nan, 0, 0), angles: [:]); preconditionFailure("Nonfinite IK target accepted") } catch {}
+        rig.groups[1].ikHelper?.rootID = UUID()
+        do { try rig.validate(partIDs: ["upper", "lower"]); preconditionFailure("Invalid IK root accepted") } catch {}
+        print("PASS: IK reachable, straight-chain folding, unreachable, limits, fixed ancestors and helper persistence")
         var cyclic = document
         cyclic.groups[0].parentID = child.id
         do { try cyclic.validate(partIDs: ["upper", "lower"]); preconditionFailure("Cycle accepted") } catch {}

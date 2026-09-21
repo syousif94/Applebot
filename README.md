@@ -28,6 +28,18 @@ Import limits: embedded GLB 2.0 resources, rigid triangle meshes, 100 MB file, 1
 
 Choose **Move Axis** after confirming an axis to reposition its pivot with red **X**, green **Y**, and blue **Z** cone-tipped handles. Drag a handle in the viewport; movement is constrained to that model-rest coordinate and leaves the axis direction unchanged. Each released drag is saved as one undoable edit. **Done Moving Axis** returns to normal selection and rotation preview. Moving the pivot resets preview rotations to the rest pose and is unavailable in Live mode. **Edit Axis** remains available for exact origin and direction values.
 
+### Inverse Kinematics
+
+IK is a position-only, preview-only tool for the existing rigid hinge hierarchy. It never sends motor commands.
+
+1. Create groups, set their rotation axes, and connect them using **Group Settings > Parent Group**.
+2. Select the final child group, press **Place IK Helper**, and click a point on that child's mesh. This is the point the solver will move toward the target. **Edit IK Helper** also accepts exact model-rest XYZ coordinates, including points outside the mesh.
+3. Choose **IK Chain Root** to select the highest ancestor allowed to rotate. The default is the topmost ancestor. Groups without axes transmit their parent's transform but do not add a joint.
+4. Press **Drag IK Target**. Drag the child or the target marker in the camera plane, or use the XYZ cone handles for constrained target movement. Pink marks the requested target; cyan marks the achieved helper position. The inspector reports target distance and whether it was reached.
+5. Press **Done With IK** to keep the preview pose, or **Reset Preview** to return to the rest pose.
+
+Helper points and chain roots are saved with the rig and support document undo/redo. Solved poses are temporary, like slider previews. The solver respects motor-binding joint limits; unbound joints use -180 to 180 degrees. Ancestors above the selected root retain their angles. Branches attached to a moving ancestor follow it but their own joint angles are not solved. Chains are limited to 32 groups. Unreachable or constrained targets retain the best pose found; convergence is not guaranteed. There is no collision avoidance, orientation target, pole vector, or simultaneous multi-target constraint. Existing rigs without IK helpers still load unchanged.
+
 ### Editor Checks
 
 From the workspace root:

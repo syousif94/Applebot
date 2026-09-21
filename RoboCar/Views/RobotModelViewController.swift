@@ -29,6 +29,11 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private var isolated = false
     private var pickingAxis = false
     private var movingAxis = false
+    private var pickingIK = false
+    private var ikTarget: SIMD3<Float>?
+    private var ikDragAngles: [UUID: Float]?
+    private var ikMessage: String?
+    private let ikStateLabel = UILabel()
     private var pendingSurface: (String, RobotRigSurface)?
     private var undoStack: [RobotRigDocument] = []
     private var redoStack: [RobotRigDocument] = []
@@ -60,7 +65,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private var canDeselectParts: Bool {
-        !motors.isArmed && !importing && (!selected.isEmpty || pickingAxis || movingAxis || pendingSurface != nil)
+        !motors.isArmed && !importing && (!selected.isEmpty || pickingAxis || movingAxis || pickingIK || ikTarget != nil || pendingSurface != nil)
     }
 
     override func viewDidLoad() {
@@ -134,7 +139,14 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             button("Edit Axis", "pencil", #selector(editAxis)),
             button("Move Axis", "move.3d", #selector(toggleMoveAxis))
         ])
-        for label in [selectionLabel, axisStateLabel] {
+        let ikTools = actionGrid([
+            button("Place IK Helper", "mappin.and.ellipse", #selector(placeIKHelper)),
+            button("Edit IK Helper", "pencil", #selector(editIKHelper)),
+            button("IK Chain Root", "point.3.connected.trianglepath.dotted", #selector(chooseIKRoot)),
+            button("Drag IK Target", "move.3d", #selector(toggleIK)),
+            button("Remove IK Helper", "trash", #selector(removeIKHelper))
+        ])
+        for label in [selectionLabel, axisStateLabel, ikStateLabel] {
             label.font = .systemFont(ofSize: 13, weight: .medium)
             label.numberOfLines = 0
         }
@@ -164,7 +176,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         actionButtons[#selector(deselectAllParts)]?.toolTip = "Deselect All (Command-Shift-A)"
         for child in [sectionHeading("1. Parts & Groups"), groupButton, selectionLabel, selectionTools, groupTools,
                       sectionHeading("2. Rotation Axis"), axisStateLabel, axisTools,
-                      sectionHeading("3. Rotation & Motor"), mode, angleLabel, angle, motorTools,
+                      sectionHeading("3. Inverse Kinematics"), ikStateLabel, ikTools,
+                      sectionHeading("4. Rotation & Motor"), mode, angleLabel, angle, motorTools,
                       sectionHeading("Model Parts"), search, table] { inspector.addArrangedSubview(child) }
         groupButton.heightAnchor.constraint(equalToConstant: 44).isActive = true
         search.heightAnchor.constraint(equalToConstant: 44).isActive = true
@@ -307,9 +320,16 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         ])
         viewport.onPick = { [weak self] part, triangle in self?.picked(part: part, triangle: triangle) }
         viewport.onAxisMove = { [weak self] axis, state in self?.axisMoved(axis, state: state) }
+        viewport.onIKDragBegan = { [weak self] in self?.ikDragAngles = self?.angles }
+        viewport.onIKMove = { [weak self] target, state in self?.moveIK(target, state: state) }
     }
 
     private func refresh() {
+        if motors.isArmed || importing || activeGroup == nil {
+            ikTarget = nil
+            pickingIK = false
+        }
+        viewport.onHelperPick = pickingIK ? { [weak self] part, point in self?.pickedIKHelper(part: part, point: point) } : nil
         if movingAxis && (activeGroup?.axis == nil || motors.isArmed || importing || pickingAxis) {
             movingAxis = false
             viewport.cancelAxisDrag()
@@ -320,7 +340,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             UIAction(title: group.name, state: group.id == activeGroupID ? .on : .off) { [weak self] _ in self?.selectGroup(group.id) }
         })
         viewport.update(document: document, angles: angles, selected: selected, isolated: isolated)
-        if let pendingSurface {
+        if let target = ikTarget, let group = activeGroup, let endpoint = document.ikEndpoint(for: group.id, angles: angles) {
+            viewport.showIK(target: target, endpoint: endpoint, parts: group.parts)
+        } else if let pendingSurface {
             viewport.showAxis(pendingSurface.1.axis, surface: pendingSurface.1, partID: pendingSurface.0)
         } else {
             let transform = activeGroupID.flatMap { document.transforms(angles: angles)[$0] } ?? matrix_identity_float4x4
@@ -340,6 +362,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             ? (pendingSurface == nil ? "  Select Axis Face: \(group?.name ?? "")  " : "  Selected Face: Confirm or Select Another  ")
             : (motors.isArmed ? "  Live Motor Control  " : "  Select Parts  ")
         if movingAxis { viewportModeLabel.text = "  Move Axis: X / Y / Z  " }
+        if pickingIK { viewportModeLabel.text = "  Place IK Helper: \(group?.name ?? "")  " }
+        if ikTarget != nil { viewportModeLabel.text = "  IK Preview: Drag Child or XYZ Target  " }
         viewportHost.bringSubviewToFront(viewportModeLabel)
         selectionLabel.text = "\(selected.count) selected parts" + (group.map { " / \($0.parts.count) in group" } ?? "")
         if pickingAxis {
@@ -364,18 +388,29 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         updateAction(#selector(toggleMoveAxis), enabled: editable && group?.axis != nil && !pickingAxis,
                  title: movingAxis ? "Done Moving Axis" : "Move Axis")
         updateAction(#selector(bindMotor), enabled: editable && group != nil && !pickingAxis)
+        let helper = group?.ikHelper
+        let rootName = document.groups.first { $0.id == helper?.rootID }?.name ?? ""
+        ikStateLabel.text = pickingIK ? "Selecting helper point on child" : (ikMessage ?? (helper == nil ? "No IK helper" : "Chain root: \(rootName) / Preview only"))
+        updateAction(#selector(placeIKHelper), enabled: editable && group?.parts.isEmpty == false,
+                 title: pickingIK ? "Cancel Helper Pick" : "Place IK Helper")
+        updateAction(#selector(editIKHelper), enabled: editable && group != nil)
+        updateAction(#selector(chooseIKRoot), enabled: editable && helper != nil)
+        updateAction(#selector(toggleIK), enabled: editable && helper != nil,
+                 title: ikTarget == nil ? "Drag IK Target" : "Done With IK")
+        updateAction(#selector(removeIKHelper), enabled: editable && helper != nil)
         updateAction(#selector(moveMotor), enabled: motors.isArmed && !importing)
         updateAction(#selector(stopMotor), enabled: motors.isArmed)
         updateAction(#selector(resetPreview), enabled: !viewport.parts.isEmpty && !importing)
         updateAction(#selector(undoTapped), enabled: editable && !undoStack.isEmpty)
         updateAction(#selector(redoTapped), enabled: editable && !redoStack.isEmpty)
         updateAction(#selector(isolateTapped), enabled: !viewport.parts.isEmpty && !importing, title: isolated ? "Show All Parts" : "Isolate Parts")
-        angle.isEnabled = angle.isEnabled && !pickingAxis && !movingAxis
-        mode.isEnabled = !movingAxis
+        angle.isEnabled = angle.isEnabled && !pickingAxis && !movingAxis && !pickingIK && ikTarget == nil
+        mode.isEnabled = !movingAxis && !pickingIK && ikTarget == nil
         table.reloadData()
     }
 
     private func selectGroup(_ id: UUID?) {
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis = false
         motors.disarm()
@@ -389,6 +424,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     @objc private func deselectAllParts() {
         guard canDeselectParts else { return }
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis = false
         selected.removeAll()
@@ -400,6 +436,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     private func edit(_ body: (inout RobotRigDocument) throws -> Void) {
         guard !motors.isArmed, !importing, let url = assetURL else { showError("Return to Preview before editing"); return }
+        stopIK()
         viewport.cancelAxisDrag()
         do {
             var updated = document
@@ -432,6 +469,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private func load(url: URL) {
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis = false
         motors.disarm()
@@ -492,7 +530,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private func picked(part: String, triangle: Int) {
-        guard !motors.isArmed, !importing, !movingAxis else { return }
+        guard !motors.isArmed, !importing, !movingAxis, !pickingIK, ikTarget == nil else { return }
         if pickingAxis {
             guard activeGroup?.parts.contains(part) == true, let mesh = viewport.parts.first(where: { $0.id == part })?.mesh else {
                 showError("Choose a face belonging to the selected group")
@@ -563,6 +601,10 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             self?.edit { draft in
                 draft.groups.removeAll { $0.id == group.id }
                 for index in draft.groups.indices where draft.groups[index].parentID == group.id { draft.groups[index].parentID = group.parentID }
+                for index in draft.groups.indices where draft.groups[index].ikHelper?.rootID == group.id {
+                    let rootID = group.parentID ?? draft.groups[index].id
+                    draft.groups[index].ikHelper?.rootID = rootID
+                }
             }
             self?.activeGroupID = nil
             self?.refresh()
@@ -589,6 +631,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     @objc private func setAxis() {
         guard !motors.isArmed, activeGroup != nil else { return }
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis = false
         angles.removeAll()
@@ -633,6 +676,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     @objc private func toggleMoveAxis() {
         guard !motors.isArmed, !importing, activeGroup?.axis != nil, !pickingAxis else { return }
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis.toggle()
         angles.removeAll()
@@ -660,8 +704,126 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         refresh()
     }
 
+    private func stopIK() {
+        viewport.cancelAxisDrag()
+        pickingIK = false
+        ikTarget = nil
+        ikDragAngles = nil
+        ikMessage = nil
+    }
+
+    private func defaultIKRoot(_ group: RobotRigGroup) -> UUID {
+        var root = group
+        while let parent = document.groups.first(where: { $0.id == root.parentID }) { root = parent }
+        return root.id
+    }
+
+    private func revealIKControls() {
+        view.layoutIfNeeded()
+        let maximum = max(0, inspectorScroll.contentSize.height - inspectorScroll.bounds.height)
+        inspectorScroll.setContentOffset(CGPoint(x: 0, y: min(maximum, max(0, ikStateLabel.frame.minY - 30))), animated: false)
+    }
+
+    @objc private func placeIKHelper() {
+        guard !motors.isArmed, !importing, activeGroup != nil else { return }
+        let wasPicking = pickingIK
+        stopIK()
+        movingAxis = false
+        pickingAxis = false
+        pendingSurface = nil
+        pickingIK = !wasPicking
+        refresh()
+        revealIKControls()
+    }
+
+    private func pickedIKHelper(part: String, point: SIMD3<Float>) {
+        guard pickingIK, let group = activeGroup, group.parts.contains(part) else {
+            showError("Choose a point on the active child group")
+            return
+        }
+        saveIKHelper(point: point, group: group)
+    }
+
+    private func saveIKHelper(point: SIMD3<Float>, group: RobotRigGroup) {
+        let helper = RobotRigIKHelper(point: point, rootID: group.ikHelper?.rootID ?? defaultIKRoot(group))
+        edit { draft in
+            if let index = draft.groups.firstIndex(where: { $0.id == group.id }) { draft.groups[index].ikHelper = helper }
+        }
+    }
+
+    @objc private func editIKHelper() {
+        guard let group = activeGroup else { return }
+        let point = group.ikHelper?.point ?? group.axis?.origin ?? .zero
+        prompt(title: "IK Helper (Model Rest Coordinates)", fields: [("X", "\(point.x)"), ("Y", "\(point.y)"), ("Z", "\(point.z)")]) { [weak self] values in
+            let numbers = values.compactMap(Float.init)
+            guard numbers.count == 3, numbers.allSatisfy(\.isFinite) else { self?.showError("Enter three finite coordinates"); return }
+            self?.saveIKHelper(point: SIMD3(numbers[0], numbers[1], numbers[2]), group: group)
+        }
+    }
+
+    @objc private func chooseIKRoot() {
+        guard let group = activeGroup, group.ikHelper != nil else { return }
+        let menu = UIAlertController(title: "IK Chain Root", message: nil, preferredStyle: .actionSheet)
+        var current: RobotRigGroup? = group
+        while let joint = current {
+            let rootID = joint.id
+            menu.addAction(UIAlertAction(title: joint.name, style: .default) { [weak self] _ in
+                self?.edit { draft in
+                    if let index = draft.groups.firstIndex(where: { $0.id == group.id }) { draft.groups[index].ikHelper?.rootID = rootID }
+                }
+            })
+            current = document.groups.first { $0.id == joint.parentID }
+        }
+        menu.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        showSheet(menu)
+    }
+
+    @objc private func removeIKHelper() {
+        guard let id = activeGroupID else { return }
+        edit { draft in
+            if let index = draft.groups.firstIndex(where: { $0.id == id }) { draft.groups[index].ikHelper = nil }
+        }
+    }
+
+    @objc private func toggleIK() {
+        guard !motors.isArmed, !importing, let group = activeGroup else { return }
+        let wasActive = ikTarget != nil
+        stopIK()
+        movingAxis = false
+        pickingAxis = false
+        pendingSurface = nil
+        if !wasActive {
+            do {
+                let chain = try document.ikChain(for: group.id)
+                guard chain.contains(where: { $0.axis != nil }) else { throw RobotRigError.invalid("Set rotation axes on the IK chain first") }
+                ikTarget = document.ikEndpoint(for: group.id, angles: angles)
+            } catch { showError(error.localizedDescription) }
+        }
+        refresh()
+        revealIKControls()
+    }
+
+    private func moveIK(_ target: SIMD3<Float>, state: UIGestureRecognizer.State) {
+        guard ikTarget != nil, !motors.isArmed, !importing, let group = activeGroup else { return }
+        if state == .cancelled || state == .failed {
+            if let previous = ikDragAngles { angles = previous }
+            ikDragAngles = nil
+            ikTarget = document.ikEndpoint(for: group.id, angles: angles)
+            ikMessage = nil
+        } else {
+            do {
+                let result = try document.solveIK(for: group.id, target: target, angles: angles)
+                angles = result.angles
+                ikTarget = target
+                ikMessage = String(format: "%@ / Distance %.4f", result.reached ? "Target reached" : "Target not reached", result.error)
+                if state == .ended { ikDragAngles = nil }
+            } catch { showError(error.localizedDescription) }
+        }
+        refresh()
+    }
+
     @objc private func enterAngle() {
-        guard activeGroup?.axis != nil, !motors.isArmed, !movingAxis else { return }
+        guard activeGroup?.axis != nil, !motors.isArmed, !movingAxis, !pickingIK, ikTarget == nil else { return }
         prompt(title: "Preview Angle", fields: [("Degrees", "\(angle.value)")]) { [weak self] values in
             guard let self, let degrees = Float(values[0]), degrees.isFinite,
                   degrees >= self.angle.minimumValue, degrees <= self.angle.maximumValue else { self?.showError("Angle exceeds joint limits"); return }
@@ -671,6 +833,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     @objc private func resetPreview() {
+        stopIK()
         viewport.cancelAxisDrag()
         movingAxis = false
         motors.disarm()
@@ -751,6 +914,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     private func restoreHistory(undo: Bool) {
         guard !motors.isArmed, !importing, let url = assetURL, let restored = undo ? undoStack.last : redoStack.last else { return }
+        stopIK()
         viewport.cancelAxisDrag()
         do {
             try restored.validate(partIDs: partIDs)
@@ -812,7 +976,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         return cell
     }
     func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        guard !motors.isArmed, !pickingAxis, !movingAxis else { return }
+        guard !motors.isArmed, !pickingAxis, !movingAxis, !pickingIK, ikTarget == nil else { return }
         let part = filteredParts[indexPath.row]
         if !selected.insert(part.id).inserted { selected.remove(part.id) }
         refresh()
@@ -972,6 +1136,86 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 editor.toggleMoveAxis()
                 precondition(editor.angle.isEnabled && editor.document == savedDocument && commander.motion.isEmpty)
                 print("PASS: XYZ cone picking, constrained pivot dragging, direction preservation, persistence, undo and cancellation")
+                editor.angles[savedGroupID!] = 30
+                editor.placeIKHelper()
+                SCNTransaction.flush()
+                _ = editor.viewport.snapshot()
+                let helperRest = SIMD3<Float>(1, 0.5, 0)
+                let helperWorld = editor.document.transforms(angles: editor.angles)[savedGroupID!]! * SIMD4(helperRest, 1)
+                let helperScreen = editor.viewport.projectPoint(SCNVector3(helperWorld.x, helperWorld.y, helperWorld.z))
+                editor.viewport.pick(at: CGPoint(x: CGFloat(helperScreen.x), y: CGFloat(helperScreen.y)))
+                precondition(simd_distance(editor.activeGroup!.ikHelper!.point, helperRest) < 0.001)
+                let helperDocument = try RobotModelStorage.loadDocument(at: url, hash: "fixture")
+                precondition(helperDocument == editor.document && !editor.pickingIK)
+                let root = RobotRigGroup(name: "IK Base", parts: [], axis: RobotRigAxis(origin: .zero, direction: SIMD3(0, 0, 1)))
+                editor.edit { draft in
+                    draft.groups.append(root)
+                    draft.groups[0].parentID = root.id
+                    draft.groups[0].axis = RobotRigAxis(origin: SIMD3(1, 0, 0), direction: SIMD3(0, 0, 1))
+                    draft.groups[0].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: root.id)
+                }
+                let ikDocument = editor.document
+                editor.toggleIK()
+                precondition(editor.ikTarget != nil && !editor.mode.isEnabled)
+                editor.moveIK(SIMD3(0.5, 1.5, 0), state: .ended)
+                precondition(simd_distance(editor.document.ikEndpoint(for: savedGroupID!, angles: editor.angles)!, SIMD3(0.5, 1.5, 0)) < 0.003)
+                precondition(abs(editor.angles[root.id] ?? 0) > 1)
+                precondition(editor.document == ikDocument && commander.motion.isEmpty)
+                SCNTransaction.flush()
+                _ = editor.viewport.snapshot()
+                let targetScreen = editor.viewport.projectPoint(SCNVector3(editor.ikTarget!))
+                let dragStart = CGPoint(x: CGFloat(targetScreen.x), y: CGFloat(targetScreen.y))
+                let dragEnd = CGPoint(x: dragStart.x + 25, y: dragStart.y - 10)
+                let poseBeforeDrag = editor.angles
+                precondition(editor.viewport.beginAxisDrag(at: dragStart))
+                editor.viewport.moveAxisDrag(to: dragEnd, state: .changed)
+                precondition(editor.angles != poseBeforeDrag)
+                editor.viewport.cancelAxisDrag()
+                precondition(editor.angles == poseBeforeDrag)
+                SCNTransaction.flush()
+                _ = editor.viewport.snapshot()
+                let childTransform = editor.document.transforms(angles: editor.angles)[savedGroupID!]!
+                let childWorld = childTransform * SIMD4<Float>(0.6, 1.4, 0, 1)
+                let childScreen = editor.viewport.projectPoint(SCNVector3(childWorld.x, childWorld.y, childWorld.z))
+                let childStart = CGPoint(x: CGFloat(childScreen.x), y: CGFloat(childScreen.y))
+                precondition(editor.viewport.beginAxisDrag(at: childStart), "Could not drag child mesh")
+                editor.viewport.moveAxisDrag(to: CGPoint(x: childStart.x + 15, y: childStart.y - 8), state: .changed)
+                precondition(editor.angles != poseBeforeDrag)
+                editor.viewport.cancelAxisDrag()
+                precondition(editor.angles == poseBeforeDrag)
+                SCNTransaction.flush()
+                _ = editor.viewport.snapshot()
+                let ikHandle = editor.viewport.scene!.rootNode.childNode(withName: "X", recursively: true)!
+                let ikCone = ikHandle.childNodes.first { $0.geometry is SCNCone }!
+                let coneScreen = editor.viewport.projectPoint(SCNVector3(ikCone.simdWorldPosition))
+                let coneEnd = editor.viewport.projectPoint(SCNVector3(ikCone.simdWorldPosition + SIMD3<Float>(0.1, 0, 0)))
+                let targetBeforeHandle = editor.ikTarget!
+                precondition(editor.viewport.beginAxisDrag(at: CGPoint(x: CGFloat(coneScreen.x), y: CGFloat(coneScreen.y))))
+                editor.viewport.moveAxisDrag(to: CGPoint(x: CGFloat(coneEnd.x), y: CGFloat(coneEnd.y)), state: .ended)
+                precondition(simd_distance(editor.ikTarget!, targetBeforeHandle + SIMD3(0.1, 0, 0)) < 0.001)
+                editor.moveIK(SIMD3(10, 10, 10), state: .ended)
+                precondition(editor.ikMessage!.contains("not reached") && commander.motion.isEmpty)
+                editor.moveIK(SIMD3(1, 1, 0), state: .ended)
+                editor.revealIKControls()
+                SCNTransaction.flush()
+                let ikImage = editor.viewport.snapshot()
+                try ikImage.pngData()?.write(to: folder.appendingPathComponent("ik.png"))
+                let ikEditorImage = UIGraphicsImageRenderer(bounds: editor.view.bounds).image { context in
+                    editor.view.layer.render(in: context.cgContext)
+                    ikImage.draw(in: editor.viewport.convert(editor.viewport.bounds, to: editor.view))
+                    let badgeFrame = editor.viewportModeLabel.convert(editor.viewportModeLabel.bounds, to: editor.view)
+                    context.cgContext.saveGState()
+                    context.cgContext.translateBy(x: badgeFrame.minX, y: badgeFrame.minY)
+                    editor.viewportModeLabel.layer.render(in: context.cgContext)
+                    context.cgContext.restoreGState()
+                }
+                try ikEditorImage.pngData()?.write(to: folder.appendingPathComponent("ik-editor.png"))
+                editor.resetPreview()
+                precondition(editor.ikTarget == nil && editor.angles.isEmpty && editor.mode.isEnabled)
+                editor.document = savedDocument
+                try RobotModelStorage.save(savedDocument, at: url)
+                editor.refresh()
+                print("PASS: IK rest-coordinate helper picking, persistence, parent-chain solving, target drag cancellation, unreachable state and zero motor commands")
                 UserDefaults.standard.set(priorDefault, forKey: "RobotModel.lastAsset")
                 let binding = RobotRigMotorBinding(servoID: 1, reversed: true, ratio: 2, offset: 720, robotID: "test")
                 motors.updateIDs([1])
