@@ -13,7 +13,19 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         let materials: [SCNMaterial]
     }
 
+    struct ModelNode {
+        let id: String
+        let name: String
+        let parts: Set<String>
+        let children: [ModelNode]
+
+        var allParts: Set<String> {
+            children.reduce(into: parts) { $0.formUnion($1.allParts) }
+        }
+    }
+
     private(set) var parts: [Part] = []
+    private(set) var modelHierarchy: ModelNode?
     private let modelRoot = SCNNode()
     private let overlayRoot = SCNNode()
     private let gizmoRoot = SCNNode()
@@ -63,7 +75,8 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
     func install(_ imported: SCNScene) throws {
         var collected: [Part] = []
         var triangleCount = 0
-        func visit(_ node: SCNNode, path: String) throws {
+        func visit(_ node: SCNNode, path: String) throws -> ModelNode {
+            var nodeParts = Set<String>()
             guard node.skinner == nil, node.morpher == nil else { throw RobotRigError.invalid("Skinned or morphing meshes are not supported") }
             if let geometry = node.geometry {
                 guard let source = geometry.sources(for: .vertex).first else { throw RobotRigError.invalid("Mesh has no positions") }
@@ -107,6 +120,7 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
                         partGeometry.materials = geometry.materials.map { $0.copy() as! SCNMaterial }
                         let partNode = SCNNode(geometry: partGeometry)
                         let id = "\(path)/component/\(componentIndex)"
+                        nodeParts.insert(id)
                         partNode.name = id
                         partNode.simdTransform = rest
                         let name = (node.name?.isEmpty == false ? node.name! : "Mesh \(collected.count + 1)") + (components.count > 1 ? " [\(componentIndex + 1)]" : "")
@@ -115,11 +129,15 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
                     }
                 }
             }
-            for (index, child) in node.childNodes.enumerated() { try visit(child, path: "\(path)/\(index)") }
+            let children = try node.childNodes.enumerated().map { index, child in
+                try visit(child, path: "\(path)/\(index)")
+            }.filter { !$0.allParts.isEmpty }
+            return ModelNode(id: path, name: node.name?.isEmpty == false ? node.name! : (path == "scene" ? "Model" : "Node \(path.split(separator: "/").last ?? "")"), parts: nodeParts, children: children)
         }
-        try visit(imported.rootNode, path: "scene")
+        let hierarchy = try visit(imported.rootNode, path: "scene")
         guard !collected.isEmpty else { throw RobotRigError.invalid("No selectable triangle meshes") }
         parts = collected
+        modelHierarchy = hierarchy
         modelRoot.childNodes.forEach { $0.removeFromParentNode() }
         overlayRoot.childNodes.forEach { $0.removeFromParentNode() }
         for part in parts { modelRoot.addChildNode(part.node) }

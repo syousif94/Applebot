@@ -3,7 +3,7 @@ import UniformTypeIdentifiers
 import SceneKit
 import GLTFKit2
 
-final class RobotModelViewController: PanelViewController, UIDocumentPickerDelegate, UITableViewDataSource, UITableViewDelegate, UISearchBarDelegate {
+final class RobotModelViewController: PanelViewController, UIDocumentPickerDelegate, UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UISearchBarDelegate {
     let motors: RobotRigMotorController
     private var viewport = RobotModelSceneView()
     private let viewportHost = UIView()
@@ -42,6 +42,34 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private var importError: String?
     private var sidebarWidth: NSLayoutConstraint?
     private var sidebarHeight: NSLayoutConstraint?
+    private struct TreeNode {
+        let id: String
+        let name: String
+        let parts: Set<String>
+        var groupID: UUID? = nil
+        var children: [TreeNode] = []
+    }
+    private struct TreeRow {
+        let node: TreeNode
+        let depth: Int
+    }
+    private struct TreeDrag {
+        let groupID: UUID?
+        let parts: Set<String>
+    }
+    private struct TreeState: Equatable {
+        let viewportID: ObjectIdentifier
+        let document: RobotRigDocument
+        let query: String
+        let collapsed: Set<String>
+        let selected: Set<String>
+        let activeGroupID: UUID?
+        let editable: Bool
+    }
+    private var displayedTreeState: TreeState?
+    private var treeRows: [TreeRow] = []
+    private var collapsedNodes = Set<String>()
+    private var sidebarSections: [String: (UIButton, UIStackView)] = [:]
     #if DEBUG
     private var runtimeCheck: (() -> Void)?
     #endif
@@ -112,12 +140,19 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             viewportModeLabel.widthAnchor.constraint(lessThanOrEqualTo: viewportHost.widthAnchor, constant: -16),
             viewportModeLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 36)
         ])
-        search.placeholder = "Parts"
+        search.placeholder = "Groups, collections, parts"
         search.delegate = self
         search.searchBarStyle = .minimal
         table.dataSource = self
         table.delegate = self
+        table.dragDelegate = self
+        table.dropDelegate = self
+        table.dragInteractionEnabled = true
+        table.accessibilityLabel = "Model hierarchy"
         table.rowHeight = 44
+        table.estimatedRowHeight = 0
+        table.estimatedSectionHeaderHeight = 0
+        table.estimatedSectionFooterHeight = 0
         var groupConfiguration = UIButton.Configuration.tinted()
         groupConfiguration.title = "Choose Group"
         groupConfiguration.image = UIImage(systemName: "chevron.down")
@@ -174,14 +209,14 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         inspector.spacing = 8
         let selectionTools = actionGrid([button("Deselect All", "selection.pin.in.out", #selector(deselectAllParts))])
         actionButtons[#selector(deselectAllParts)]?.toolTip = "Deselect All (Command-Shift-A)"
-        for child in [sectionHeading("1. Parts & Groups"), groupButton, selectionLabel, selectionTools, groupTools,
-                      sectionHeading("2. Rotation Axis"), axisStateLabel, axisTools,
-                      sectionHeading("3. Inverse Kinematics"), ikStateLabel, ikTools,
-                      sectionHeading("4. Rotation & Motor"), mode, angleLabel, angle, motorTools,
-                      sectionHeading("Model Parts"), search, table] { inspector.addArrangedSubview(child) }
+        addSidebarSection("Hierarchy", views: [search, table, selectionLabel, selectionTools])
+        addSidebarSection("Parts & Groups", views: [groupButton, groupTools])
+        addSidebarSection("Rotation Axis", views: [axisStateLabel, axisTools])
+        addSidebarSection("Inverse Kinematics", views: [ikStateLabel, ikTools])
+        addSidebarSection("Rotation & Motor", views: [mode, angleLabel, angle, motorTools])
         groupButton.heightAnchor.constraint(equalToConstant: 44).isActive = true
         search.heightAnchor.constraint(equalToConstant: 44).isActive = true
-        table.heightAnchor.constraint(equalToConstant: 200).isActive = true
+        table.heightAnchor.constraint(equalToConstant: 320).isActive = true
         inspector.translatesAutoresizingMaskIntoConstraints = false
         inspectorScroll.addSubview(inspector)
         inspectorScroll.keyboardDismissMode = .interactive
@@ -253,9 +288,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     private var activeGroup: RobotRigGroup? { document.groups.first { $0.id == activeGroupID } }
     private var partIDs: Set<String> { Set(viewport.parts.map(\.id)) }
-    private var filteredParts: [RobotModelSceneView.Part] {
-        let query = search.text ?? ""
-        return viewport.parts.filter { query.isEmpty || $0.name.localizedCaseInsensitiveContains(query) }
+    private var canEditTree: Bool {
+        assetURL != nil && !motors.isArmed && !importing && !pickingAxis && !movingAxis && !pickingIK && ikTarget == nil
     }
 
     private func button(_ title: String, _ symbol: String, _ action: Selector) -> UIButton {
@@ -294,12 +328,35 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         return grid
     }
 
-    private func sectionHeading(_ title: String) -> UILabel {
-        let label = UILabel()
-        label.text = title
-        label.font = .systemFont(ofSize: 15, weight: .semibold)
-        label.numberOfLines = 0
-        return label
+    private func addSidebarSection(_ title: String, views: [UIView]) {
+        let content = UIStackView(arrangedSubviews: views)
+        content.axis = .vertical
+        content.spacing = 8
+        let header = UIButton(type: .system)
+        var configuration = UIButton.Configuration.plain()
+        configuration.title = title
+        configuration.image = UIImage(systemName: "chevron.down")
+        configuration.imagePadding = 8
+        configuration.contentInsets = NSDirectionalEdgeInsets(top: 8, leading: 0, bottom: 8, trailing: 0)
+        header.configuration = configuration
+        header.contentHorizontalAlignment = .leading
+        header.heightAnchor.constraint(equalToConstant: 44).isActive = true
+        header.addAction(UIAction { [weak self, weak content] _ in
+            guard let content else { return }
+            self?.setSidebarSection(title, collapsed: !content.isHidden)
+        }, for: .touchUpInside)
+        sidebarSections[title] = (header, content)
+        inspector.addArrangedSubview(header)
+        inspector.addArrangedSubview(content)
+        setSidebarSection(title, collapsed: false)
+    }
+
+    private func setSidebarSection(_ title: String, collapsed: Bool) {
+        guard let (header, content) = sidebarSections[title] else { return }
+        content.isHidden = collapsed
+        header.configuration?.image = UIImage(systemName: collapsed ? "chevron.right" : "chevron.down")
+        header.accessibilityValue = collapsed ? "Collapsed" : "Expanded"
+        header.toolTip = "\(collapsed ? "Expand" : "Collapse") \(title)"
     }
 
     private func updateAction(_ action: Selector, enabled: Bool, title: String? = nil) {
@@ -334,9 +391,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             movingAxis = false
             viewport.cancelAxisDrag()
         }
-        groupButton.configuration?.title = activeGroup.map { "Group: \($0.name)" } ?? "Unassigned Parts"
+        groupButton.configuration?.title = activeGroup.map { "Group: \($0.name)" } ?? "No Active Group"
         groupButton.accessibilityLabel = groupButton.configuration?.title
-        groupButton.menu = UIMenu(children: [UIAction(title: "Unassigned Parts", state: activeGroupID == nil ? .on : .off) { [weak self] _ in self?.selectGroup(nil) }] + document.groups.map { group in
+        groupButton.menu = UIMenu(children: [UIAction(title: "No Active Group", state: activeGroupID == nil ? .on : .off) { [weak self] _ in self?.selectGroup(nil) }] + document.groups.map { group in
             UIAction(title: group.name, state: group.id == activeGroupID ? .on : .off) { [weak self] _ in self?.selectGroup(group.id) }
         })
         viewport.update(document: document, angles: angles, selected: selected, isolated: isolated)
@@ -406,7 +463,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         updateAction(#selector(isolateTapped), enabled: !viewport.parts.isEmpty && !importing, title: isolated ? "Show All Parts" : "Isolate Parts")
         angle.isEnabled = angle.isEnabled && !pickingAxis && !movingAxis && !pickingIK && ikTarget == nil
         mode.isEnabled = !movingAxis && !pickingIK && ikTarget == nil
-        table.reloadData()
+        reloadTree()
     }
 
     private func selectGroup(_ id: UUID?) {
@@ -513,6 +570,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                         self.document = saved
                         self.assetURL = local
                         self.selected.removeAll()
+                        self.resetTreeExpansion()
                         self.activeGroupID = nil
                         self.angles.removeAll()
                         self.undoStack.removeAll()
@@ -561,6 +619,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 self.activeGroupID = group.id
                 self.pickingAxis = true
                 self.refresh()
+                self.setSidebarSection("Rotation Axis", collapsed: false)
                 self.inspectorScroll.scrollRectToVisible(self.axisStateLabel.convert(self.axisStateLabel.bounds, to: self.inspector), animated: true)
             }
         }
@@ -965,23 +1024,182 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         }
     }
 
-    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { filteredParts.count }
-    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
-        let part = filteredParts[indexPath.row]
-        let cell = tableView.dequeueReusableCell(withIdentifier: "part") ?? UITableViewCell(style: .subtitle, reuseIdentifier: "part")
-        cell.textLabel?.text = part.name
-        cell.textLabel?.font = .systemFont(ofSize: 14)
-        cell.detailTextLabel?.text = document.groups.first { $0.parts.contains(part.id) }?.name ?? "Unassigned"
-        cell.accessoryType = selected.contains(part.id) ? .checkmark : .none
-        return cell
+    private func resetTreeExpansion() {
+        displayedTreeState = nil
+        collapsedNodes.removeAll()
+        func collapse(_ node: RobotModelSceneView.ModelNode) {
+            collapsedNodes.insert("model/\(node.id)")
+            node.children.forEach(collapse)
+        }
+        viewport.modelHierarchy?.children.forEach(collapse)
     }
-    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
-        guard !motors.isArmed, !pickingAxis, !movingAxis, !pickingIK, ikTarget == nil else { return }
-        let part = filteredParts[indexPath.row]
-        if !selected.insert(part.id).inserted { selected.remove(part.id) }
+
+    private func reloadTree() {
+        let state = TreeState(viewportID: ObjectIdentifier(viewport), document: document,
+                              query: search.text ?? "", collapsed: collapsedNodes, selected: selected,
+                              activeGroupID: activeGroupID, editable: canEditTree)
+        guard state != displayedTreeState else { return }
+        displayedTreeState = state
+        let parts = Dictionary(uniqueKeysWithValues: viewport.parts.map { ($0.id, $0.name) })
+        func leaves(_ ids: Set<String>, prefix: String) -> [TreeNode] {
+            ids.sorted().map { TreeNode(id: "\(prefix)/\($0)", name: parts[$0] ?? $0, parts: [$0]) }
+        }
+        func modelNode(_ node: RobotModelSceneView.ModelNode) -> TreeNode {
+            TreeNode(id: "model/\(node.id)", name: node.name, parts: node.allParts,
+                     children: node.children.map(modelNode) + leaves(node.parts, prefix: "source"))
+        }
+        func groupNode(_ group: RobotRigGroup) -> TreeNode {
+            let children = document.groups.filter { $0.parentID == group.id }.map(groupNode)
+            return TreeNode(id: "group/\(group.id)", name: group.name,
+                            parts: children.reduce(into: group.parts) { $0.formUnion($1.parts) }, groupID: group.id,
+                            children: children + leaves(group.parts, prefix: "rig"))
+        }
+        let assigned = document.groups.reduce(into: Set<String>()) { $0.formUnion($1.parts) }
+        let groups = TreeNode(id: "groups", name: "Rig Groups", parts: assigned, children:
+            document.groups.filter { $0.parentID == nil }.map(groupNode))
+        let roots = [groups] + (viewport.modelHierarchy.map { [modelNode($0)] } ?? [])
+        let query = (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        func matches(_ node: TreeNode) -> Bool {
+            node.name.localizedCaseInsensitiveContains(query) || node.children.contains(where: matches)
+        }
+        treeRows.removeAll(keepingCapacity: true)
+        func append(_ node: TreeNode, depth: Int, ancestorMatches: Bool) {
+            let ownMatch = !query.isEmpty && node.name.localizedCaseInsensitiveContains(query)
+            guard query.isEmpty || ancestorMatches || matches(node) else { return }
+            treeRows.append(TreeRow(node: node, depth: depth))
+            if !query.isEmpty || !collapsedNodes.contains(node.id) {
+                for child in node.children { append(child, depth: depth + 1, ancestorMatches: ancestorMatches || ownMatch) }
+            }
+        }
+        for root in roots { append(root, depth: 0, ancestorMatches: false) }
+        table.reloadData()
+    }
+
+    private func toggleTreeNode(_ id: String) {
+        if !collapsedNodes.insert(id).inserted { collapsedNodes.remove(id) }
+        reloadTree()
+    }
+
+    private func selectTreeNode(_ node: TreeNode) {
+        guard canEditTree else { return }
+        if let groupID = node.groupID { activeGroupID = groupID }
+        if !node.parts.isEmpty && node.parts.isSubset(of: selected) { selected.subtract(node.parts) }
+        else { selected.formUnion(node.parts) }
         refresh()
     }
-    func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) { table.reloadData() }
+
+    func tableView(_ tableView: UITableView, numberOfRowsInSection section: Int) -> Int { treeRows.count }
+
+    func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
+        let row = treeRows[indexPath.row]
+        let node = row.node
+        let cell = tableView.dequeueReusableCell(withIdentifier: "tree") ?? UITableViewCell(style: .subtitle, reuseIdentifier: "tree")
+        cell.textLabel?.text = node.name
+        cell.textLabel?.font = .systemFont(ofSize: 14, weight: node.groupID == activeGroupID && node.groupID != nil ? .semibold : .regular)
+        cell.textLabel?.lineBreakMode = .byTruncatingMiddle
+        cell.indentationLevel = min(row.depth, 6)
+        cell.indentationWidth = 12
+        let selectedCount = node.parts.intersection(selected).count
+        cell.detailTextLabel?.text = node.children.isEmpty && node.parts.count == 1
+            ? (document.groups.first { $0.parts.contains(node.parts.first!) }?.name ?? "Unassigned")
+            : "\(node.parts.count) parts" + (selectedCount > 0 ? " / \(selectedCount) selected" : "")
+        cell.imageView?.image = UIImage(systemName: node.children.isEmpty ? "cube" : "folder")
+        let controls = UIStackView()
+        controls.spacing = 0
+        let selection = UIButton(type: .system)
+        let symbol = selectedCount == 0 ? "square" : (selectedCount == node.parts.count ? "checkmark.square.fill" : "minus.square.fill")
+        selection.setImage(UIImage(systemName: symbol), for: .normal)
+        selection.accessibilityLabel = "Select \(node.name)"
+        selection.accessibilityValue = selectedCount == 0 ? "Not selected" : (selectedCount == node.parts.count ? "Selected" : "Partially selected")
+        selection.toolTip = "Toggle selection: \(node.name)"
+        selection.isEnabled = canEditTree && !node.parts.isEmpty
+        selection.addAction(UIAction { [weak self] _ in self?.selectTreeNode(node) }, for: .touchUpInside)
+        controls.addArrangedSubview(selection)
+        selection.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        if !node.children.isEmpty {
+            let disclosure = UIButton(type: .system)
+            let expanded = !(search.text ?? "").isEmpty || !collapsedNodes.contains(node.id)
+            disclosure.setImage(UIImage(systemName: expanded ? "chevron.down" : "chevron.right"), for: .normal)
+            disclosure.accessibilityLabel = "\(expanded ? "Collapse" : "Expand") \(node.name)"
+            disclosure.toolTip = disclosure.accessibilityLabel
+            disclosure.isEnabled = (search.text ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            disclosure.addAction(UIAction { [weak self] _ in self?.toggleTreeNode(node.id) }, for: .touchUpInside)
+            controls.addArrangedSubview(disclosure)
+            disclosure.widthAnchor.constraint(equalToConstant: 36).isActive = true
+        }
+        controls.frame = CGRect(x: 0, y: 0, width: node.children.isEmpty ? 36 : 72, height: 44)
+        cell.accessoryView = controls
+        cell.accessibilityValue = selection.accessibilityValue
+        return cell
+    }
+
+    func tableView(_ tableView: UITableView, didSelectRowAt indexPath: IndexPath) {
+        tableView.deselectRow(at: indexPath, animated: false)
+        selectTreeNode(treeRows[indexPath.row].node)
+    }
+
+    func searchBar(_ searchBar: UISearchBar, textDidChange searchText: String) { reloadTree() }
+
+    func tableView(_ tableView: UITableView, itemsForBeginning session: UIDragSession, at indexPath: IndexPath) -> [UIDragItem] {
+        guard canEditTree else { return [] }
+        let node = treeRows[indexPath.row].node
+        guard node.id != "groups", node.groupID != nil || !node.parts.isEmpty else { return [] }
+        let chosen = node.parts.isSubset(of: selected) ? selected : node.parts
+        let item = UIDragItem(itemProvider: NSItemProvider(object: node.name as NSString))
+        item.localObject = TreeDrag(groupID: node.groupID, parts: chosen)
+        session.localContext = self
+        return [item]
+    }
+
+    private func dropping(_ items: [UIDragItem], onto destination: TreeNode) throws -> RobotRigDocument {
+        guard canEditTree, destination.groupID != nil || destination.id == "groups" else {
+            throw RobotRigError.invalid("Drop onto a rig group")
+        }
+        var draft = document
+        for item in items {
+            guard let payload = item.localObject as? TreeDrag else { throw RobotRigError.invalid("Only local model items can be moved") }
+            if let id = payload.groupID {
+                guard let index = draft.groups.firstIndex(where: { $0.id == id }) else {
+                    throw RobotRigError.invalid("Drop groups onto another group or Rig Groups")
+                }
+                draft.groups[index].parentID = destination.groupID
+            } else {
+                guard destination.id != "groups" else { throw RobotRigError.invalid("Choose a group for these parts") }
+                for index in draft.groups.indices {
+                    if draft.groups[index].id == destination.groupID { draft.groups[index].parts.formUnion(payload.parts) }
+                    else { draft.groups[index].parts.subtract(payload.parts) }
+                }
+            }
+        }
+        try draft.validate(partIDs: partIDs)
+        return draft
+    }
+
+    func tableView(_ tableView: UITableView, canHandle session: UIDropSession) -> Bool {
+        (session.localDragSession?.localContext as? RobotModelViewController) === self && canEditTree
+    }
+
+    func tableView(_ tableView: UITableView, dropSessionDidUpdate session: UIDropSession, withDestinationIndexPath destinationIndexPath: IndexPath?) -> UITableViewDropProposal {
+        guard self.tableView(tableView, canHandle: session), let destinationIndexPath,
+              treeRows.indices.contains(destinationIndexPath.row),
+              (try? dropping(session.items, onto: treeRows[destinationIndexPath.row].node)) != nil else {
+            return UITableViewDropProposal(operation: .forbidden)
+        }
+        return UITableViewDropProposal(operation: .move, intent: .insertIntoDestinationIndexPath)
+    }
+
+    func tableView(_ tableView: UITableView, performDropWith coordinator: UITableViewDropCoordinator) {
+        guard self.tableView(tableView, canHandle: coordinator.session), let indexPath = coordinator.destinationIndexPath,
+              treeRows.indices.contains(indexPath.row) else { return }
+        let destination = treeRows[indexPath.row].node
+        do {
+            let draft = try dropping(coordinator.items.map(\.dragItem), onto: destination)
+            guard draft != document else { return }
+            for item in coordinator.items { coordinator.drop(item.dragItem, toRowAt: indexPath) }
+            collapsedNodes.remove(destination.id)
+            edit { $0 = draft }
+        } catch { showError(error.localizedDescription) }
+    }
 
     #if DEBUG
     static func makeRuntimeChecks() -> RobotModelViewController {
@@ -1009,9 +1227,15 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let scene = SCNScene()
                 let node = SCNNode(geometry: geometry)
                 node.name = "Fixture"
-                scene.rootNode.addChildNode(node)
+                let collection = SCNNode()
+                collection.name = "Assembly"
+                collection.addChildNode(node)
+                scene.rootNode.addChildNode(collection)
                 try editor.viewport.install(scene)
                 precondition(editor.viewport.parts.count == 2)
+                precondition(editor.viewport.modelHierarchy?.children.first?.name == "Assembly")
+                precondition(editor.viewport.modelHierarchy?.children.first?.children.first?.name == "Fixture")
+                precondition(editor.viewport.modelHierarchy?.allParts == Set(editor.viewport.parts.map(\.id)))
                 let part = editor.viewport.parts[0]
                 precondition(part.node.geometry?.elements.count == 2)
                 let surface = try part.mesh.surface(at: 0)
@@ -1091,7 +1315,117 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 editor.importing = false
                 editor.search.text = ""
                 editor.selectGroup(savedGroupID)
-                print("PASS: Unassigned Parts clears selection, Deselect All button and Command-Shift-A action, axis cancellation and document preservation")
+                print("PASS: No Active Group clears selection, Deselect All button and Command-Shift-A action, axis cancellation and document preservation")
+                let treeUndo = editor.undoStack
+                let treeRedo = editor.redoStack
+                editor.resetTreeExpansion()
+                editor.refresh()
+                let assembly = editor.treeRows.first { $0.node.name == "Assembly" }!.node
+                precondition(!editor.treeRows.contains { $0.node.name == "Fixture" })
+                editor.toggleTreeNode(assembly.id)
+                precondition(editor.treeRows.contains { $0.node.name == "Fixture" })
+                editor.toggleTreeNode(assembly.id)
+                editor.search.text = "Fixture"
+                editor.reloadTree()
+                precondition(editor.treeRows.contains { $0.node.name == "Assembly" })
+                precondition(editor.treeRows.contains { $0.node.name == "Fixture" })
+                editor.search.text = ""
+                editor.reloadTree()
+                precondition(!editor.treeRows.contains { $0.node.name == "Fixture" })
+                editor.selected.removeAll()
+                editor.selectTreeNode(assembly)
+                precondition(editor.selected == editor.partIDs)
+                editor.selectTreeNode(assembly)
+                precondition(editor.selected.isEmpty)
+                editor.selected = [part.id]
+                editor.selectTreeNode(assembly)
+                precondition(editor.selected == editor.partIDs)
+                for title in editor.sidebarSections.keys {
+                    editor.sidebarSections[title]?.0.sendActions(for: .touchUpInside)
+                    precondition(editor.sidebarSections[title]?.1.isHidden == true)
+                    editor.view.layoutIfNeeded()
+                    editor.sidebarSections[title]?.0.sendActions(for: .touchUpInside)
+                    precondition(editor.sidebarSections[title]?.1.isHidden == false)
+                }
+                let targetGroup = editor.treeRows.first { $0.node.groupID == savedGroupID }!.node
+                let partDrag = UIDragItem(itemProvider: NSItemProvider(object: "Parts" as NSString))
+                partDrag.localObject = TreeDrag(groupID: nil, parts: editor.partIDs)
+                let moved = try editor.dropping([partDrag], onto: targetGroup)
+                editor.edit { $0 = moved }
+                precondition(editor.activeGroup?.parts == editor.partIDs)
+                let persistedMove = try RobotModelStorage.loadDocument(at: url, hash: "fixture")
+                precondition(persistedMove == moved)
+                editor.undoTapped()
+                precondition(editor.document == savedDocument)
+                editor.redoTapped()
+                precondition(editor.document == moved)
+                editor.removeSelection()
+                precondition(editor.document.groups.allSatisfy { $0.parts.isEmpty })
+                let savedCollapsedNodes = editor.collapsedNodes
+                editor.collapsedNodes.removeAll()
+                editor.reloadTree()
+                precondition(!editor.treeRows.contains { $0.node.id == "unassigned" })
+                for partID in editor.partIDs {
+                    let leaves = editor.treeRows.filter { $0.node.children.isEmpty && $0.node.parts.contains(partID) }
+                    precondition(leaves.count == 1 && leaves[0].node.id.hasPrefix("source/"))
+                }
+                editor.collapsedNodes = savedCollapsedNodes
+                editor.undoTapped()
+                precondition(editor.document == moved)
+                print("PASS: ungrouped parts appear only in the source hierarchy; Remove Parts and undo preserve the model")
+                let childGroup = RobotRigGroup(name: "Child", parts: [])
+                editor.document.groups.append(childGroup)
+                editor.refresh()
+                let groupDrag = UIDragItem(itemProvider: NSItemProvider(object: "Child" as NSString))
+                groupDrag.localObject = TreeDrag(groupID: childGroup.id, parts: [])
+                editor.document = try editor.dropping([groupDrag], onto: targetGroup)
+                precondition(editor.document.groups.last?.parentID == savedGroupID)
+                editor.refresh()
+                let childRow = editor.treeRows.first { $0.node.groupID == childGroup.id }!
+                let parentRow = editor.treeRows.first { $0.node.groupID == savedGroupID }!
+                precondition(childRow.depth == parentRow.depth + 1)
+                groupDrag.localObject = TreeDrag(groupID: savedGroupID, parts: [])
+                do { _ = try editor.dropping([groupDrag], onto: childRow.node); preconditionFailure("Tree accepted a cycle") } catch {}
+                do { _ = try editor.dropping([groupDrag], onto: targetGroup); preconditionFailure("Tree accepted self-parenting") } catch {}
+                groupDrag.localObject = TreeDrag(groupID: childGroup.id, parts: [])
+                let rootRow = editor.treeRows.first { $0.node.id == "groups" }!.node
+                let rooted = try editor.dropping([groupDrag], onto: rootRow)
+                precondition(rooted.groups.last?.parentID == nil)
+                editor.importing = true
+                do { _ = try editor.dropping([partDrag], onto: targetGroup); preconditionFailure("Tree accepted edit during import") } catch {}
+                editor.importing = false
+                editor.document = savedDocument
+                editor.undoStack = treeUndo
+                editor.redoStack = treeRedo
+                editor.selectGroup(savedGroupID)
+                try RobotModelStorage.save(savedDocument, at: url)
+                print("PASS: retained GLB collections, tree collapse/search, batch selection, collapsible sections, part transfer, group nesting, cycle rejection, persistence and undo/redo")
+                for index in 0..<30 {
+                    editor.document.groups.append(RobotRigGroup(name: "Scroll fixture \(index)", parts: []))
+                }
+                editor.refresh()
+                editor.table.layoutIfNeeded()
+                editor.table.setContentOffset(CGPoint(x: 0, y: 440), animated: false)
+                editor.table.layoutIfNeeded()
+                let scrollOffset = editor.table.contentOffset
+                let visiblePaths = editor.table.indexPathsForVisibleRows!
+                let visibleCells = visiblePaths.map { editor.table.cellForRow(at: $0)! }
+                let visibleAccessories = visibleCells.map { $0.accessoryView! }
+                let rowIDs = editor.treeRows.map { $0.node.id }
+                for _ in 0..<20 {
+                    editor.motorUpdate()
+                    editor.table.layoutIfNeeded()
+                    precondition(editor.table.contentOffset == scrollOffset)
+                    precondition(editor.treeRows.map { $0.node.id } == rowIDs)
+                    for (index, path) in visiblePaths.enumerated() {
+                        precondition(editor.table.cellForRow(at: path) === visibleCells[index])
+                        precondition(editor.table.cellForRow(at: path)?.accessoryView === visibleAccessories[index])
+                    }
+                }
+                editor.document = savedDocument
+                editor.refresh()
+                editor.table.setContentOffset(.zero, animated: false)
+                print("PASS: telemetry refresh preserves hierarchy row order, visible cells and scroll offset")
                 editor.angles[savedGroupID!] = 45
                 editor.toggleMoveAxis()
                 precondition(editor.movingAxis && editor.angles.isEmpty && !editor.angle.isEnabled)
@@ -1271,6 +1605,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                         editor.assetURL = nil
                         editor.pendingSurface = nil
                         editor.selected.removeAll()
+                        editor.resetTreeExpansion()
                         editor.refresh()
                         SCNTransaction.flush()
                         print("PASS: sample GLB decoded into \(editor.viewport.parts.count) parts")
