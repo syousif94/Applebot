@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+	C01115100000000000000001 /* RobotCollisionQueries in Frameworks */ = {isa = PBXBuildFile; productRef = C01115100000000000000003 /* RobotCollisionQueries */; };
 		532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */ = {isa = PBXBuildFile; productRef = 532AA3D42F09D00000B4C836 /* WebRTC */; };
 		533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */ = {isa = PBXBuildFile; productRef = 533516C33040FE6D0090D4A9 /* IrohLib */; };
 		53A5785B305E19AB00D6B634 /* GLTFKit2 in Frameworks */ = {isa = PBXBuildFile; productRef = 53A5785A305E19AB00D6B634 /* GLTFKit2 */; };
@@ -43,6 +44,7 @@
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+                C01115100000000000000001 /* RobotCollisionQueries in Frameworks */,
 				533516C43040FE6D0090D4A9 /* IrohLib in Frameworks */,
 				532AA3D32F09D00000B4C836 /* WebRTC in Frameworks */,
 				53A5785B305E19AB00D6B634 /* GLTFKit2 in Frameworks */,
@@ -88,6 +90,7 @@
 			);
 			name = RoboCar;
 			packageProductDependencies = (
+                C01115100000000000000003 /* RobotCollisionQueries */,
 				532AA3D42F09D00000B4C836 /* WebRTC */,
 				533516C33040FE6D0090D4A9 /* IrohLib */,
 				53A5785A305E19AB00D6B634 /* GLTFKit2 */,
@@ -121,6 +124,7 @@
 			mainGroup = 532AA3B22F09C4CB00B4C836;
 			minimizedProjectReferenceProxies = 1;
 			packageReferences = (
+                C01115100000000000000002 /* XCLocalSwiftPackageReference "CollisionQueries" */,
 				532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */,
 				533516C23040FE6D0090D4A9 /* XCRemoteSwiftPackageReference "iroh-ffi" */,
 				53A57859305E19AB00D6B634 /* XCRemoteSwiftPackageReference "GLTFKit2" */,
@@ -403,6 +407,10 @@
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
+		C01115100000000000000002 /* XCLocalSwiftPackageReference "CollisionQueries" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = CollisionQueries;
+		};
 		532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */ = {
 			isa = XCRemoteSwiftPackageReference;
 			repositoryURL = "https://github.com/stasel/WebRTC.git";
@@ -430,6 +438,11 @@
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
+		C01115100000000000000003 /* RobotCollisionQueries */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = C01115100000000000000002 /* XCLocalSwiftPackageReference "CollisionQueries" */;
+			productName = RobotCollisionQueries;
+		};
 		532AA3D42F09D00000B4C836 /* WebRTC */ = {
 			isa = XCSwiftPackageProductDependency;
 			package = 532AA3D52F09D00000B4C836 /* XCRemoteSwiftPackageReference "WebRTC" */;

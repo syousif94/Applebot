@@ -2,6 +2,7 @@ import UIKit
 import UniformTypeIdentifiers
 import SceneKit
 import GLTFKit2
+import RobotCollisionQueries
 
 final class RobotModelViewController: PanelViewController, UIDocumentPickerDelegate, UITableViewDataSource, UITableViewDelegate, UITableViewDragDelegate, UITableViewDropDelegate, UISearchBarDelegate {
     let motors: RobotRigMotorController
@@ -20,6 +21,10 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private let axisStateLabel = UILabel()
     private let selectionLabel = UILabel()
     private let viewportModeLabel = UILabel()
+    private let errorBanner = UIStackView()
+    private let errorLabel = UILabel()
+    private var errorTimer: Timer?
+    private var errorDeadline: Date?
     private var actionButtons: [Selector: UIButton] = [:]
     private var document = RobotRigDocument(assetHash: "")
     private var assetURL: URL?
@@ -32,6 +37,17 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private var pickingIK = false
     private var ikTarget: SIMD3<Float>?
     private var ikDragAngles: [UUID: Float]?
+    private var collisionPreparation: Task<RigCollisionWorld, Never>?
+    private var collisionCheck: Task<RigCollisionWorld.Outcome, Never>?
+    private var pendingIKMove: (target: SIMD3<Float>, state: UIGestureRecognizer.State)?
+    private var ikDisplayLink: CADisplayLink?
+    private final class IKFrameTarget {
+        weak var editor: RobotModelViewController?
+        init(_ editor: RobotModelViewController) { self.editor = editor }
+        @objc func tick() { editor?.processIKFrame() }
+    }
+    private var collisionGeneration = UUID()
+    private var collisionPartIDs = Set<String>()
     private var ikMessage: String?
     private let ikStateLabel = UILabel()
     private var pendingSurface: (String, RobotRigSurface)?
@@ -71,7 +87,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private var collapsedNodes = Set<String>()
     private var sidebarSections: [String: (UIButton, UIStackView)] = [:]
     #if DEBUG
-    private var runtimeCheck: (() -> Void)?
+    private var runtimeCheck: (() async -> Void)?
     #endif
 
     init(motors: RobotRigMotorController) {
@@ -80,6 +96,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    isolated deinit { ikDisplayLink?.invalidate() }
 
     override var keyCommands: [UIKeyCommand]? {
         let deselect = UIKeyCommand(input: "a", modifierFlags: [.command, .shift], action: #selector(deselectAllParts))
@@ -139,6 +157,27 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             viewportModeLabel.centerXAnchor.constraint(equalTo: viewportHost.centerXAnchor),
             viewportModeLabel.widthAnchor.constraint(lessThanOrEqualTo: viewportHost.widthAnchor, constant: -16),
             viewportModeLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 36)
+        ])
+        errorBanner.translatesAutoresizingMaskIntoConstraints = false
+        errorBanner.axis = .horizontal
+        errorBanner.alignment = .center
+        errorBanner.isLayoutMarginsRelativeArrangement = true
+        errorBanner.layoutMargins = UIEdgeInsets(top: 12, left: 12, bottom: 12, right: 12)
+        errorBanner.backgroundColor = .clear
+        errorBanner.isHidden = true
+        errorBanner.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(hideError)))
+        errorBanner.isAccessibilityElement = true
+        errorBanner.accessibilityCustomActions = [UIAccessibilityCustomAction(name: "Dismiss error", target: self, selector: #selector(dismissAccessibleError))]
+        errorLabel.font = .systemFont(ofSize: 14, weight: .medium)
+        errorLabel.textColor = .systemRed
+        errorLabel.numberOfLines = 0
+        errorBanner.addArrangedSubview(errorLabel)
+        viewportHost.addSubview(errorBanner)
+        NSLayoutConstraint.activate([
+            errorBanner.bottomAnchor.constraint(equalTo: viewportHost.safeAreaLayoutGuide.bottomAnchor, constant: -8),
+            errorBanner.centerXAnchor.constraint(equalTo: viewportHost.centerXAnchor),
+            errorBanner.heightAnchor.constraint(greaterThanOrEqualToConstant: 44),
+            errorBanner.widthAnchor.constraint(equalTo: viewportHost.widthAnchor, constant: -24)
         ])
         search.placeholder = "Groups, collections, parts"
         search.delegate = self
@@ -269,7 +308,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         #if DEBUG
         if let check = runtimeCheck {
             runtimeCheck = nil
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { check() }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { Task { await check() } }
         }
         #endif
     }
@@ -396,7 +435,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         groupButton.menu = UIMenu(children: [UIAction(title: "No Active Group", state: activeGroupID == nil ? .on : .off) { [weak self] _ in self?.selectGroup(nil) }] + document.groups.map { group in
             UIAction(title: group.name, state: group.id == activeGroupID ? .on : .off) { [weak self] _ in self?.selectGroup(group.id) }
         })
-        viewport.update(document: document, angles: angles, selected: selected, isolated: isolated)
+        viewport.update(document: document, angles: angles, selected: selected, isolated: isolated, colliding: collisionPartIDs)
         if let target = ikTarget, let group = activeGroup, let endpoint = document.ikEndpoint(for: group.id, angles: angles) {
             viewport.showIK(target: target, endpoint: endpoint, parts: group.parts)
         } else if let pendingSurface {
@@ -420,8 +459,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             : (motors.isArmed ? "  Live Motor Control  " : "  Select Parts  ")
         if movingAxis { viewportModeLabel.text = "  Move Axis: X / Y / Z  " }
         if pickingIK { viewportModeLabel.text = "  Place IK Helper: \(group?.name ?? "")  " }
-        if ikTarget != nil { viewportModeLabel.text = "  IK Preview: Drag Child or XYZ Target  " }
+        viewportModeLabel.isHidden = !motors.isArmed
         viewportHost.bringSubviewToFront(viewportModeLabel)
+        viewportHost.bringSubviewToFront(errorBanner)
         selectionLabel.text = "\(selected.count) selected parts" + (group.map { " / \($0.parts.count) in group" } ?? "")
         if pickingAxis {
             axisStateLabel.text = pendingSurface == nil
@@ -696,7 +736,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         angles.removeAll()
         pickingAxis.toggle()
         pendingSurface = nil
-        status.text = pickingAxis ? "Select axis face" : "Preview"
+        status.text = pickingAxis ? "Select axis face" : nil
         refresh()
     }
 
@@ -765,6 +805,15 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
 
     private func stopIK() {
         viewport.cancelAxisDrag()
+        collisionGeneration = UUID()
+        collisionPreparation?.cancel()
+        collisionPreparation = nil
+        collisionCheck?.cancel()
+        collisionCheck = nil
+        pendingIKMove = nil
+        ikDisplayLink?.invalidate()
+        ikDisplayLink = nil
+        collisionPartIDs.removeAll()
         pickingIK = false
         ikTarget = nil
         ikDragAngles = nil
@@ -855,6 +904,24 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             do {
                 let chain = try document.ikChain(for: group.id)
                 guard chain.contains(where: { $0.axis != nil }) else { throw RobotRigError.invalid("Set rotation axes on the IK chain first") }
+                var moving = Set(chain.filter { $0.axis != nil }.map { $0.id.uuidString })
+                for _ in document.groups.indices {
+                    for item in document.groups where item.parentID.map({ moving.contains($0.uuidString) }) == true {
+                        moving.insert(item.id.uuidString)
+                    }
+                }
+                let parts = viewport.parts.map { part in
+                    RigCollisionWorld.Part(id: part.id, name: part.name,
+                                           owner: document.groups.first { $0.parts.contains(part.id) }?.id.uuidString,
+                                           vertices: part.mesh.triangles.flatMap { [$0.first, $0.second, $0.third] })
+                }
+                let joints = document.groups.compactMap { item in
+                    item.axis.map { RigCollisionWorld.Joint(id: item.id.uuidString, parent: item.parentID?.uuidString, pivot: $0.origin, direction: $0.direction) }
+                }
+                let movingIDs = moving
+                collisionPreparation = Task.detached(priority: .userInitiated) {
+                    RigCollisionWorld(parts: parts, joints: joints, moving: movingIDs)
+                }
                 ikTarget = document.ikEndpoint(for: group.id, angles: angles)
             } catch { showError(error.localizedDescription) }
         }
@@ -863,19 +930,93 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private func moveIK(_ target: SIMD3<Float>, state: UIGestureRecognizer.State) {
+        guard ikTarget != nil, !motors.isArmed, !importing else { return }
+        if state == .cancelled || state == .failed {
+            ikDisplayLink?.invalidate()
+            ikDisplayLink = nil
+            performIKMove(target, state: state)
+            return
+        }
+        ikTarget = target
+        pendingIKMove = (target, state)
+        if ikDisplayLink == nil {
+            let link = CADisplayLink(target: IKFrameTarget(self), selector: #selector(IKFrameTarget.tick))
+            link.preferredFrameRateRange = CAFrameRateRange(minimum: 30, maximum: 60, preferred: 60)
+            link.add(to: .main, forMode: .common)
+            ikDisplayLink = link
+        }
+        ikDisplayLink?.isPaused = false
+    }
+
+    private func processIKFrame() {
+        guard collisionCheck == nil, let pending = pendingIKMove else { return }
+        pendingIKMove = nil
+        ikDisplayLink?.isPaused = true
+        performIKMove(pending.target, state: pending.state)
+    }
+
+    private func performIKMove(_ target: SIMD3<Float>, state: UIGestureRecognizer.State) {
         guard ikTarget != nil, !motors.isArmed, !importing, let group = activeGroup else { return }
         if state == .cancelled || state == .failed {
+            collisionGeneration = UUID()
+            collisionCheck?.cancel()
+            collisionCheck = nil
+            pendingIKMove = nil
+            collisionPartIDs.removeAll()
             if let previous = ikDragAngles { angles = previous }
             ikDragAngles = nil
             ikTarget = document.ikEndpoint(for: group.id, angles: angles)
             ikMessage = nil
         } else {
+            ikTarget = target
+            if collisionCheck != nil {
+                pendingIKMove = (target, state)
+                return
+            }
             do {
                 let result = try document.solveIK(for: group.id, target: target, angles: angles)
-                angles = result.angles
-                ikTarget = target
-                ikMessage = String(format: "%@ / Distance %.4f", result.reached ? "Target reached" : "Target not reached", result.error)
-                if state == .ended { ikDragAngles = nil }
+                guard let preparation = collisionPreparation else { return }
+                let generation = UUID()
+                collisionGeneration = generation
+                let initial = angles
+                let ids = Set(initial.keys).union(result.angles.keys)
+                let travel = ids.reduce(Float(0)) { $0 + abs((result.angles[$1] ?? 0) - (initial[$1] ?? 0)) }
+                let stepCount = min(8, max(1, Int(ceil(travel / 5))))
+                let samples = (0...stepCount).map { step in
+                    Dictionary(uniqueKeysWithValues: ids.map { id in
+                        (id, (initial[id] ?? 0) + ((result.angles[id] ?? 0) - (initial[id] ?? 0)) * Float(step) / Float(stepCount))
+                    })
+                }
+                let poses = samples.map { sample in
+                    Dictionary(uniqueKeysWithValues: document.transforms(angles: sample).map { ($0.key.uuidString, $0.value) })
+                }
+                ikMessage = "Checking mesh collisions"
+                let worker = Task.detached(priority: .userInitiated) {
+                    let world = await preparation.value
+                    return world.check(poses: poses, measureOverlap: false)
+                }
+                collisionCheck = worker
+                Task { [weak self] in
+                    let outcome = await worker.value
+                    guard let self, self.collisionGeneration == generation, self.ikTarget != nil,
+                          !self.motors.isArmed, !self.importing else { return }
+                                        self.collisionCheck = nil
+                    self.angles = samples[outcome.accepted]
+                    self.collisionPartIDs = Set(outcome.blockedParts)
+                    let reached = result.reached && outcome.accepted == stepCount
+                    let endpoint = self.document.ikEndpoint(for: group.id, angles: self.angles) ?? result.endpoint
+                    self.ikMessage = String(format: "%@ / Distance %.4f", reached ? "Target reached" : "Target not reached", simd_distance(endpoint, target))
+                    if let message = Self.collisionError(outcome, proposedSamples: samples.count - 1) {
+                        self.ikMessage = (self.ikMessage ?? "") + " / " + message
+                        self.showError(message)
+                    }
+                    self.refresh()
+                    if self.pendingIKMove != nil {
+                        self.ikDisplayLink?.isPaused = false
+                        return
+                    }
+                    if state == .ended { self.ikDragAngles = nil }
+                }
             } catch { showError(error.localizedDescription) }
         }
         refresh()
@@ -961,7 +1102,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 if let binding = group.motor, let measured = motors.measuredAngle(binding) { angles[group.id] = Float(measured) }
             }
         }
-        if !importing, importError == nil, let message = motors.status { status.text = message }
+        if !importing, importError == nil, let message = motors.status { status.text = message == "Preview" ? nil : message }
         refresh()
     }
 
@@ -1012,7 +1153,40 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         present(alert, animated: true)
     }
 
-    private func showError(_ message: String) { status.text = message; status.textColor = .systemRed }
+    private static func collisionError(_ outcome: RigCollisionWorld.Outcome, proposedSamples: Int) -> String? {
+        outcome.accepted < proposedSamples || !outcome.blockedParts.isEmpty ? outcome.message : nil
+    }
+
+    private func showError(_ message: String) {
+        let announce = errorBanner.isHidden || errorLabel.text != message
+        errorTimer?.invalidate()
+        errorLabel.text = message
+        errorBanner.accessibilityLabel = message
+        errorBanner.isHidden = false
+        viewportHost.bringSubviewToFront(errorBanner)
+        errorDeadline = Date().addingTimeInterval(20)
+        errorTimer = Timer.scheduledTimer(withTimeInterval: 20, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated { self?.expireError(at: Date()) }
+        }
+        if announce { UIAccessibility.post(notification: .announcement, argument: message) }
+    }
+
+    private func expireError(at date: Date) {
+        guard let deadline = errorDeadline, date >= deadline else { return }
+        hideError()
+    }
+
+    @objc private func hideError() {
+        errorTimer?.invalidate()
+        errorTimer = nil
+        errorDeadline = nil
+        errorBanner.isHidden = true
+    }
+
+    @objc private func dismissAccessibleError() -> Bool {
+        hideError()
+        return true
+    }
 
     private func showImportError(_ message: String) {
         importError = message
@@ -1210,6 +1384,16 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         let editor = RobotModelViewController(motors: motors)
         editor.runtimeCheck = { [weak editor] in
             guard let editor else { return }
+            func awaitCollision() async {
+                for _ in 0..<200 {
+                    editor.processIKFrame()
+                    let worker = editor.collisionCheck
+                    _ = await worker?.value
+                    await Task.yield()
+                    if editor.collisionCheck == nil && editor.pendingIKMove == nil { return }
+                }
+                preconditionFailure("Collision completion was not applied")
+            }
             do {
                 let vertices = [SCNVector3(0, 0, 0), SCNVector3(4, 0, 0), SCNVector3(0, 2, 0), SCNVector3(4, 2, 0),
                                 SCNVector3(6, 0, 0), SCNVector3(7, 0, 0), SCNVector3(6, 1, 0)]
@@ -1491,10 +1675,30 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let ikDocument = editor.document
                 editor.toggleIK()
                 precondition(editor.ikTarget != nil && !editor.mode.isEnabled)
+                editor.moveIK(SIMD3(1.5, 0.5, 0), state: .changed)
+                let firstGeneration = editor.collisionGeneration
                 editor.moveIK(SIMD3(0.5, 1.5, 0), state: .ended)
+                precondition(editor.collisionGeneration == firstGeneration && editor.pendingIKMove != nil)
+                precondition(editor.collisionCheck == nil, "Drag events must wait for the next frame")
+                editor.processIKFrame()
+                let batchGeneration = editor.collisionGeneration
+                await awaitCollision()
+                precondition(editor.collisionGeneration == batchGeneration, "One target must use one solve/check batch")
+                precondition(editor.pendingIKMove == nil && editor.collisionCheck == nil)
                 precondition(simd_distance(editor.document.ikEndpoint(for: savedGroupID!, angles: editor.angles)!, SIMD3(0.5, 1.5, 0)) < 0.003)
                 precondition(abs(editor.angles[root.id] ?? 0) > 1)
                 precondition(editor.document == ikDocument && commander.motion.isEmpty)
+                editor.moveIK(SIMD3(1.5, 0.5, 0), state: .changed)
+                editor.processIKFrame()
+                let runningGeneration = editor.collisionGeneration
+                editor.moveIK(SIMD3(1, 1, 0), state: .changed)
+                editor.moveIK(SIMD3(0.5, 1.5, 0), state: .ended)
+                editor.processIKFrame()
+                precondition(editor.collisionGeneration == runningGeneration, "A frame must not start a second worker")
+                precondition(editor.pendingIKMove?.target == SIMD3(0.5, 1.5, 0), "Only the newest pending target should survive")
+                await awaitCollision()
+                precondition(editor.pendingIKMove == nil && editor.collisionCheck == nil && editor.ikDragAngles == nil)
+                precondition(simd_distance(editor.document.ikEndpoint(for: savedGroupID!, angles: editor.angles)!, SIMD3(0.5, 1.5, 0)) < 0.003)
                 SCNTransaction.flush()
                 _ = editor.viewport.snapshot()
                 let targetScreen = editor.viewport.projectPoint(SCNVector3(editor.ikTarget!))
@@ -1503,6 +1707,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let poseBeforeDrag = editor.angles
                 precondition(editor.viewport.beginAxisDrag(at: dragStart))
                 editor.viewport.moveAxisDrag(to: dragEnd, state: .changed)
+                await awaitCollision()
                 precondition(editor.angles != poseBeforeDrag)
                 editor.viewport.cancelAxisDrag()
                 precondition(editor.angles == poseBeforeDrag)
@@ -1514,6 +1719,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let childStart = CGPoint(x: CGFloat(childScreen.x), y: CGFloat(childScreen.y))
                 precondition(editor.viewport.beginAxisDrag(at: childStart), "Could not drag child mesh")
                 editor.viewport.moveAxisDrag(to: CGPoint(x: childStart.x + 15, y: childStart.y - 8), state: .changed)
+                await awaitCollision()
                 precondition(editor.angles != poseBeforeDrag)
                 editor.viewport.cancelAxisDrag()
                 precondition(editor.angles == poseBeforeDrag)
@@ -1528,8 +1734,10 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 editor.viewport.moveAxisDrag(to: CGPoint(x: CGFloat(coneEnd.x), y: CGFloat(coneEnd.y)), state: .ended)
                 precondition(simd_distance(editor.ikTarget!, targetBeforeHandle + SIMD3(0.1, 0, 0)) < 0.001)
                 editor.moveIK(SIMD3(10, 10, 10), state: .ended)
+                await awaitCollision()
                 precondition(editor.ikMessage!.contains("not reached") && commander.motion.isEmpty)
                 editor.moveIK(SIMD3(1, 1, 0), state: .ended)
+                await awaitCollision()
                 editor.revealIKControls()
                 SCNTransaction.flush()
                 let ikImage = editor.viewport.snapshot()
@@ -1550,6 +1758,33 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 try RobotModelStorage.save(savedDocument, at: url)
                 editor.refresh()
                 print("PASS: IK rest-coordinate helper picking, persistence, parent-chain solving, target drag cancellation, unreachable state and zero motor commands")
+                editor.showError("Enter three finite coordinates")
+                let firstDeadline = editor.errorDeadline!
+                editor.motorUpdate()
+                precondition(!editor.errorBanner.isHidden && editor.viewportModeLabel.isHidden)
+                editor.expireError(at: firstDeadline.addingTimeInterval(-1))
+                precondition(!editor.errorBanner.isHidden)
+                editor.showError("Replacement error")
+                editor.expireError(at: firstDeadline.addingTimeInterval(-1))
+                precondition(!editor.errorBanner.isHidden && editor.errorLabel.text == "Replacement error")
+                editor.expireError(at: editor.errorDeadline!)
+                precondition(editor.errorBanner.isHidden)
+                editor.showError("Dismissable error")
+                editor.view.layoutIfNeeded()
+                precondition(editor.errorBanner.backgroundColor == UIColor.clear && editor.errorLabel.textColor == UIColor.systemRed)
+                precondition(editor.errorBanner.arrangedSubviews.count == 1 && editor.errorBanner.arrangedSubviews[0] === editor.errorLabel)
+                precondition(editor.errorBanner.gestureRecognizers?.contains(where: { $0 is UITapGestureRecognizer }) == true)
+                precondition(abs(editor.errorBanner.frame.maxY - (editor.viewportHost.safeAreaLayoutGuide.layoutFrame.maxY - 8)) < 1)
+                precondition(editor.dismissAccessibleError())
+                precondition(editor.errorBanner.isHidden && editor.errorDeadline == nil)
+                let coverage = await Task.detached {
+                    RigCollisionWorld(parts: [.init(id: "empty", name: "empty", owner: "arm", vertices: [])], joints: [], moving: ["arm"])
+                        .check(poses: [[:], [:]], timeLimit: 1)
+                }.value
+                precondition(coverage.message?.contains("unsupported") == true)
+                precondition(collisionError(coverage, proposedSamples: 1) == nil, "Coverage notices must not appear as errors")
+                precondition(collisionError(coverage, proposedSamples: 2) != nil, "Incomplete motion must still report its message")
+                print("PASS: viewport errors survive telemetry, remain for 20 seconds, renew and dismiss; preview badge hidden")
                 UserDefaults.standard.set(priorDefault, forKey: "RobotModel.lastAsset")
                 let binding = RobotRigMotorBinding(servoID: 1, reversed: true, ratio: 2, offset: 720, robotID: "test")
                 motors.updateIDs([1])
@@ -1609,6 +1844,74 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                         editor.refresh()
                         SCNTransaction.flush()
                         print("PASS: sample GLB decoded into \(editor.viewport.parts.count) parts")
+                        let meshParts = editor.viewport.parts.map { part in
+                            RigCollisionWorld.Part(id: part.id, name: part.name, owner: nil,
+                                                   vertices: part.mesh.triangles.flatMap { [$0.first, $0.second, $0.third] })
+                        }
+                        let preparationStart = Date()
+                        let world = await Task.detached { RigCollisionWorld(parts: meshParts, joints: [], moving: []) }.value
+                        print("MESH COVERAGE: \(meshParts.count - world.unsupported.count)/\(meshParts.count) components, \(world.surfaceCount) surface-only; preparation \(Date().timeIntervalSince(preparationStart))s")
+                        report += "Mesh coverage: \(meshParts.count - world.unsupported.count)/\(meshParts.count) components; \(world.surfaceCount) surface-only\n"
+                        if let rigIndex = args.firstIndex(of: "--rig-document"), args.indices.contains(rigIndex + 1) {
+                            let saved = try JSONDecoder().decode(RobotRigDocument.self, from: Data(contentsOf: URL(fileURLWithPath: args[rigIndex + 1])))
+                            let owned = meshParts.map { part in
+                                RigCollisionWorld.Part(id: part.id, name: part.name,
+                                                       owner: saved.groups.first { $0.parts.contains(part.id) }?.id.uuidString, vertices: part.vertices)
+                            }
+                            let joints = saved.groups.compactMap { group in
+                                group.axis.map { RigCollisionWorld.Joint(id: group.id.uuidString, parent: group.parentID?.uuidString, pivot: $0.origin, direction: $0.direction) }
+                            }
+                            let moving = Set(saved.groups.map { $0.id.uuidString })
+                            let poses = (0...2).map { step in
+                                let angles = Dictionary(uniqueKeysWithValues: saved.groups.map { ($0.id, Float(step) * 0.1) })
+                                return Dictionary(uniqueKeysWithValues: saved.transforms(angles: angles).map { ($0.key.uuidString, $0.value) })
+                            }
+                            let dragPoses = (0...60).map { step in
+                                let angle = Float(step <= 30 ? step : 60 - step) / 150
+                                let angles = Dictionary(uniqueKeysWithValues: saved.groups.map { ($0.id, angle) })
+                                return Dictionary(uniqueKeysWithValues: saved.transforms(angles: angles).map { ($0.key.uuidString, $0.value) })
+                            }
+                            await Task.detached {
+                                let probe = RigCollisionWorld(parts: owned, joints: joints, moving: moving)
+                                for budget in [10.0, 0.25] {
+                                    let start = Date()
+                                    let outcome = probe.check(poses: poses, timeLimit: budget, measureOverlap: false)
+                                    print("FULL RIG: budget \(budget); elapsed \(Date().timeIntervalSince(start)); accepted \(outcome.accepted); \(outcome.message ?? "clear")")
+                                    for part in owned where outcome.blockedParts.contains(part.id) {
+                                        print("BLOCKED OWNER: \(part.name), \(part.id), group \(part.owner ?? "ungrouped")")
+                                    }
+                                    precondition(outcome.message?.contains("timed out") != true, "Saved-rig collision query exhausted its budget")
+                                    precondition(outcome.accepted == poses.count - 1, "Saved-rig small motion was blocked")
+                                }
+                                var durations: [Double] = []
+                                for step in 1..<dragPoses.count {
+                                    let start = ContinuousClock.now
+                                    let outcome = probe.check(poses: [dragPoses[step - 1], dragPoses[step]], measureOverlap: false)
+                                    let elapsed = start.duration(to: .now).components
+                                    durations.append(Double(elapsed.seconds) + Double(elapsed.attoseconds) / 1e18)
+                                    precondition(outcome.accepted == 1, "Saved-rig incremental motion was blocked: \(outcome.message ?? "unknown")")
+                                }
+                                let sorted = durations.sorted()
+                                print("FULL RIG INCREMENTAL: \(durations.count) checks; mean \(durations.reduce(0, +) / Double(durations.count) * 1000)ms; p95 \(sorted[Int(Double(sorted.count - 1) * 0.95)] * 1000)ms; max \(sorted.last! * 1000)ms")
+                            }.value
+                        }
+                        let wrists = meshParts.filter { $0.name == "Wrist_001 [1]" }
+                        let servos = meshParts.filter { $0.name == "Bend Servo_001" }
+                        for wrist in wrists {
+                            for servo in servos {
+                                let pair = [RigCollisionWorld.Part(id: wrist.id, name: wrist.name, owner: "wrist", vertices: wrist.vertices), servo]
+                                await Task.detached {
+                                    let probe = RigCollisionWorld(parts: pair, joints: [], moving: ["wrist"])
+                                    print("COLLISION PROXY: \(wrist.name) \(wrist.vertices.count / 3) -> \(probe.triangleCounts[wrist.id] ?? 0) triangles; relative error \(probe.simplificationErrors[wrist.id] ?? 0)")
+                                    let rotation = simd_float4x4(simd_quatf(angle: 0.01, axis: SIMD3<Float>(0, 1, 0)))
+                                    for budget in [0.25, 5.0] {
+                                        let start = Date()
+                                        let outcome = probe.check(poses: [[:], ["wrist": rotation]], timeLimit: budget)
+                                        print("MESH PAIR: \(wrist.name) (\(wrist.vertices.count / 3)) / \(servo.name) (\(servo.vertices.count / 3)); surfaces \(probe.surfaceCount); budget \(budget); elapsed \(Date().timeIntervalSince(start)); accepted \(outcome.accepted); \(outcome.message ?? "clear")")
+                                    }
+                                }.value
+                            }
+                        }
                         report += "PASS: sample GLB decoded into \(editor.viewport.parts.count) parts\n"
                         report += "Viewport bounds: \(editor.viewport.bounds)\n"
                     } catch {

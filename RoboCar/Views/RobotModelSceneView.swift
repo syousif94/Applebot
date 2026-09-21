@@ -166,15 +166,16 @@ final class RobotModelSceneView: SCNView, UIGestureRecognizerDelegate {
         defaultCameraController.pointOfView = cameraNode
     }
 
-    func update(document: RobotRigDocument, angles: [UUID: Float], selected: Set<String>, isolated: Bool) {
+    func update(document: RobotRigDocument, angles: [UUID: Float], selected: Set<String>, isolated: Bool, colliding: Set<String> = []) {
         let transforms = document.transforms(angles: angles)
         for part in parts {
             let owner = document.groups.first { $0.parts.contains(part.id) }
             part.node.simdTransform = (owner.flatMap { transforms[$0.id] } ?? matrix_identity_float4x4) * part.rest
-            part.node.isHidden = isolated && !selected.contains(part.id)
+            part.node.isHidden = isolated && !selected.contains(part.id) && !colliding.contains(part.id)
             part.node.geometry?.materials = part.materials.map { material in
                 let copy = material.copy() as! SCNMaterial
-                if selected.contains(part.id) { copy.emission.contents = UIColor(red: 0.05, green: 0.35, blue: 0.3, alpha: 1) }
+                if colliding.contains(part.id) { copy.emission.contents = UIColor.systemRed }
+                else if selected.contains(part.id) { copy.emission.contents = UIColor(red: 0.05, green: 0.35, blue: 0.3, alpha: 1) }
                 return copy
             }
         }
