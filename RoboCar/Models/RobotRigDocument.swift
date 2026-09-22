@@ -34,6 +34,10 @@ struct RobotRigDocument: Codable, Equatable {
                 }
             }
             if let axis = group.axis { try axis.validate() }
+            try group.validateIKMovementCost()
+            if let forward = group.targetFollowForward {
+                try validateTargetFollow(RobotRigTargetFollow(jointID: group.id, forward: forward))
+            }
             if let linear = group.linear {
                 guard group.axis != nil, linear.minimum.isFinite, linear.maximum.isFinite,
                       linear.minimum <= 0, linear.maximum >= 0, linear.minimum < linear.maximum,
@@ -57,6 +61,7 @@ struct RobotRigDocument: Codable, Equatable {
             if let helper = group.ikHelper {
                 guard helper.point.isFinite else { throw RobotRigError.invalid("IK helper must be finite") }
                 _ = try ikChain(for: group.id)
+                if let follow = helper.targetFollow { try validateTargetFollow(follow) }
             }
             if let binding = group.motor {
                 try motorBinding(for: group)!.validate()
@@ -144,6 +149,18 @@ struct RobotRigGroup: Codable, Equatable, Identifiable {
     var motor: RobotRigMotorBinding?
     var ikHelper: RobotRigIKHelper?
     var linear: RobotRigLinearMotion?
+    var ikMovementCost: Float?
+    var targetFollowForward: SIMD3<Float>?
+
+    static let ikMovementCostRange: ClosedRange<Float> = 0.1...100
+
+    func validateIKMovementCost() throws {
+        if let cost = ikMovementCost {
+            guard cost.isFinite, Self.ikMovementCostRange.contains(cost) else {
+                throw RobotRigError.invalid("IK movement cost must be between 0.1 and 100")
+            }
+        }
+    }
 }
 
 struct RobotRigLinearMotion: Codable, Equatable {
@@ -155,6 +172,12 @@ struct RobotRigLinearMotion: Codable, Equatable {
 struct RobotRigIKHelper: Codable, Equatable {
     var point: SIMD3<Float>
     var rootID: UUID
+    var targetFollow: RobotRigTargetFollow?
+}
+
+struct RobotRigTargetFollow: Codable, Equatable {
+    var jointID: UUID
+    var forward: SIMD3<Float>
 }
 
 struct RobotRigIKResult {
@@ -165,6 +188,74 @@ struct RobotRigIKResult {
 }
 
 extension RobotRigDocument {
+    func targetFollowers() -> [RobotRigTargetFollow] {
+        var follows: [UUID: RobotRigTargetFollow] = [:]
+        for group in groups {
+            if let legacy = group.ikHelper?.targetFollow, follows[legacy.jointID] == nil {
+                follows[legacy.jointID] = legacy
+            }
+        }
+        for group in groups {
+            if let forward = group.targetFollowForward {
+                follows[group.id] = RobotRigTargetFollow(jointID: group.id, forward: forward)
+            }
+        }
+        func depth(_ jointID: UUID) -> Int {
+            var current = groups.first { $0.id == jointID }
+            var visited = Set<UUID>()
+            while let joint = current, visited.insert(joint.id).inserted {
+                current = groups.first { $0.id == joint.parentID }
+            }
+            return visited.count
+        }
+        return follows.values.sorted {
+            let firstDepth = depth($0.jointID)
+            let secondDepth = depth($1.jointID)
+            return firstDepth == secondDepth ? $0.jointID.uuidString < $1.jointID.uuidString : firstDepth < secondDepth
+        }
+    }
+
+    func validateTargetFollow(_ follow: RobotRigTargetFollow) throws {
+        guard let joint = groups.first(where: { $0.id == follow.jointID }), joint.linear == nil,
+              let axis = joint.axis, follow.forward.isFinite,
+              abs(simd_length(follow.forward) - 1) < 0.001,
+              simd_length(simd_cross(axis.direction, follow.forward)) > 0.0001 else {
+            throw RobotRigError.invalid("Target following requires a rotational joint and a unit forward direction not parallel to its axis")
+        }
+    }
+
+    func followingTarget(_ target: SIMD3<Float>, follow: RobotRigTargetFollow, angles: [UUID: Float]) -> [UUID: Float] {
+        guard let joint = groups.first(where: { $0.id == follow.jointID }), let axis = joint.axis else { return angles }
+        let inherited = joint.parentID.flatMap { transforms(angles: angles)[$0] } ?? matrix_identity_float4x4
+        let localTarget4 = simd_inverse(inherited) * SIMD4(target, 1)
+        let offset = SIMD3(localTarget4.x, localTarget4.y, localTarget4.z) - axis.origin
+        let desired = offset - axis.direction * simd_dot(offset, axis.direction)
+        let forward = follow.forward - axis.direction * simd_dot(follow.forward, axis.direction)
+        guard simd_length(desired) > max(simd_length(offset) * 0.000001, Float.leastNormalMagnitude) else { return angles }
+        let degrees = atan2(simd_dot(axis.direction, simd_cross(forward, desired)), simd_dot(forward, desired)) * 180 / Float.pi
+        let limits = limits(for: joint)
+        let current = min(max(angles[joint.id] ?? 0, limits.lowerBound), limits.upperBound)
+        let firstTurn = ceil((limits.lowerBound - degrees) / 360)
+        let lastTurn = floor((limits.upperBound - degrees) / 360)
+        let nearestTurn = ((current - degrees) / 360).rounded()
+        let nearest = degrees + 360 * (firstTurn <= lastTurn ? min(max(nearestTurn, firstTurn), lastTurn) : nearestTurn)
+        let candidates = [nearest, limits.lowerBound, limits.upperBound].map {
+            min(max($0, limits.lowerBound), limits.upperBound)
+        }
+        var best = current
+        var bestError = Float.infinity
+        for candidate in candidates {
+            let error = abs((candidate - degrees).remainder(dividingBy: 360))
+            if error < bestError - 0.0001 || (abs(error - bestError) <= 0.0001 && abs(candidate - current) < abs(best - current)) {
+                best = candidate
+                bestError = error
+            }
+        }
+        var result = angles
+        result[joint.id] = best
+        return result
+    }
+
     func ikChain(for groupID: UUID) throws -> [RobotRigGroup] {
         guard let group = groups.first(where: { $0.id == groupID }), let helper = group.ikHelper else {
             throw RobotRigError.invalid("Add an IK helper first")
@@ -194,6 +285,15 @@ extension RobotRigDocument {
         var sourceIDs = Set<UUID>()
         let joints = chain.filter { $0.axis != nil }.map { motionSource(for: $0) }.filter { sourceIDs.insert($0.id).inserted }
         guard !joints.isEmpty, let helper = chain.first?.ikHelper else { throw RobotRigError.invalid("Set a motion axis on at least one group in the IK chain") }
+        let followers = targetFollowers()
+        for follow in followers { try validateTargetFollow(follow) }
+        let followingIDs = Set(followers.map(\.jointID))
+        func aimed(_ angles: [UUID: Float]) -> [UUID: Float] {
+            followers.reduce(angles) { followingTarget(target, follow: $1, angles: $0) }
+        }
+        for joint in joints { try joint.validateIKMovementCost() }
+        let mobilities: [Float] = joints.map { followingIDs.contains($0.id) ? 0 : 1 / ($0.ikMovementCost ?? 1) }
+        let usesMovementCosts = mobilities.contains { $0 != 1 }
         let lookup = Dictionary(uniqueKeysWithValues: groups.map { ($0.id, $0) })
         var ancestry = chain
         var visited = Set(chain.map(\.id))
@@ -234,6 +334,7 @@ extension RobotRigDocument {
         for joint in joints {
             best[joint.id] = clamped(best[joint.id] ?? 0, for: joint)
         }
+        best = aimed(best)
         let initialPoint = chainTransforms(best)[groupID]! * SIMD4(helper.point, 1)
         var bestPoint = SIMD3(initialPoint.x, initialPoint.y, initialPoint.z)
         var bestError = simd_distance(bestPoint, target)
@@ -242,11 +343,12 @@ extension RobotRigDocument {
             var angles = best
             if attempt > 0 {
                 for (index, joint) in joints.enumerated() {
-                    let perturbation: Float = maximumStep(joint) * 1.2 * (index % 2 == 0 ? 1 : -1) * (attempt == 1 ? 1 : -1)
+                    let perturbation: Float = maximumStep(joint) * 1.2 * min(1, sqrt(mobilities[index])) * (index % 2 == 0 ? 1 : -1) * (attempt == 1 ? 1 : -1)
                     angles[joint.id] = clamped((seed[joint.id] ?? 0) + perturbation, for: joint)
                 }
             }
             for _ in 0..<100 {
+                angles = aimed(angles)
                 let transforms = chainTransforms(angles)
                 let endpoint4 = transforms[groupID]! * SIMD4(helper.point, 1)
                 let endpoint = SIMD3(endpoint4.x, endpoint4.y, endpoint4.z)
@@ -258,7 +360,15 @@ extension RobotRigDocument {
                 }
                 if bestError <= tolerance { break }
                 let columns: [SIMD3<Float>] = joints.map { joint in
-                    chain.filter { $0.axis != nil && motionSource(for: $0).id == joint.id }.reduce(SIMD3<Float>.zero) { column, influence in
+                    if !followers.isEmpty {
+                        if followingIDs.contains(joint.id) { return .zero }
+                        let step = nativeStep(joint) * 0.001
+                        var shifted = angles
+                        shifted[joint.id] = (angles[joint.id] ?? 0) + step
+                        let shiftedPoint = chainTransforms(aimed(shifted))[groupID]! * SIMD4(helper.point, 1)
+                        return (SIMD3(shiftedPoint.x, shiftedPoint.y, shiftedPoint.z) - endpoint) / (scale * 0.001)
+                    }
+                    return chain.filter { $0.axis != nil && motionSource(for: $0).id == joint.id }.reduce(SIMD3<Float>.zero) { column, influence in
                         let inherited = influence.parentID.flatMap { transforms[$0] } ?? matrix_identity_float4x4
                         let origin = inherited * SIMD4(influence.axis!.origin, 1)
                         let direction = inherited * SIMD4(influence.axis!.direction, 0)
@@ -267,15 +377,38 @@ extension RobotRigDocument {
                         return column + simd_cross(vector, (endpoint - SIMD3(origin.x, origin.y, origin.z)) / scale)
                     }
                 }
-                var normal = matrix_identity_float3x3 * Float(0.0025)
-                for column in columns {
-                    normal += simd_float3x3(columns: (column * column.x, column * column.y, column * column.z))
+                var activeMobilities = mobilities
+                var correction = SIMD3<Float>.zero
+                for _ in 0...joints.count {
+                    var normal = matrix_identity_float3x3 * Float(0.0025)
+                    for (column, mobility) in zip(columns, activeMobilities) {
+                        normal += simd_float3x3(columns: (column * column.x, column * column.y, column * column.z)) * mobility
+                    }
+                    correction = simd_inverse(normal) * ((target - endpoint) / scale)
+                    guard usesMovementCosts, correction.isFinite else { break }
+                    var blocked = false
+                    for (index, joint) in joints.enumerated() where activeMobilities[index] > 0 {
+                        let position = angles[joint.id] ?? 0
+                        let limits = limits(for: joint)
+                        let direction = simd_dot(columns[index], correction)
+                        if (position <= limits.lowerBound && direction < 0) || (position >= limits.upperBound && direction > 0) {
+                            activeMobilities[index] = 0
+                            blocked = true
+                        }
+                    }
+                    if !blocked { break }
                 }
-                let correction = simd_inverse(normal) * ((target - endpoint) / scale)
                 guard correction.isFinite else { break }
+                let deltas = joints.enumerated().map { index, joint in
+                    simd_dot(columns[index], correction) * activeMobilities[index] * nativeStep(joint)
+                }
+                let stepScale = usesMovementCosts ? joints.enumerated().reduce(Float(1)) { factor, item in
+                    let magnitude = abs(deltas[item.offset])
+                    return magnitude > 0 ? min(factor, maximumStep(item.element) / magnitude) : factor
+                } : 1
                 var changed = false
-                for (joint, column) in zip(joints, columns) {
-                    let delta = min(max(simd_dot(column, correction) * nativeStep(joint), -maximumStep(joint)), maximumStep(joint))
+                for (index, joint) in joints.enumerated() {
+                    let delta = min(max(deltas[index] * stepScale, -maximumStep(joint)), maximumStep(joint))
                     let old = angles[joint.id] ?? 0
                     let next = clamped(old + delta, for: joint)
                     changed = changed || abs(next - old) > maximumStep(joint) * 0.000001

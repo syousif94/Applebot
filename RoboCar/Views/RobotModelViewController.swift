@@ -54,6 +54,9 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     private var collisionPartIDs = Set<String>()
     private var ikMessage: String?
     private let ikStateLabel = UILabel()
+    private let ikMovementCost = UISlider()
+    private let ikMovementCostLabel = UILabel()
+    private let targetFollowSwitch = UISwitch()
     private var pendingSurface: (String, RobotRigSurface)?
     private var undoStack: [RobotRigDocument] = []
     private var redoStack: [RobotRigDocument] = []
@@ -221,6 +224,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             button("Place IK Helper", "mappin.and.ellipse", #selector(placeIKHelper)),
             button("Edit IK Helper", "pencil", #selector(editIKHelper)),
             button("IK Chain Root", "point.3.connected.trianglepath.dotted", #selector(chooseIKRoot)),
+            button("Forward Direction", "eye", #selector(chooseTargetFollowJoint)),
             button("Drag IK Target", "move.3d", #selector(toggleIK)),
             button("Remove IK Helper", "trash", #selector(removeIKHelper))
         ])
@@ -228,6 +232,19 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
             label.font = .systemFont(ofSize: 13, weight: .medium)
             label.numberOfLines = 0
         }
+        ikMovementCost.minimumValue = log10(RobotRigGroup.ikMovementCostRange.lowerBound)
+        ikMovementCost.maximumValue = log10(RobotRigGroup.ikMovementCostRange.upperBound)
+        ikMovementCost.isContinuous = false
+        ikMovementCost.accessibilityLabel = "IK movement cost"
+        ikMovementCost.accessibilityHint = "Higher costs discourage movement."
+        ikMovementCost.addTarget(self, action: #selector(ikMovementCostChanged), for: .valueChanged)
+        ikMovementCost.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        ikMovementCostLabel.font = .monospacedSystemFont(ofSize: 13, weight: .medium)
+        ikMovementCostLabel.numberOfLines = 0
+        ikMovementCostLabel.isUserInteractionEnabled = true
+        ikMovementCostLabel.accessibilityTraits.insert(.button)
+        ikMovementCostLabel.addGestureRecognizer(UITapGestureRecognizer(target: self, action: #selector(enterIKMovementCost)))
+        ikMovementCostLabel.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
         axisStateLabel.accessibilityTraits.insert(.updatesFrequently)
         angle.minimumValue = -180
         angle.maximumValue = 180
@@ -284,7 +301,17 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         addSidebarSection("Collision Checks", views: [collisionRow, collisionSelectionLabel, collisionTools])
         addSidebarSection("Parts & Groups", views: [groupButton, groupTools])
         addSidebarSection("Motion Axis", views: [motionKind, axisStateLabel, axisTools, mechanismLabel, mechanismTools])
-        addSidebarSection("Inverse Kinematics", views: [ikStateLabel, ikTools])
+        let followTitle = UILabel()
+        followTitle.text = "Follow Active IK Target"
+        followTitle.font = .systemFont(ofSize: 13, weight: .medium)
+        followTitle.numberOfLines = 0
+        targetFollowSwitch.accessibilityLabel = "Follow active IK target"
+        targetFollowSwitch.addTarget(self, action: #selector(targetFollowChanged), for: .valueChanged)
+        let followRow = UIStackView(arrangedSubviews: [followTitle, targetFollowSwitch])
+        followRow.alignment = .center
+        followRow.spacing = 8
+        followRow.heightAnchor.constraint(greaterThanOrEqualToConstant: 44).isActive = true
+        addSidebarSection("Inverse Kinematics", views: [ikStateLabel, ikMovementCostLabel, ikMovementCost, followRow, ikTools])
         addSidebarSection("Position & Motor", views: [mode, angleLabel, angle, motorTools])
         groupButton.heightAnchor.constraint(equalToConstant: 44).isActive = true
         search.heightAnchor.constraint(equalToConstant: 44).isActive = true
@@ -494,6 +521,15 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         motionKind.selectedSegmentIndex = group?.linear == nil ? 0 : 1
         motionKind.isEnabled = editable && group != nil && !pickingAxis
         let source = activeMotionSource
+        let movementCost = source?.ikMovementCost ?? 1
+        ikMovementCost.value = log10(movementCost)
+        ikMovementCost.accessibilityValue = String(format: "%.2f", movementCost)
+        ikMovementCost.isEnabled = editable && source?.axis != nil && !pickingAxis && !movingAxis && !pickingIK
+        ikMovementCostLabel.text = String(format: "Movement Cost: %.2f", movementCost)
+            + (group?.linear?.sourceID != nil ? "\nSource: \(source?.name ?? "")" : "")
+        ikMovementCostLabel.textColor = ikMovementCost.isEnabled ? .label : .secondaryLabel
+        ikMovementCostLabel.accessibilityLabel = (ikMovementCostLabel.text ?? "") + ", tap to enter a value"
+        ikMovementCostLabel.isUserInteractionEnabled = ikMovementCost.isEnabled
         let opposing = source.flatMap { source in document.groups.first { $0.linear?.sourceID == source.id } }
         mechanismLabel.text = group?.linear == nil ? nil : (group?.linear?.sourceID != nil
             ? "Driven by: \(source?.name ?? "") / source travel (mm)"
@@ -556,6 +592,12 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                  title: pickingIK ? "Cancel Helper Pick" : "Place IK Helper")
         updateAction(#selector(editIKHelper), enabled: editable && group != nil)
         updateAction(#selector(chooseIKRoot), enabled: editable && helper != nil)
+        let follow = document.targetFollowers().first { $0.jointID == group?.id }
+        if helper == nil && follow != nil { ikStateLabel.text = "Following active IK target / Preview only" }
+        targetFollowSwitch.isOn = follow != nil
+        targetFollowSwitch.isEnabled = editable && group?.axis != nil && group?.linear == nil && !pickingAxis && !movingAxis && !pickingIK
+        updateAction(#selector(chooseTargetFollowJoint), enabled: targetFollowSwitch.isEnabled,
+                 title: follow.map { String(format: "Forward: %.2g, %.2g, %.2g", $0.forward.x, $0.forward.y, $0.forward.z) } ?? "Forward Direction")
         updateAction(#selector(toggleIK), enabled: editable && helper != nil,
                  title: ikTarget == nil ? "Drag IK Target" : "Done With IK")
         updateAction(#selector(removeIKHelper), enabled: editable && helper != nil)
@@ -992,6 +1034,28 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         showSheet(menu)
     }
 
+    @objc private func ikMovementCostChanged() {
+        guard ikMovementCost.isEnabled, let source = activeMotionSource else { refresh(); return }
+        let cost = (pow(Float(10), ikMovementCost.value) * 100).rounded() / 100
+        setIKMovementCost(cost, for: source.id)
+    }
+
+    @objc private func enterIKMovementCost() {
+        guard ikMovementCost.isEnabled, let source = activeMotionSource else { return }
+        prompt(title: "\(source.name): IK Movement Cost", fields: [("Cost (0.1 - 100)", "\(source.ikMovementCost ?? 1)")]) { [weak self] values in
+            guard let cost = Float(values[0]) else { self?.showError("Enter an IK movement cost between 0.1 and 100"); return }
+            self?.setIKMovementCost(cost, for: source.id)
+        }
+    }
+
+    private func setIKMovementCost(_ cost: Float, for sourceID: UUID) {
+        guard let source = document.groups.first(where: { $0.id == sourceID }), cost != (source.ikMovementCost ?? 1) else { return }
+        edit { draft in
+            guard let index = draft.groups.firstIndex(where: { $0.id == sourceID }) else { return }
+            draft.groups[index].ikMovementCost = cost == 1 ? nil : cost
+        }
+    }
+
     private func stopIK() {
         viewport.cancelAxisDrag()
         collisionGeneration = UUID()
@@ -1042,7 +1106,8 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
     }
 
     private func saveIKHelper(point: SIMD3<Float>, group: RobotRigGroup) {
-        let helper = RobotRigIKHelper(point: point, rootID: group.ikHelper?.rootID ?? defaultIKRoot(group))
+        let helper = RobotRigIKHelper(point: point, rootID: group.ikHelper?.rootID ?? defaultIKRoot(group),
+                                      targetFollow: group.ikHelper?.targetFollow)
         edit { draft in
             if let index = draft.groups.firstIndex(where: { $0.id == group.id }) { draft.groups[index].ikHelper = helper }
         }
@@ -1075,6 +1140,57 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
         showSheet(menu)
     }
 
+    @objc private func targetFollowChanged() {
+        guard targetFollowSwitch.isEnabled, let joint = activeGroup else { refresh(); return }
+        if targetFollowSwitch.isOn {
+            chooseTargetForward(joint: joint)
+        } else {
+            setTargetFollow(nil, for: joint.id)
+        }
+        refresh()
+    }
+
+    @objc private func chooseTargetFollowJoint() {
+        guard targetFollowSwitch.isEnabled, let joint = activeGroup else { return }
+        chooseTargetForward(joint: joint)
+    }
+
+    private func chooseTargetForward(joint: RobotRigGroup) {
+        let menu = UIAlertController(title: "\(joint.name): Forward (Model Rest)", message: nil, preferredStyle: .actionSheet)
+        let directions: [(String, SIMD3<Float>)] = [
+            ("+X", SIMD3(1, 0, 0)), ("-X", SIMD3(-1, 0, 0)),
+            ("+Y", SIMD3(0, 1, 0)), ("-Y", SIMD3(0, -1, 0)),
+            ("+Z", SIMD3(0, 0, 1)), ("-Z", SIMD3(0, 0, -1))
+        ]
+        for (name, direction) in directions where simd_length(simd_cross(joint.axis!.direction, direction)) > 0.0001 {
+            menu.addAction(UIAlertAction(title: name, style: .default) { [weak self] _ in
+                self?.setTargetFollow(RobotRigTargetFollow(jointID: joint.id, forward: direction), for: joint.id)
+            })
+        }
+        menu.addAction(UIAlertAction(title: "Custom Direction", style: .default) { [weak self] _ in
+            self?.prompt(title: "Forward Direction (Model Rest)", fields: [("X", "0"), ("Y", "0"), ("Z", "1")]) { [weak self] values in
+                let numbers = values.compactMap(Float.init)
+                guard numbers.count == 3, numbers.allSatisfy(\.isFinite) else { self?.showError("Enter three finite values"); return }
+                let forward = SIMD3(numbers[0], numbers[1], numbers[2])
+                guard simd_length(forward).isFinite, simd_length(forward) > 0.000001 else { self?.showError("Forward direction must be nonzero"); return }
+                self?.setTargetFollow(RobotRigTargetFollow(jointID: joint.id, forward: simd_normalize(forward)), for: joint.id)
+            }
+        })
+        menu.addAction(UIAlertAction(title: "Cancel", style: .cancel))
+        showSheet(menu)
+    }
+
+    private func setTargetFollow(_ follow: RobotRigTargetFollow?, for jointID: UUID) {
+        edit { draft in
+            for index in draft.groups.indices {
+                if draft.groups[index].ikHelper?.targetFollow?.jointID == jointID {
+                    draft.groups[index].ikHelper?.targetFollow = nil
+                }
+                if draft.groups[index].id == jointID { draft.groups[index].targetFollowForward = follow?.forward }
+            }
+        }
+    }
+
     @objc private func removeIKHelper() {
         guard let id = activeGroupID else { return }
         edit { draft in
@@ -1094,6 +1210,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let chain = try document.ikChain(for: group.id)
                 guard chain.contains(where: { $0.axis != nil }) else { throw RobotRigError.invalid("Set motion axes on the IK chain first") }
                 var moving = Set(chain.filter { $0.axis != nil }.map { document.motionSource(for: $0).id.uuidString })
+                moving.formUnion(document.targetFollowers().map { $0.jointID.uuidString })
                 for _ in document.groups.indices {
                     for item in document.groups where item.parentID.map({ moving.contains($0.uuidString) }) == true || item.linear?.sourceID.map({ moving.contains($0.uuidString) }) == true {
                         moving.insert(item.id.uuidString)
@@ -1870,6 +1987,11 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                     draft.groups[0].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: root.id)
                 }
                 let ikDocument = editor.document
+                try await checkTargetFollow()
+                if ProcessInfo.processInfo.arguments.contains("--rig-follow-only") {
+                    UserDefaults.standard.set(priorDefault, forKey: "RobotModel.lastAsset")
+                    exit(0)
+                }
                 let excludedPart = editor.viewport.parts[0].id
                 let includedPart = editor.viewport.parts[1].id
                 editor.selected = [excludedPart]
@@ -1997,6 +2119,67 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 try ikEditorImage.pngData()?.write(to: folder.appendingPathComponent("ik-editor.png"))
                 editor.resetPreview()
                 precondition(editor.ikTarget == nil && editor.angles.isEmpty && editor.mode.isEnabled)
+                func checkTargetFollow() async throws {
+                    let followHead = RobotRigGroup(name: "Head follow", parts: [], parentID: root.id,
+                        axis: RobotRigAxis(origin: .zero, direction: SIMD3(0, 0, 1)))
+                    editor.edit { $0.groups.append(followHead) }
+                    let beforeFollow = editor.document
+                    let follow = RobotRigTargetFollow(jointID: followHead.id, forward: SIMD3(1, 0, 0))
+                    editor.selectGroup(followHead.id)
+                    precondition(editor.activeGroup?.ikHelper == nil && editor.targetFollowSwitch.isEnabled)
+                    editor.setTargetFollow(follow, for: followHead.id)
+                    precondition(editor.activeGroup?.targetFollowForward == follow.forward && editor.targetFollowSwitch.isOn)
+                    precondition(editor.actionButtons[#selector(chooseTargetFollowJoint)]?.isEnabled == true)
+                    let savedFollow = try RobotModelStorage.loadDocument(at: url, hash: editor.document.assetHash)
+                    precondition(savedFollow == editor.document)
+                    editor.undoTapped()
+                    precondition(editor.document == beforeFollow)
+                    editor.redoTapped()
+                    precondition(editor.document.targetFollowers() == [follow])
+                    editor.selectGroup(savedGroupID)
+                    editor.saveIKHelper(point: editor.activeGroup!.ikHelper!.point, group: editor.activeGroup!)
+                    precondition(editor.document.targetFollowers() == [follow])
+                    editor.toggleIK()
+                    editor.moveIK(SIMD3(1, 1, 0), state: .ended)
+                    await awaitCollision()
+                    let facing = editor.document.transforms(angles: editor.angles)[followHead.id]! * SIMD4<Float>(1, 0, 0, 0)
+                    precondition(simd_distance(facing, SIMD4<Float>(sqrt(0.5), sqrt(0.5), 0, 0)) < 0.001)
+                    var otherArm = editor.activeGroup!
+                    otherArm.id = UUID()
+                    otherArm.name = "Other arm target"
+                    otherArm.parts = []
+                    otherArm.motor = nil
+                    editor.edit { $0.groups.append(otherArm) }
+                    editor.selectGroup(otherArm.id)
+                    editor.toggleIK()
+                    editor.moveIK(SIMD3(1.5, 0.5, 0), state: .ended)
+                    await awaitCollision()
+                    let otherFacing = editor.document.transforms(angles: editor.angles)[followHead.id]! * SIMD4<Float>(1, 0, 0, 0)
+                    let expectedFacing = simd_normalize(SIMD3<Float>(1.5, 0.5, 0))
+                    precondition(simd_distance(otherFacing, SIMD4(expectedFacing, 0)) < 0.001)
+                    precondition(commander.motion.isEmpty)
+                    editor.selectGroup(followHead.id)
+                    editor.setSidebarSection("Hierarchy", collapsed: true)
+                    editor.setSidebarSection("Parts & Groups", collapsed: true)
+                    editor.setSidebarSection("Motion Axis", collapsed: true)
+                    editor.setSidebarSection("Collision Checks", collapsed: true)
+                    editor.setSidebarSection("Inverse Kinematics", collapsed: false)
+                    editor.inspectorScroll.setContentOffset(.zero, animated: false)
+                    editor.view.layoutIfNeeded()
+                    let followImage = UIGraphicsImageRenderer(bounds: editor.view.bounds).image { context in
+                        editor.view.layer.render(in: context.cgContext)
+                        editor.viewport.snapshot().draw(in: editor.viewport.convert(editor.viewport.bounds, to: editor.view))
+                    }
+                    try followImage.pngData()?.write(to: folder.appendingPathComponent("target-follow-editor.png"))
+                    editor.selectGroup(followHead.id)
+                    editor.targetFollowSwitch.isOn = false
+                    editor.targetFollowSwitch.sendActions(for: .valueChanged)
+                    precondition(editor.document.targetFollowers().isEmpty && editor.ikTarget == nil && editor.angles.isEmpty)
+                    print("PASS: helper-free follower controls, two active arm targets, persistence, undo/redo, disabling and zero motor commands")
+                    editor.document = ikDocument
+                    try RobotModelStorage.save(ikDocument, at: url)
+                    editor.refresh()
+                }
                 editor.document = savedDocument
                 try RobotModelStorage.save(savedDocument, at: url)
                 editor.refresh()
@@ -2092,6 +2275,37 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let savedGripper = try RobotModelStorage.loadDocument(at: editor.assetURL!, hash: gripper.assetHash)
                 precondition(savedGripper == gripper)
                 editor.selectGroup(opposingJaw.id)
+                precondition(editor.ikMovementCost.isEnabled && editor.ikMovementCost.value == 0)
+                editor.ikMovementCost.value = log10(20)
+                editor.ikMovementCost.sendActions(for: .valueChanged)
+                precondition(editor.document.groups[0].ikMovementCost == 20 && editor.document.groups[1].ikMovementCost == nil)
+                precondition(editor.ikMovementCostLabel.text?.contains("Source: Linear source") == true)
+                precondition(editor.angles.isEmpty && editor.ikTarget == nil && commander.motion.count == 1)
+                let savedCosts = try RobotModelStorage.loadDocument(at: editor.assetURL!, hash: gripper.assetHash)
+                precondition(savedCosts == editor.document)
+                editor.undoTapped()
+                precondition(editor.document == gripper && editor.ikMovementCost.value == 0)
+                editor.redoTapped()
+                precondition(editor.document.groups[0].ikMovementCost == 20)
+                editor.setSidebarSection("Hierarchy", collapsed: true)
+                editor.setSidebarSection("Parts & Groups", collapsed: true)
+                editor.setSidebarSection("Motion Axis", collapsed: true)
+                editor.setSidebarSection("Collision Checks", collapsed: true)
+                editor.setSidebarSection("Inverse Kinematics", collapsed: false)
+                editor.inspectorScroll.setContentOffset(.zero, animated: false)
+                editor.view.layoutIfNeeded()
+                let costImage = UIGraphicsImageRenderer(bounds: editor.view.bounds).image { context in
+                    editor.view.layer.render(in: context.cgContext)
+                    editor.viewport.snapshot().draw(in: editor.viewport.convert(editor.viewport.bounds, to: editor.view))
+                }
+                let costFolder = FileManager.default.temporaryDirectory.appendingPathComponent("RigChecks")
+                try FileManager.default.createDirectory(at: costFolder, withIntermediateDirectories: true)
+                try costImage.pngData()?.write(to: costFolder.appendingPathComponent("ik-movement-cost.png"))
+                editor.undoTapped()
+                precondition(editor.document == gripper)
+                editor.setSidebarSection("Motion Axis", collapsed: false)
+                editor.setSidebarSection("Collision Checks", collapsed: false)
+                print("PASS: IK movement cost slider, shared source routing, persistence, undo/redo, preview reset and zero motor commands")
                 editor.angles[sourceJaw.id] = 3
                 editor.refresh()
                 editor.setSidebarSection("Hierarchy", collapsed: true)
@@ -2115,6 +2329,7 @@ final class RobotModelViewController: PanelViewController, UIDocumentPickerDeleg
                 let effectiveBinding = editor.activeMotorBinding!
                 try motors.arm(effectiveBinding)
                 editor.motorUpdate()
+                precondition(!editor.ikMovementCost.isEnabled && !editor.ikMovementCostLabel.isUserInteractionEnabled)
                 precondition(editor.angles[sourceJaw.id] == 4 && editor.angles[opposingJaw.id] == nil)
                 editor.angle.value = 10
                 editor.moveMotor()

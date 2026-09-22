@@ -46,6 +46,7 @@ struct RobotRigChecks {
         let legacy = try JSONDecoder().decode(RobotRigDocument.self, from: Data(legacyJSON.utf8))
         try legacy.validate(partIDs: [])
         precondition(legacy.groups[0].linear == nil && legacy.millimetersPerModelUnit == nil)
+        precondition(legacy.groups[0].ikMovementCost == nil)
         let legacyTip = legacy.transforms(angles: [legacy.groups[0].id: 90])[legacy.groups[0].id]! * SIMD4<Float>(1, 0, 0, 1)
         precondition(simd_distance(legacyTip, SIMD4(0, 1, 0, 1)) < 0.0001)
         let slide = RobotRigGroup(name: "Slide", parts: ["slide"], parentID: parent.id,
@@ -163,6 +164,111 @@ struct RobotRigChecks {
         rig.groups[1].ikHelper?.rootID = UUID()
         do { try rig.validate(partIDs: ["upper", "lower"]); preconditionFailure("Invalid IK root accepted") } catch {}
         print("PASS: IK reachable, straight-chain folding, unreachable, limits, fixed ancestors and helper persistence")
+        var weighted = document
+        weighted.groups[1].axis = parent.axis
+        weighted.groups[1].ikHelper = RobotRigIKHelper(point: SIMD3(1, 0, 0), rootID: parent.id)
+        let weightedTarget = weighted.ikEndpoint(for: child.id, angles: [child.id: 20])!
+        let equalCosts = try weighted.solveIK(for: child.id, target: weightedTarget, angles: [:])
+        precondition(equalCosts.reached && abs(equalCosts.angles[parent.id]! - equalCosts.angles[child.id]!) < 0.001)
+        weighted.groups[0].ikMovementCost = 1
+        weighted.groups[1].ikMovementCost = 1
+        let explicitDefaults = try weighted.solveIK(for: child.id, target: weightedTarget, angles: [:])
+        precondition(explicitDefaults.angles == equalCosts.angles)
+        weighted.groups[0].ikMovementCost = 20
+        let costlyParent = try weighted.solveIK(for: child.id, target: weightedTarget, angles: [:])
+        precondition(costlyParent.reached && abs(costlyParent.angles[parent.id]!) < abs(costlyParent.angles[child.id]!) / 10)
+        weighted.groups[0].ikMovementCost = 1
+        weighted.groups[1].ikMovementCost = 20
+        let costlyChild = try weighted.solveIK(for: child.id, target: weightedTarget, angles: [:])
+        precondition(costlyChild.reached && abs(costlyChild.angles[child.id]!) < abs(costlyChild.angles[parent.id]!) / 10)
+        try weighted.validate(partIDs: ["upper", "lower"])
+        let weightedRestored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(weighted))
+        precondition(weightedRestored == weighted)
+        weighted.groups[0].motor = RobotRigMotorBinding(servoID: 1, minimum: -2, maximum: 2)
+        let limitTarget = weighted.ikEndpoint(for: child.id, angles: [child.id: 8])!
+        let weightedLimited = try weighted.solveIK(for: child.id, target: limitTarget, angles: [:])
+        precondition(weightedLimited.reached && abs(weightedLimited.angles[parent.id]!) <= 2 && weightedLimited.angles[child.id]! > 5)
+        for invalidCost: Float in [0, -1, .nan, .infinity, 0.01, 101] {
+            weighted.groups[0].ikMovementCost = invalidCost
+            do { try weighted.validate(partIDs: ["upper", "lower"]); preconditionFailure("Invalid IK movement cost accepted") } catch {}
+            do { _ = try weighted.solveIK(for: child.id, target: weightedTarget, angles: [:]); preconditionFailure("Invalid IK movement cost solved") } catch {}
+        }
+        print("PASS: weighted IK preference in both directions, default equivalence, legacy decoding, persistence and invalid costs")
+        var weightedLinear = document
+        weightedLinear.version = 2
+        weightedLinear.millimetersPerModelUnit = 1
+        for index in weightedLinear.groups.indices {
+            weightedLinear.groups[index].axis = RobotRigAxis(origin: .zero, direction: SIMD3(1, 0, 0))
+            weightedLinear.groups[index].linear = RobotRigLinearMotion()
+        }
+        weightedLinear.groups[1].ikHelper = RobotRigIKHelper(point: .zero, rootID: parent.id)
+        weightedLinear.groups[0].ikMovementCost = 20
+        let weightedSlide = try weightedLinear.solveIK(for: child.id, target: SIMD3(5, 0, 0), angles: [:])
+        precondition(weightedSlide.reached && weightedSlide.angles[parent.id]! < weightedSlide.angles[child.id]! / 10)
+        let weightedSlideLimited = try weightedLinear.solveIK(for: child.id, target: SIMD3(15, 0, 0), angles: [:])
+        precondition(weightedSlideLimited.reached && weightedSlideLimited.angles[child.id] == 10 && weightedSlideLimited.angles[parent.id]! > 4.9)
+        let weightedSlideUnreachable = try weightedLinear.solveIK(for: child.id, target: SIMD3(25, 0, 0), angles: [:])
+        precondition(!weightedSlideUnreachable.reached && weightedSlideUnreachable.error.isFinite)
+        precondition(weightedSlideUnreachable.angles[parent.id]! <= 10 && weightedSlideUnreachable.angles[child.id]! <= 10)
+        weightedLinear.millimetersPerModelUnit = 1000
+        let weightedScaled = try weightedLinear.solveIK(for: child.id, target: SIMD3(0.005, 0, 0), angles: [:])
+        precondition(weightedScaled.reached && abs(weightedScaled.angles[parent.id]! - weightedSlide.angles[parent.id]!) < 0.001)
+        linearRig.groups[1].ikMovementCost = 20
+        linearRig.groups[2].ikMovementCost = 0.1
+        let weightedJaw = try linearRig.solveIK(for: jaw.id, target: coupledTarget, angles: [:])
+        linearRig.groups[2].ikMovementCost = 100
+        let weightedJawAgain = try linearRig.solveIK(for: jaw.id, target: coupledTarget, angles: [:])
+        precondition(weightedJaw.reached && weightedJaw.angles == weightedJawAgain.angles && weightedJaw.angles[jaw.id] == nil)
+        print("PASS: weighted rotation and linear limits, costly joint fallback, unreachable targets, physical scale and shared jaw source cost")
+        var following = document
+        following.groups[1].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: parent.id,
+            targetFollow: RobotRigTargetFollow(jointID: parent.id, forward: SIMD3(1, 0, 0)))
+        let followed = try following.solveIK(for: child.id, target: SIMD3(0, 2, 0), angles: [:])
+        precondition(followed.reached && abs(followed.angles[parent.id]! - 90) < 0.001)
+        let head = RobotRigGroup(name: "Head", parts: [], parentID: parent.id,
+            axis: RobotRigAxis(origin: .zero, direction: SIMD3(0, 0, 1)))
+        following.groups.append(head)
+        following.groups[1].ikHelper?.targetFollow?.jointID = head.id
+        let branchFollowed = try following.solveIK(for: child.id, target: SIMD3(1, 1, 0), angles: [:])
+        precondition(branchFollowed.reached)
+        let headForward = following.transforms(angles: branchFollowed.angles)[head.id]! * SIMD4<Float>(1, 0, 0, 0)
+        precondition(simd_distance(headForward, SIMD4<Float>(sqrt(0.5), sqrt(0.5), 0, 0)) < 0.001)
+        let follow = following.groups[1].ikHelper!.targetFollow!
+        let onAxis = following.followingTarget(SIMD3(0, 0, 5), follow: follow, angles: [head.id: 17])
+        precondition(onAxis[head.id] == 17)
+        let wrapped = following.followingTarget(SIMD3(-1, -0.01, 0), follow: follow, angles: [head.id: 179])
+        precondition(abs(wrapped[head.id]! + 179.427) < 0.001)
+        following.groups[2].motor = RobotRigMotorBinding(servoID: 3, minimum: -20, maximum: 20)
+        let constrained = following.followingTarget(SIMD3(0, 1, 0), follow: follow, angles: [:])
+        precondition(constrained[head.id] == 20)
+        try following.validate(partIDs: ["upper", "lower"])
+        let followRestored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(following))
+        precondition(followRestored == following && legacy.groups[0].ikHelper == nil)
+        following.groups[1].ikHelper?.targetFollow?.forward = SIMD3(0, 0, 1)
+        do { try following.validate(partIDs: ["upper", "lower"]); preconditionFailure("Parallel forward accepted") } catch {}
+        print("PASS: target following with shared and separate joints, parent compensation, axis degeneracy, wraparound, limits and persistence")
+        let collar = RobotRigGroup(name: "Collar", parts: [], axis: parent.axis, targetFollowForward: SIMD3(1, 0, 0))
+        let rightArm = RobotRigGroup(name: "Right arm", parts: [], parentID: collar.id,
+            axis: RobotRigAxis(origin: SIMD3(1, 0, 0), direction: SIMD3(0, 0, 1)))
+        let leftArm = RobotRigGroup(name: "Left arm", parts: [], parentID: collar.id,
+            axis: RobotRigAxis(origin: SIMD3(1, 0, 0), direction: SIMD3(0, 0, 1)))
+        var twoArms = RobotRigDocument(assetHash: "two-arms", groups: [collar, rightArm, leftArm])
+        for index in 1...2 {
+            twoArms.groups[index].ikHelper = RobotRigIKHelper(point: SIMD3(2, 0, 0), rootID: collar.id)
+        }
+        try twoArms.validate(partIDs: [])
+        precondition(twoArms.groups[0].ikHelper == nil)
+        let rightFollowed = try twoArms.solveIK(for: rightArm.id, target: SIMD3(0, 2, 0), angles: [:])
+        precondition(rightFollowed.reached && abs(rightFollowed.angles[collar.id]! - 90) < 0.001)
+        let leftFollowed = try twoArms.solveIK(for: leftArm.id, target: SIMD3(0, -2, 0), angles: rightFollowed.angles)
+        precondition(leftFollowed.reached && abs(leftFollowed.angles[collar.id]! + 90) < 0.001)
+        precondition(leftFollowed.angles[rightArm.id] == rightFollowed.angles[rightArm.id])
+        let armsRestored = try JSONDecoder().decode(RobotRigDocument.self, from: JSONEncoder().encode(twoArms))
+        precondition(armsRestored == twoArms && armsRestored.targetFollowers().count == 1)
+        twoArms.groups[0].targetFollowForward = nil
+        precondition(twoArms.targetFollowers().isEmpty)
+        precondition(legacy.targetFollowers().isEmpty)
+        print("PASS: collar without helper follows either active arm target, persistence, disabling and unchanged inactive joint")
         var cyclic = document
         cyclic.groups[0].parentID = child.id
         do { try cyclic.validate(partIDs: ["upper", "lower"]); preconditionFailure("Cycle accepted") } catch {}
